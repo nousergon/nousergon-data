@@ -20,7 +20,13 @@ Inputs and their basis (named, never silently swapped; Rule 5)
 * **NAV**: ``trades/eod_pnl.csv``, the EOD export of ``trades.db::eod_pnl``,
   which the money ledger (crucible-executor ``executor/money_ledger.py``)
   journals corrections against. Its ``nav_basis`` column is carried through;
-  a basis change inside a window is reported on that window.
+  a basis change inside a window is reported on that window. The ground-truth
+  basis is ``settled_close`` (IB shares and cash, Polygon settled closes;
+  ruling 2026-10-22): a window whose base or any later row is on another
+  basis (``ib_netliq``, or ``unrecorded`` before the column existed) is
+  estimated and names the first and last such row
+  (``nav_basis_not_settled_close:<first>..<last>``). The number is still
+  published; it is never re-based onto a series the export did not publish.
 * **External flows**: transfer entries in the ledger journal copies under
   ``trades/ledger/journal/``. The ledger has no transfer builder yet
   (alpha-engine-config-I12557 deliverable 2), so :data:`FLOWS_JOURNALED_FROM`
@@ -106,6 +112,12 @@ REASON_NAV_ROW_MISSING = "nav_row_missing"
 #: A NAV row on a date the SPY close history has no close for, inside that
 #: history's span: a market-closed day the export recorded anyway.
 REASON_NAV_ROW_CLOSED_DAY = "nav_row_on_market_closed_day"
+#: The ground-truth NAV basis: IB shares and cash marked at Polygon settled
+#: closes (ruling 2026-10-22; crucible-executor ``NAV_BASIS_SETTLED_CLOSE``).
+NAV_BASIS_SETTLED_CLOSE = "settled_close"
+#: A NAV row inside a window (its base included: it is the first factor's
+#: denominator) on any other basis. Dated by the first and last such row.
+REASON_NAV_BASIS = "nav_basis_not_settled_close"
 
 WINDOWS: tuple[tuple[str, str], ...] = (
     ("day", "Day"),
@@ -320,6 +332,12 @@ def _close_on_or_before(series: Mapping[date, float], day: date) -> tuple[float 
     return None, False
 
 
+def _dated(reason: str, days: Sequence[date]) -> str:
+    """``reason:<day>`` for one day, ``reason:<first>..<last>`` for several."""
+    first, last = min(days), max(days)
+    return f"{reason}:{first.isoformat()}" + ("" if first == last else f"..{last.isoformat()}")
+
+
 def _pct(x: float | None) -> float | None:
     return None if x is None else round(x * 100.0, 4)
 
@@ -401,6 +419,9 @@ def build(
         q_reasons: list[str] = [REASON_QQQ_BASIS]
         if FLOWS_JOURNALED_FROM is None or base < FLOWS_JOURNALED_FROM:
             p_reasons.append(REASON_FLOWS)
+        off_basis = [r.day for r in rows[lo:hi + 1] if r.nav_basis != NAV_BASIS_SETTLED_CLOSE]
+        if off_basis:
+            p_reasons.append(_dated(REASON_NAV_BASIS, off_basis))
         for i in range(lo + 1, hi + 1):
             prev, cur = rows[i - 1], rows[i]
             p_f.append((cur.nav - interval_flow(i)) / prev.nav)
@@ -422,8 +443,13 @@ def build(
             a, a_exact = _close_on_or_before(qqq_history, prev.day)
             b, b_exact = _close_on_or_before(qqq_history, cur.day)
             q_f.append(b / a if a and b else None)
-            if not (a_exact and b_exact):
-                q_reasons.append(f"qqq_close_missing:{cur.day.isoformat()}")
+            # Name the day whose close is absent, not the interval's end: a
+            # market-closed base row is missing, the next session is not.
+            q_reasons.extend(
+                f"qqq_close_missing:{r.day.isoformat()}"
+                for r, exact in ((prev, a_exact), (cur, b_exact))
+                if not exact
+            )
         return (
             _Leg(_chain(p_f), tuple(p_reasons), tuple(f - 1.0 for f in p_f)),
             _Leg(_chain(s_f), tuple(dict.fromkeys(s_reasons)),
