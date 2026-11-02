@@ -175,7 +175,12 @@ def _entered_data_stage(sfn: Any, execution_arn: str) -> bool:
     stages".
     """
     paginator = sfn.get_paginator("get_execution_history")
-    for page in paginator.paginate(executionArn=execution_arn, maxResults=1000):
+    # includeExecutionData=False: only the entered state's NAME is read, and
+    # the API default ships every state's input and output with each page
+    # (~5.9 MB vs ~99 KB measured; nous-ergon-ops-I2001).
+    for page in paginator.paginate(
+        executionArn=execution_arn, maxResults=1000, includeExecutionData=False
+    ):
         for event in page.get("events", []):
             detail = event.get("stateEnteredEventDetails")
             if detail and detail.get("name") in V1_DATA_STAGE_STATES:
