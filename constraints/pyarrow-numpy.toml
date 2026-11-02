@@ -1,0 +1,184 @@
+# THE ONE DECLARATION of the pyarrow/numpy pair (alpha-engine-config-I13002;
+# mechanism record nous-ergon-ops#2041, `data-deps:pyarrow-numpy-lockstep-unenforced`).
+#
+# pyarrow 26.0.0 refuses to import under NumPy 1.x:
+#   ImportError: pyarrow requires NumPy 2.0 or newer, found 1.26.4
+# It broke the fleet three times in October, each time through a surface the
+# previous fix had not touched: data requirements.txt (10-09, data#2128), a
+# Dependabot bump on the same file (10-16, data#2172), and crucible-dashboard's
+# lock under the weekly-freshness box's `numpy<2` override (10-21,
+# crucible-dashboard#957). Each fix pinned one surface; nothing asserted that
+# the surfaces agreed.
+#
+# This file is where the pair is declared, once per venv, and where every
+# surface that installs into one of those venvs is registered. A surface never
+# carries its own opinion about pyarrow: it carries the spec written here, and
+# scripts/check_pyarrow_numpy_constraint.py fails when it does not.
+#
+#   python3 scripts/check_pyarrow_numpy_constraint.py           # this repo (CI: tests/test_pyarrow_numpy_constraint.py)
+#   python3 scripts/check_pyarrow_numpy_constraint.py --remote  # + the other repos' surfaces, read from GitHub
+#
+# The rule (checked for every venv below):
+#   a venv that has numpy forced below 2 (`numpy_below_2 = true`) must cap
+#   pyarrow below `pyarrow_needs_numpy2_from`.
+#
+# Changing a pyarrow spec is a change to THIS file plus every surface it lists,
+# in one PR. A Dependabot PR edits a surface and not this file, so it goes red
+# here instead of reaching a box: that is the hold, and it is deliberate.
+#
+# Surface kinds:
+#   requirements  a pip requirements file or pyproject: its pyarrow spec must
+#                 equal the venv's exactly; a numpy spec in it must not admit
+#                 NumPy 1.x while the venv's pyarrow admits >= 26.
+#   lock          a compiled lock: its `pyarrow==X` must satisfy the venv's spec.
+#   bootstrap     a script that builds the venv: a `pip install ... numpy<2`
+#                 in it must match the venv's `numpy_below_2`, both ways.
+#   dependabot    .github/dependabot.yml: its pyarrow `ignore` versions must
+#                 equal `pyarrow_ignore`; with `group`, pyarrow and numpy must
+#                 sit in that dedicated group so a held bump holds nothing else.
+#
+# `repo` omitted means this repository.
+
+schema = 1
+
+[rule]
+pyarrow_needs_numpy2_from = "26"
+
+# ---------------------------------------------------------------------------
+[venvs.data]
+about = "Every venv built from nousergon-data requirements.txt: the data spot boxes, the v1 weekly DataPhase2 venv, metron-intraday, and the canary replay's data venv."
+pyarrow = ">=26"
+numpy_below_2 = false
+
+[[venvs.data.surfaces]]
+path = "requirements.txt"
+kind = "requirements"
+
+[[venvs.data.surfaces]]
+path = ".github/dependabot.yml"
+kind = "dependabot"
+pyarrow_ignore = []
+group = "pyarrow-numpy"
+
+[[venvs.data.surfaces]]
+path = "infrastructure/lambdas/data-spot-dispatcher/index.py"
+kind = "bootstrap"
+
+[[venvs.data.surfaces]]
+path = "infrastructure/lambdas/arctic-migration-dispatcher/index.py"
+kind = "bootstrap"
+
+[[venvs.data.surfaces]]
+path = "infrastructure/spot_data_weekly.sh"
+kind = "bootstrap"
+
+[[venvs.data.surfaces]]
+path = "infrastructure/install-metron-intraday.sh"
+kind = "bootstrap"
+
+[[venvs.data.surfaces]]
+repo = "alpha-engine-config"
+path = "infrastructure/canary_replay_spot_bootstrap.sh"
+kind = "bootstrap"
+
+[[venvs.data.surfaces]]
+repo = "alpha-engine-config"
+path = "scripts/canary_replay_entrypoint.sh"
+kind = "bootstrap"
+
+# ---------------------------------------------------------------------------
+[venvs.data-trading]
+about = "The trading box's checkout venv (/home/ec2-user/alpha-engine-data/.venv), installed by crucible-executor boot-pull.sh. Held on pyarrow 25 until the trading box's own move to 26 is made as its own step; 25 runs on NumPy 2, so the hold is not a break."
+pyarrow = ">=25.0.1,<26"
+numpy_below_2 = false
+
+[[venvs.data-trading.surfaces]]
+path = "infrastructure/data-trading-requirements.txt"
+kind = "requirements"
+
+[[venvs.data-trading.surfaces]]
+repo = "crucible-executor"
+path = "infrastructure/boot-pull.sh"
+kind = "bootstrap"
+
+# ---------------------------------------------------------------------------
+[venvs.daily-news]
+about = "The standalone daily-news collector venv on the dashboard box."
+pyarrow = ">=25.0.1"
+numpy_below_2 = false
+
+[[venvs.daily-news.surfaces]]
+path = "requirements-daily-news.txt"
+kind = "requirements"
+
+[[venvs.daily-news.surfaces]]
+path = "infrastructure/install-daily-news.sh"
+kind = "bootstrap"
+
+[[venvs.daily-news.surfaces]]
+path = "scripts/run_daily_news_standalone.sh"
+kind = "bootstrap"
+
+# ---------------------------------------------------------------------------
+[venvs.dashboard]
+about = "The v1 crucible-dashboard (alpha-engine-dashboard) venv on the weekly-freshness and backtest spot boxes. Both bootstraps force numpy<2 over its lock, so its pyarrow must stay below 26; it retires with the v1 weekly SF."
+pyarrow = ">=25.0.1,<26"
+numpy_below_2 = true
+
+[[venvs.dashboard.surfaces]]
+path = "infrastructure/lambdas/weekly-freshness-spot-dispatcher/index.py"
+kind = "bootstrap"
+
+[[venvs.dashboard.surfaces]]
+repo = "crucible-dashboard"
+path = "requirements.in"
+kind = "requirements"
+
+[[venvs.dashboard.surfaces]]
+repo = "crucible-dashboard"
+path = "requirements.txt"
+kind = "lock"
+
+[[venvs.dashboard.surfaces]]
+repo = "crucible-dashboard"
+path = "infrastructure/spot_backtest.sh"
+kind = "bootstrap"
+
+[[venvs.dashboard.surfaces]]
+repo = "crucible-dashboard"
+path = ".github/dependabot.yml"
+kind = "dependabot"
+pyarrow_ignore = []
+
+# ---------------------------------------------------------------------------
+[venvs.research]
+about = "The canary replay's research venv, built from crucible-research requirements.txt."
+pyarrow = ">=25.0.1"
+numpy_below_2 = false
+
+[[venvs.research.surfaces]]
+repo = "crucible-research"
+path = "requirements.txt"
+kind = "requirements"
+
+[[venvs.research.surfaces]]
+repo = "alpha-engine-config"
+path = "infrastructure/canary_replay_spot_bootstrap.sh"
+kind = "bootstrap"
+
+# ---------------------------------------------------------------------------
+[venvs.crucible]
+about = "The crucible harness (pyproject + uv.lock). pyarrow >=26 is held by Dependabot ignore under Brian's ruling #25 (2026-10-14) until alpha-engine-config-I12318 lifts it; the ignore is declared here so it cannot drift from the data venv unseen."
+pyarrow = ">=25.0.1"
+numpy_below_2 = false
+
+[[venvs.crucible.surfaces]]
+repo = "crucible"
+path = "pyproject.toml"
+kind = "requirements"
+
+[[venvs.crucible.surfaces]]
+repo = "crucible"
+path = ".github/dependabot.yml"
+kind = "dependabot"
+pyarrow_ignore = [">=26"]
