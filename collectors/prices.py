@@ -86,8 +86,15 @@ _SUB_SECTOR_ETFS = ["SMH", "IGV", "XBI", "PPH", "XOP", "KRE", "ITA", "GDX"]
 # is enforced by tests/test_benchmark_proxies_i10704.py rather than by a
 # runtime import, deliberately: this module is imported by collectors at
 # process start and must not pull in the feature-compute import graph.
+#
+# alpha-engine-config-I13096: QQQ is a BENCHMARK-ONLY series — the perf
+# tracker's vs_qqq leg needs a settled close the way vs_spy has SPY's. It is
+# kept here so the weekly backfill can write its full Close history to the
+# ArcticDB ``macro`` library (``builders/backfill.py::_RAW_MACRO_SERIES``); it
+# is skip-protected in ``features.compute._SKIP_TICKERS`` so it is never
+# computed or written as a stock.
 _ALWAYS_DOWNLOAD = [
-    "SPY", "IWM", "VIX", "VIX3M", "TNX", "IRX", "GLD", "USO",
+    "SPY", "QQQ", "IWM", "VIX", "VIX3M", "TNX", "IRX", "GLD", "USO",
     "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "XLB", "XLRE", "XLC",
     *_SUB_SECTOR_ETFS,
 ]

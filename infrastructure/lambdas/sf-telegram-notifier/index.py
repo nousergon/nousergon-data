@@ -31,6 +31,7 @@ from eod_artifact_verification import (
     format_eod_artifact_lines,
     verify_eod_artifacts,
 )
+from failure_class import classify_failure
 from flow_doctor_telegram import build_flow_doctor_config, notify_via_flow_doctor
 from weekly_run_report import (
     WEEKLY_PIPELINE_NAME,
@@ -445,6 +446,14 @@ def _build_message(
         )
         if cause:
             lines.append(f"Cause: {cause}")
+
+    # Brian, 2026-11-02: every failure alert says whether anything retries it.
+    # The weekly terminal already carries its own report-level Auto-fix line.
+    if status in ("FAILED", "TIMED_OUT") and not any(
+        line.startswith("Auto-fix:") for line in lines
+    ):
+        full_cause = detailed_failure_cause or _failure_cause_from(describe_resp)
+        lines.append(classify_failure(full_cause).auto_fix_line)
 
     lines.append(f"Execution: {exec_name}")
     silent = False

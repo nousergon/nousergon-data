@@ -56,6 +56,7 @@ __all__ = [
     "DECLARED_GAPS",
     "FIRST_SCHEDULED_SESSION",
     "GAP_WINDOW_SESSIONS",
+    "gap_window",
     "PANEL_CLAUSE",
     "PANEL_REQUIREMENT",
     "PRODUCER_TEST",
@@ -165,8 +166,13 @@ def _grade_manifest(store: GateStore, key: str, document: dict, day: dt.date) ->
     return None
 
 
-def _window(latest: dt.date) -> list[dt.date]:
-    """The sessions before ``latest`` the gap check covers, oldest first."""
+def gap_window(latest: dt.date) -> list[dt.date]:
+    """The sessions before ``latest`` the gap check covers, oldest first.
+
+    Public because the producer's catch-up (``weekly_collector.py
+    --daily-panel``, alpha-engine-config-I12652) fills exactly the window this
+    check grades, so the two can never disagree about which day is a hole.
+    """
     days: list[dt.date] = []
     day = previous_trading_day(latest)
     while day >= FIRST_SCHEDULED_SESSION and len(days) < GAP_WINDOW_SESSIONS:
@@ -176,7 +182,7 @@ def _window(latest: dt.date) -> list[dt.date]:
 
 
 def _window_start(latest: dt.date) -> dt.date:
-    days = _window(latest)
+    days = gap_window(latest)
     return days[0] if days else latest
 
 
@@ -186,7 +192,7 @@ def _missing_sessions(store: GateStore, latest: dt.date) -> tuple[list[dt.date],
     One listing of the panel prefix, not a read per day. A listing we could
     not make is a problem (UNMEASURABLE), never an empty answer.
     """
-    days = _window(latest)
+    days = gap_window(latest)
     if not days:
         return [], None
     prefix = _rel(dp.KEY_PREFIX)

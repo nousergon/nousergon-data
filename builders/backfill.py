@@ -108,6 +108,10 @@ PROVENANCE_COL = _CANONICAL_PROVENANCE_COL
 #: asserts every ``FRED_HISTORY_MAP`` key is here.
 _RAW_MACRO_SERIES: tuple[str, ...] = (
     "SPY", "VIX", "VIX3M", "TNX", "IRX", "GLD", "USO",
+    # alpha-engine-config-I13096 — benchmark-only: the settled QQQ close the
+    # EOD reconcile persists beside SPY's for the perf tracker's vs_qqq leg.
+    # No feature reads it (``_build_macro_features_df`` does not).
+    "QQQ",
     # config#939 — credit spreads. FRED-only (BAMLH0A0HYM2), licence-gated to
     # 2023+ on FRED; absent from price_data (e.g. pre-Stage-2.5 cache) →
     # macro.get("HYOAS") returns None downstream, which compute_features
@@ -1079,8 +1083,12 @@ def backfill(
         # ``_apply_daily_delta`` AND the post-condition audit below, so the
         # audit sees this run's just-detected actions.
         registry = _build_registry(s3, bucket)
+        # override_base=False (alpha-engine-config-I13095): the cache rows are
+        # dividend-adjusted; a raw daily_closes row may only EXTEND a ticker
+        # past its own cache end, never replace an adjusted row.
         price_data, split_tickers = _apply_daily_delta(
             s3, bucket, today_str, price_data, registry=registry,
+            override_base=False,
         )
         if split_tickers:
             # data#1298: these tickers had a registered split detected and their
