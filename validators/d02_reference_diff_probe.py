@@ -82,7 +82,7 @@ SUGGESTED_SPINOFF_VALIDITY_DAYS = 30
 #: would fail, so it is never a page.
 
 _FINDING_RE = re.compile(
-    r"^(?P<side>observed|reference) (?P<action>added|removed) (?P<ticker>\S+) "
+    r"^(?P<side>observed|reference) (?P<verb>added|removed) (?P<ticker>\S+) "
     r"(?:not in reference|not observed)$"
 )
 
@@ -131,7 +131,7 @@ def resolve_renames_offline(
 
 def _parse_finding(text: str) -> tuple[str, str, str] | None:
     m = _FINDING_RE.match(text)
-    return (m["side"], m["action"], m["ticker"]) if m else None
+    return (m["side"], m["verb"], m["ticker"]) if m else None
 
 
 def classify(
@@ -188,7 +188,7 @@ def classify(
                         "a price-identity check of the two price_cache parquets>"
                     ),
                 },
-                "action": (
+                "next_step": (
                     f"If {old} -> {new} is a symbol change, add the entry to "
                     f"{RETICKERS_FILE} before Saturday. If it is a real index "
                     f"swap, the reference table should list it; re-check it."
@@ -201,7 +201,7 @@ def classify(
                 "kind": "unparsed", "disagreements": [text], "tickers": [],
                 "observed_on": None, "new_this_week": False,
                 "declaration_file": None, "suggested_entry": None,
-                "action": "D02 emitted a disagreement this probe cannot read; inspect it.",
+                "next_step": "D02 emitted a disagreement this probe cannot read; inspect it.",
             })
             continue
         side, action, ticker = p
@@ -225,7 +225,7 @@ def classify(
                     "valid_through": valid,
                     "evidence": "<fill in: S&P Dow Jones Indices announcement and URL>",
                 },
-                "action": (
+                "next_step": (
                     f"If {ticker} joined as a spin-off, add the entry to "
                     f"{SPINOFFS_FILE} before Saturday. If it is a reticker whose "
                     f"old symbol D02 already counts as removed, it belongs in "
@@ -238,7 +238,7 @@ def classify(
                 "tickers": [ticker], "observed_on": day, "new_this_week": _new(day),
                 "declaration_file": RETICKERS_FILE,
                 "suggested_entry": None,
-                "action": (
+                "next_step": (
                     f"{ticker} left the SPY holdings with no reference removal and "
                     f"no same-day arrival to pair it with. If it was renamed, add "
                     f"it to {RETICKERS_FILE}; otherwise the reference table lags "
@@ -250,7 +250,7 @@ def classify(
                 "kind": "reference_not_observed", "disagreements": [text],
                 "tickers": [ticker], "observed_on": None, "new_this_week": False,
                 "declaration_file": None, "suggested_entry": None,
-                "action": (
+                "next_step": (
                     f"The reference lists {ticker} {action} but no roster snapshot "
                     f"shows it. No declaration file explains this: either the "
                     f"holdings file has not caught up or a snapshot is missing."
@@ -324,7 +324,7 @@ def alert_message(report: dict) -> str:
     ]
     for f in report["findings"]:
         where = f["declaration_file"] or "no declaration file"
-        lines.append(f"- {'; '.join(f['disagreements'])} -> {where}. {f['action']}")
+        lines.append(f"- {'; '.join(f['disagreements'])} -> {where}. {f['next_step']}")
     lines.append(
         "Auto-fix: none. A declaration is a human's evidenced claim; the probe "
         "only names the file and a draft entry (run with --no-alert to print them)."
