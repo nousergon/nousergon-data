@@ -158,7 +158,6 @@ NOT_SF_INVOKED_GRANDFATHERED: frozenset[str] = frozenset(
         "changelog-incident-mirror",
         "eod-success-friday-shell-trigger",
         "friday-shell-run-report",
-        "groom-inject-mock",
         "saturday-integrity-sentinel",
         "sweep-artifact-monitor",
     }

@@ -45,9 +45,10 @@ _SF_PATH = _REPO_ROOT / "infrastructure" / "step_function_groom.json"
 _DISPATCHER = (
     _REPO_ROOT / "infrastructure" / "lambdas" / "scheduled-groom-dispatcher" / "index.py"
 )
-_INJECT_MOCK = (
-    _REPO_ROOT / "infrastructure" / "lambdas" / "groom-inject-mock" / "index.py"
-)
+# The fault-injection harness's mock (``groom-inject-mock``), the other
+# in-repo producer, was deleted with the weekly drill when the groomer was
+# retired (alpha-engine-config-I12794). ``InjectedCallbackRejected`` stays on
+# the terminal allowlist below because the definition still carries it.
 
 #: The state the bounded-relaunch ladder begins at. Reaching it means the lane
 #: gets a completion-marker check and, if the work really was lost, a relaunch.
@@ -153,7 +154,7 @@ def test_terminal_names_are_ordered_before_the_states_all_catch(catch):
             )
 
 
-@pytest.mark.parametrize("path", [_DISPATCHER, _INJECT_MOCK])
+@pytest.mark.parametrize("path", [_DISPATCHER])
 def test_producer_source_is_readable(path: Path):
     """Fail loud rather than vacuously pass.
 
@@ -175,7 +176,7 @@ def test_every_producer_error_name_is_accounted_for(catch):
     this repo can see; the inversion covers the ones it cannot.
     """
     found: set[str] = set()
-    for path in (_DISPATCHER, _INJECT_MOCK):
+    for path in (_DISPATCHER,):
         found |= set(_ERROR_LITERAL.findall(path.read_text()))
     # Names unrelated to the task-token contract (e.g. a boto3 kwarg elsewhere)
     # are still fine: everything not terminal reaches the ladder by default.
