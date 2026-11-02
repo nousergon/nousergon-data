@@ -171,8 +171,10 @@ def test_partial_shortfall_is_reported_at_error_but_does_not_raise(caplog):
     text = caplog.text
     assert "coverage SHORTFALL" in text
     assert "95 of 100" in text
-    # The consequence is named, not just the count.
-    assert "0.0" in text
+    # The consequence is named, not just the count: NaN in the snapshot, not
+    # 0.0 (alpha-engine-config-I13103).
+    assert "NaN" in text
+    assert alt.short is True
 
 
 def test_unreadable_objects_are_named_not_swallowed(caplog):
