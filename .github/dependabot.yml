@@ -31,7 +31,18 @@ updates:
     ignore:
       - dependency-name: "pandas"
         versions: [">=3"]
+    # pyarrow and numpy get their OWN group, listed first (a dependency joins
+    # the first group it matches). Their specs are declared once, in
+    # constraints/pyarrow-numpy.toml, and tests/test_pyarrow_numpy_constraint.py
+    # fails any PR whose surfaces disagree with it, so a Dependabot pyarrow bump
+    # goes red until a person moves the declaration with it
+    # (alpha-engine-config-I13002). Grouped apart, that held PR holds nothing
+    # else. Asserted by the same test.
     groups:
+      pyarrow-numpy:
+        patterns:
+          - "pyarrow"
+          - "numpy"
       minor-and-patch:
         update-types:
           - minor

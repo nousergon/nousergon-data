@@ -369,6 +369,8 @@ excluded_paths:
     reason: Rehearsal tooling for the SF path; writes an ops artifact, not a data key.
   - glob: "scripts/lint_extras.py"
     reason: A lint helper.
+  - glob: "scripts/check_pyarrow_numpy_constraint.py"
+    reason: A dependency-surface lint (alpha-engine-config-I13002); reads files, writes nothing. Its list.append calls match the arcticdb `append` verb.
   - glob: "scripts/sf_rerun_common.py"
     reason: Step Functions rerun tooling — the ops plane, not a data producer.
   - glob: "scripts/weekday_sf_rerun.py"
