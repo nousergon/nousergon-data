@@ -267,6 +267,13 @@ shared_writers:
   - path: builders/_price_cache_writeboth.py
     parent_units: [D03]
     reason: The price-cache dual-write helper.
+  - path: builders/ticker_holds.py
+    parent_units: [D18, D32]
+    reason: >-
+      The daily arctic append's ticker-hold writer (alpha-engine-config-I13044):
+      opens data_quality/ticker_holds/{TICKER}.json on an unexplained split-like
+      pure append and clears it once the stored series is restated. The operator
+      clear CLI in the same module writes the same object.
   - path: builders/backfill_delisted_history.py
     parent_units: [D14]
     reason: Populates the delisted_history library D14 prunes into.

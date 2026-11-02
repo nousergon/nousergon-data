@@ -193,7 +193,7 @@ class TestSpliceBasisGuard:
             out, verdict = _splice_basis_guard(
                 "KD", bar, hist, pd.Timestamp("2026-02-09"), [], None
             )
-        assert verdict == "ok"
+        assert verdict == "unexplained"  # written, and held (I13044)
         assert float(out["Close"]) == pytest.approx(10.59)
         assert any("NO registered corporate action" in r.message for r in caplog.records)
 
@@ -232,7 +232,7 @@ class TestSpliceBasisGuard:
             out, verdict = _splice_basis_guard(
                 "MRNA", _bar(174.38), hist, pd.Timestamp("2026-08-20"), [], reg
             )
-        assert verdict == "ok"
+        assert verdict == "unexplained"  # written, and held (I13044)
         assert float(out["Close"]) == pytest.approx(174.38)
         errs = [r.message for r in caplog.records if r.levelno >= logging.ERROR]
         assert len(errs) == 1
@@ -245,7 +245,7 @@ class TestSpliceBasisGuard:
             _out, verdict = _splice_basis_guard(
                 "KD", _bar(10.59), hist, pd.Timestamp("2026-02-09"), [], None
             )
-        assert verdict == "ok"
+        assert verdict == "unexplained"  # written, and held (I13044)
         errs = [r.message for r in caplog.records if r.levelno >= logging.ERROR]
         assert any("session-detected splits only (no registry available)" in m for m in errs)
 
