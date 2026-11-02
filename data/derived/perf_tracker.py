@@ -40,9 +40,13 @@ Inputs and their basis (named, never silently swapped; Rule 5)
   ``spy_close`` + ``spy_dividend_per_share`` and, failing that, from
   ``market_data/close_history/SPY.json`` (dividend-adjusted); either fallback
   marks the cell estimated and names the row.
-* **QQQ total return**: no Polygon settled total-return series for QQQ is
-  published yet, so ``market_data/close_history/QQQ.json`` (dividend-adjusted)
-  is used and every QQQ cell carries ``qqq_not_polygon_settled``.
+* **QQQ total return**: each ``eod_pnl`` row's persisted ``qqq_close`` +
+  ``qqq_dividend_per_share`` (alpha-engine-config-I13096), which the EOD
+  reconcile reads from the same ArcticDB macro close and the same Polygon
+  ex-dividend query as ``spy_close`` / ``spy_dividend_per_share``. An interval
+  whose either row lacks ``qqq_close`` (every row before the columns existed)
+  falls back to ``market_data/close_history/QQQ.json`` (dividend-adjusted),
+  and its window carries ``qqq_not_polygon_settled``.
 
 Return definitions
 ------------------
@@ -163,6 +167,8 @@ class NavRow:
     spy_dividend: float
     spy_return_pct: float | None
     nav_basis: str
+    qqq_close: float | None = None
+    qqq_dividend: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -200,6 +206,7 @@ def parse_nav_csv(text: str) -> list[NavRow]:
         if nav is None or nav <= 0:
             continue
         spy = _float_or_none(raw.get("spy_close"))
+        qqq = _float_or_none(raw.get("qqq_close"))
         by_day[day] = NavRow(
             day=day,
             nav=nav,
@@ -207,6 +214,8 @@ def parse_nav_csv(text: str) -> list[NavRow]:
             spy_dividend=_float_or_none(raw.get("spy_dividend_per_share")) or 0.0,
             spy_return_pct=_float_or_none(raw.get("spy_return_pct")),
             nav_basis=(raw.get("nav_basis") or "").strip() or "unrecorded",
+            qqq_close=qqq if qqq and qqq > 0 else None,
+            qqq_dividend=_float_or_none(raw.get("qqq_dividend_per_share")) or 0.0,
         )
     if not by_day:
         raise PerfInputError(f"{NAV_KEY} has no row with a positive NAV")
@@ -416,7 +425,7 @@ def build(
         p_f, s_f, q_f = [], [], []
         p_reasons: list[str] = []
         s_reasons: list[str] = []
-        q_reasons: list[str] = [REASON_QQQ_BASIS]
+        q_reasons: list[str] = []
         if FLOWS_JOURNALED_FROM is None or base < FLOWS_JOURNALED_FROM:
             p_reasons.append(REASON_FLOWS)
         off_basis = [r.day for r in rows[lo:hi + 1] if r.nav_basis != NAV_BASIS_SETTLED_CLOSE]
@@ -440,16 +449,23 @@ def build(
                     for r in (prev, cur)
                     if not r.spy_close
                 )
-            a, a_exact = _close_on_or_before(qqq_history, prev.day)
-            b, b_exact = _close_on_or_before(qqq_history, cur.day)
-            q_f.append(b / a if a and b else None)
-            # Name the day whose close is absent, not the interval's end: a
-            # market-closed base row is missing, the next session is not.
-            q_reasons.extend(
-                f"qqq_close_missing:{r.day.isoformat()}"
-                for r, exact in ((prev, a_exact), (cur, b_exact))
-                if not exact
-            )
+            if cur.qqq_close and prev.qqq_close:
+                # Settled leg (alpha-engine-config-I13096): both rows carry the
+                # EOD reconcile's persisted close; the ending row's ex-dividend
+                # makes it a total return, the same basis as the SPY leg.
+                q_f.append((cur.qqq_close + cur.qqq_dividend) / prev.qqq_close)
+            else:
+                q_reasons.append(REASON_QQQ_BASIS)
+                a, a_exact = _close_on_or_before(qqq_history, prev.day)
+                b, b_exact = _close_on_or_before(qqq_history, cur.day)
+                q_f.append(b / a if a and b else None)
+                # Name the day whose close is absent, not the interval's end: a
+                # market-closed base row is missing, the next session is not.
+                q_reasons.extend(
+                    f"qqq_close_missing:{r.day.isoformat()}"
+                    for r, exact in ((prev, a_exact), (cur, b_exact))
+                    if not exact
+                )
         return (
             _Leg(_chain(p_f), tuple(p_reasons), tuple(f - 1.0 for f in p_f)),
             _Leg(_chain(s_f), tuple(dict.fromkeys(s_reasons)),
@@ -551,8 +567,9 @@ def build(
                 ],
             },
             "qqq": {
-                "primary": CLOSE_HISTORY_KEY.format(symbol="QQQ") + " (dividend-adjusted)",
-                "settled_series": None,
+                "primary": f"{NAV_KEY} qqq_close + qqq_dividend_per_share (settled close + Polygon ex-dividends)",
+                "fallback": [CLOSE_HISTORY_KEY.format(symbol="QQQ") + " (dividend-adjusted)"],
+                "settled_series": f"{NAV_KEY} qqq_close",
             },
         },
         "windows": windows_out,

@@ -4787,6 +4787,11 @@ _MACRO_DAILY_TICKERS = [
     # the session. Enforced by
     # tests/test_benchmark_proxies_i10704.py::test_declared_proxies_are_requested_daily.
     "SPY", "IWM", "GLD", "USO",
+    # alpha-engine-config-I13096 — benchmark-only (perf tracker vs_qqq). Same
+    # path as SPY: the EOD pass writes its macro Close, MorningEnrich's
+    # polygon_only pass overwrites it with the settled close. Best-effort in
+    # daily_append: a missing QQQ bar never fails the run.
+    "QQQ",
     "XLB", "XLC", "XLE", "XLF", "XLI", "XLK",
     "XLP", "XLRE", "XLU", "XLV", "XLY",
     # config#934 — sub-sector benchmark ETFs (SMH/IGV/XBI/PPH/XOP/KRE/ITA/GDX),

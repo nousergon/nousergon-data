@@ -322,6 +322,53 @@ def test_a_missing_qqq_close_names_the_missing_day_not_the_next_session(monkeypa
     assert reasons == [pt.REASON_QQQ_BASIS, f"qqq_close_missing:{SHORT[4].isoformat()}"]
 
 
+def _with_qqq_columns(csv_text: str, qqq: dict[date, tuple[float | None, float]]) -> str:
+    """Append the executor's ``qqq_close`` / ``qqq_dividend_per_share``
+    columns (alpha-engine-config-I13096) to a ``nav_csv`` export."""
+    lines = csv_text.splitlines()
+    out = [lines[0] + ",qqq_close,qqq_dividend_per_share"]
+    for line in lines[1:]:
+        close, div = qqq.get(date.fromisoformat(line.split(",", 1)[0]), (None, 0.0))
+        out.append(f"{line},{'' if close is None else close},{div}")
+    return "\n".join(out) + "\n"
+
+
+def _build_with_qqq(rows, qqq, *, qqq_hist=None):
+    days = [r[0] for r in rows]
+    return pt.build(
+        pt.parse_nav_csv(_with_qqq_columns(nav_csv(rows), qqq)),
+        [],
+        {"entries_read": 0, "transfer_entries": 0},
+        history(days, 100.0, 0.0005),
+        qqq_hist if qqq_hist is not None else history(days),
+        now=NOW,
+    )
+
+
+def test_settled_qqq_rows_clear_the_basis_reason(monkeypatch):
+    monkeypatch.setattr(pt, "FLOWS_JOURNALED_FROM", SHORT[0])
+    rows = [(d, 1000.0, 100.0, 0.0, "settled_close") for d in SHORT[:5]]
+    qqq = {d: (500.0, 0.0) for d in SHORT[:5]}
+    qqq[SHORT[3]] = (500.0, 5.0)  # $5 ex-dividend, flat price: +1% total return
+    doc = _build_with_qqq(rows, qqq, qqq_hist={})  # the yfinance history is NOT read
+    cell = window(doc, "inception")["cells"]["vs_qqq"]
+    assert cell["status"] == pt.STATUS_OK
+    assert cell["reasons"] == []
+    assert cell["benchmark_pct"] == pytest.approx(1.0, abs=1e-6)
+    assert doc["inputs"]["qqq"]["settled_series"] == f"{pt.NAV_KEY} qqq_close"
+
+
+def test_rows_before_the_qqq_columns_keep_the_basis_reason_for_their_windows(monkeypatch):
+    monkeypatch.setattr(pt, "FLOWS_JOURNALED_FROM", SHORT[0])
+    rows = ledger(SHORT[:10])
+    qqq = {d: (500.0 + i, 0.0) for i, d in enumerate(SHORT[:10]) if i >= 8}
+    doc = _build_with_qqq(rows, qqq)
+    assert window(doc, "inception")["cells"]["vs_qqq"]["reasons"] == [pt.REASON_QQQ_BASIS]
+    day = window(doc, "day")["cells"]["vs_qqq"]
+    assert day["reasons"] == [] and day["status"] == pt.STATUS_OK
+    assert day["benchmark_pct"] == pytest.approx((509.0 / 508.0 - 1) * 100, abs=1e-4)
+
+
 def test_one_row_is_insufficient_everywhere():
     doc = build(ledger(SHORT[:1]))
     assert doc["status_counts"][pt.STATUS_INSUFFICIENT] == len(pt.WINDOWS) * len(pt.COMPARISONS)
