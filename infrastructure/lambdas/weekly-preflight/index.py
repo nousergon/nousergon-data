@@ -144,9 +144,24 @@ _METRIC_NAMESPACE = os.environ.get("PREFLIGHT_METRIC_NAMESPACE", "AlphaEngine/We
 _METRIC_PROFILE = os.environ.get("PREFLIGHT_METRIC_PROFILE", "alpha-engine-weekly-preflight")
 
 
+#: `invocation_kind` values that are NOT a pipeline run, so they must not write
+#: the production series (alpha-engine-config-I12838). `probe` is the stamp
+#: `alpha-engine-config/scripts/check_prespend_gate_arm.py::_payload_for` puts
+#: on every pre-spend gate probe (I8155); `deploy_smoke` is deploy.sh's
+#: post-publish smoke invoke. Measured 2026-11-02: the v1 weekly SF has not run
+#: since 10-24, yet this series carried ~2 invocations a day, every one a
+#: prespend-gate-arm probe with no run_date, and the console graded the
+#: component FAILED from them. The probe reads this handler's RETURN value,
+#: never the series, so dropping its emission costs the probe nothing; a
+#: probe writing the pipeline's own health series is the I8155 defect (a
+#: detector inflating the record of the thing it watches) one series over.
+_NON_PIPELINE_INVOCATION_KINDS = frozenset({"probe", "deploy_smoke"})
+
+
 def _emit_preflight_metrics(
     *,
     status: str,
+    invocation_kind: str | None = None,
     ran_count: int,
     skip_count: int,
     warn_count: int,
@@ -161,7 +176,21 @@ def _emit_preflight_metrics(
     what makes `ran == declared` checkable by a reader who does not know how
     many assertions there are supposed to be this week — the 2026-09-19 run
     reported neither, so "5 of 15" was not a number anyone could see.
+
+    A non-pipeline invocation (``_NON_PIPELINE_INVOCATION_KINDS``) writes
+    nothing and says so in the returned record, so the skip is visible to its
+    caller rather than silent.
     """
+    if invocation_kind in _NON_PIPELINE_INVOCATION_KINDS:
+        print(
+            f"preflight metrics NOT emitted: invocation_kind={invocation_kind!r} "
+            f"is not a pipeline run (status={status})"
+        )
+        return {
+            "emitted": False,
+            "skipped": f"invocation_kind={invocation_kind}",
+            "status": status,
+        }
     try:
         import boto3
 
@@ -245,7 +274,9 @@ def handler(event: dict, context) -> dict:
         # ChecksRan=0 rather than an absence it cannot distinguish from a
         # weekend with no run.
         _emit_preflight_metrics(
-            status="ERROR", ran_count=0, skip_count=0, warn_count=0,
+            status="ERROR",
+            invocation_kind=(event or {}).get("invocation_kind"),
+            ran_count=0, skip_count=0, warn_count=0,
             fail_count=0, required_skip_count=0, declared_count=0,
         )
         return {
@@ -293,7 +324,9 @@ def handler(event: dict, context) -> dict:
         )
     except Exception as exc:
         _emit_preflight_metrics(
-            status="ERROR", ran_count=0, skip_count=0, warn_count=0,
+            status="ERROR",
+            invocation_kind=(event or {}).get("invocation_kind"),
+            ran_count=0, skip_count=0, warn_count=0,
             fail_count=0, required_skip_count=0,
             declared_count=len(getattr(sfp, "CHECKS", ()) or ()),
         )
@@ -330,6 +363,7 @@ def handler(event: dict, context) -> dict:
         is complete by construction rather than by remembering."""
         return _emit_preflight_metrics(
             status=status,
+            invocation_kind=event.get("invocation_kind"),
             ran_count=ran_count,
             skip_count=len(skip_results),
             warn_count=len(warn_results),
