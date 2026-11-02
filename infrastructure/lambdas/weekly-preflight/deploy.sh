@@ -212,11 +212,13 @@ fi
 # "could not execute" turned every push red from 2026-09-21 on).
 # The handler is strictly read-only (Describe/Get/Simulate), so invoking it
 # on every deploy has no side effects and costs a sub-second Lambda run.
+# The payload names itself `deploy_smoke` so the handler does not write the
+# pipeline's AlphaEngine/WeeklyPreflight series for it (alpha-engine-config-I12838).
 if ! $DRY_RUN; then
   echo "Smoke-invoking ${FUNCTION_NAME}:live..."
   RESP=$(mktemp)
   aws lambda invoke --function-name "${FUNCTION_NAME}:live" \
-    --cli-binary-format raw-in-base64-out --payload '{}' \
+    --cli-binary-format raw-in-base64-out --payload '{"invocation_kind": "deploy_smoke"}' \
     --region "${REGION}" "${RESP}" >/dev/null
   SMOKE_STATUS=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('status','MALFORMED'))" "${RESP}")
   echo "  smoke status: ${SMOKE_STATUS}"
