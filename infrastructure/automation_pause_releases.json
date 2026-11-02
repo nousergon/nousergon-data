@@ -30,6 +30,11 @@
     "re_exam": "2026-12-02",
     "release_when": "Brian's 2026-09-01 ruling (alpha-engine-config-I9751 item 3) holds the old weekly to one run a week for the duration of the v2 build. Re-enabling needs a fresh ruling; otherwise it is deleted with the v1 path."
   },
+  "events:alpha-engine-groom-sf-failure": {
+    "issue": "alpha-engine-config-I12794",
+    "re_exam": "2026-12-01",
+    "release_when": "Not released by re-enable. Brian disabled the rule 2026-11-01 as the groomer retirement's operator step (alpha-engine-config-I12794); its only source, alpha-engine-groom-dispatch, is retired. The pause ends when the rule is deleted with the groomer, and this entry and the paused entry go with it."
+  },
   "events:alpha-engine-predictor-drift-check": {
     "issue": "alpha-engine-config-I12715",
     "re_exam": "2026-12-02",
