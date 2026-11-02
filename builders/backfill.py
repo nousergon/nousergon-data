@@ -108,6 +108,10 @@ PROVENANCE_COL = _CANONICAL_PROVENANCE_COL
 #: asserts every ``FRED_HISTORY_MAP`` key is here.
 _RAW_MACRO_SERIES: tuple[str, ...] = (
     "SPY", "VIX", "VIX3M", "TNX", "IRX", "GLD", "USO",
+    # alpha-engine-config-I13096 — benchmark-only: the settled QQQ close the
+    # EOD reconcile persists beside SPY's for the perf tracker's vs_qqq leg.
+    # No feature reads it (``_build_macro_features_df`` does not).
+    "QQQ",
     # config#939 — credit spreads. FRED-only (BAMLH0A0HYM2), licence-gated to
     # 2023+ on FRED; absent from price_data (e.g. pre-Stage-2.5 cache) →
     # macro.get("HYOAS") returns None downstream, which compute_features

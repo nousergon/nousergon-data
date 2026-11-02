@@ -294,6 +294,11 @@ _SKIP_TICKERS = {
     *_MACRO_SLIM_KEYS.values(),
     "SPY", "VIX", "VIX3M", "TNX", "IRX", "GLD", "USO",
     "^VIX", "^VIX3M", "^TNX", "^IRX",
+    # alpha-engine-config-I13096: QQQ is collected daily as a benchmark-only
+    # macro Close (perf tracker vs_qqq). It is an ETF, not a stock, and NOT a
+    # declared universe proxy, so it must never be computed or written to
+    # `universe` — without this, admits_universe_write("QQQ") is True.
+    "QQQ",
     *_SUB_SECTOR_ETFS,
     # Every declared benchmark proxy is skip-protected (see the block above).
     # IWM is here because the "XL" prefix test cannot reach it; the XL*

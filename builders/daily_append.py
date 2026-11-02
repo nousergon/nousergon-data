@@ -338,6 +338,17 @@ def _write_row_backfill_safe(
     return "backfill"
 
 
+#: Macro symbols written as a raw ``Close`` row every weekday that NO feature
+#: reads: benchmarks the EOD reconcile persists beside SPY
+#: (alpha-engine-config-I13096: QQQ, for the perf tracker's vs_qqq leg).
+#: Best-effort — a missing bar never fails the run. Each must also be in
+#: ``weekly_collector._MACRO_DAILY_TICKERS`` (or it is never requested),
+#: ``features.compute._SKIP_TICKERS`` (or it is computed as a stock) and
+#: ``builders/backfill.py::_RAW_MACRO_SERIES`` (or its history is one row per
+#: weekday); ``tests/test_benchmark_only_macro_i13096.py`` holds the lockstep.
+BENCHMARK_ONLY_MACRO_SYMBOLS: tuple[str, ...] = ("QQQ",)
+
+
 #: Trailing calendar-day window the daily append asks FRED for. FRED publishes
 #: DGS2 / BAA10Y / BAMLH0A0HYM2 one business day late, and a skipped evening
 #: (holiday run, failed state) must still be caught up by the next one, so the
@@ -2130,6 +2141,39 @@ def _daily_append_impl(
                 log.warning(
                     "Sub-sector ETF %s bar write failed for %s (non-fatal — "
                     "sub_sector_vs_benchmark_* will neutral-default): %s",
+                    sym, date_str, exc,
+                )
+
+        # Benchmark-only macro series (alpha-engine-config-I13096): QQQ's
+        # settled Close, which the EOD reconcile persists beside SPY's for the
+        # perf tracker's vs_qqq leg. Same source as SPY (this EOD pass writes
+        # it, MorningEnrich's polygon_only pass overwrites it with the settled
+        # close), but BEST-EFFORT like the sub-sector ETFs above: no feature
+        # reads it, so a missing bar is a warning, never a failed run, and it
+        # is NOT added to macro_missing_from_closes. A written bar IS
+        # readback-verified below like every other macro write.
+        for sym in BENCHMARK_ONLY_MACRO_SYMBOLS:
+            bar = closes.get(sym)
+            if bar is None or np.isnan(bar.get("Close", np.nan)):
+                log.warning(
+                    "Benchmark-only %s missing from daily closes for %s — "
+                    "no macro row written (non-fatal; the EOD reconcile "
+                    "persists a null %s close).", sym, date_str, sym.lower(),
+                )
+                continue
+            try:
+                new_row = pd.DataFrame(
+                    [{"Close": bar["Close"]}],
+                    index=pd.DatetimeIndex([today_ts]),
+                )
+                new_row.index.name = "date"
+                with _count_schema_drift(n_schema_drift, on_drift=_emit_schema_drift):
+                    mode = _write_row_backfill_safe(macro_lib, sym, new_row)
+                macro_updated.append(sym)
+                macro_write_modes[sym] = mode
+            except Exception as exc:
+                log.warning(
+                    "Benchmark-only %s bar write failed for %s (non-fatal): %s",
                     sym, date_str, exc,
                 )
 
