@@ -772,7 +772,7 @@ def _undo_vendor_preadjustment(
 
 def _apply_daily_delta(
     s3, bucket: str, date_str: str, price_data: dict[str, pd.DataFrame],
-    *, registry=None,
+    *, registry=None, override_base: bool = True,
 ) -> tuple[dict[str, pd.DataFrame], set[str]]:
     """
     Append daily_closes delta rows to price DataFrames.
@@ -792,6 +792,20 @@ def _apply_daily_delta(
     ``registry`` (keyword-only) is a ``CorporateActionRegistry``; when ``None``
     (legacy positional callers / ``s3=None`` tests) NO corporate-action
     detection or restatement is performed.
+
+    ``override_base`` (keyword-only, default ``True``): whether a delta row may
+    REPLACE a base row of the same date. The daily D31 path keeps ``True`` (its
+    base is ArcticDB, whose recent rows are the same daily captures). The
+    weekly backfill passes ``False`` (alpha-engine-config-I13095): its base is
+    the 10-year ``auto_adjust=True`` price cache, which is dividend-adjusted
+    through each ticker's own last date, while ``staging/daily_closes`` rows
+    are captured on the day and never back-adjusted. The delta window is
+    pinned by the OLDEST cache (a delisted name such as HOLX, ending
+    2026-04-07), so with ``True`` every readable daily_closes row (~20
+    trading days) replaced fresh adjusted rows for EVERY ticker, and ArcticDB
+    was rewritten with a raw tail exactly as long as ``momentum_20d``'s
+    lookback. With ``False`` a ticker only gains delta rows dated after its
+    own base ends, which is the freshness gap the delta exists to bridge.
 
     Returns (updated_price_data, split_tickers).
     """
@@ -922,7 +936,13 @@ def _apply_daily_delta(
         delta_df["source"] = make_source_series(
             [r.get("source", "unknown") for r in delta], index=delta_df.index,
         )
-        if ticker in declared_base_ok:
+        if not override_base and len(base.index):
+            # I13095: never let a raw daily capture replace an adjusted base row.
+            # An emptied delta still flows through the combine below, so the
+            # declared-basis check and any registered split restatement run on
+            # the merged frame exactly as before.
+            delta_df = delta_df[delta_df.index > base.index.max()]
+        if ticker in declared_base_ok and not delta_df.empty:
             # The daily-closes archive stays on the vendor basis, so its rows
             # are restated on their own before they can override restated base
             # rows; the frame-level evidence gate makes this a no-op when the
@@ -933,13 +953,13 @@ def _apply_daily_delta(
             if any(r["status"] == "applied" for r in res):
                 split_tickers.add(ticker)
 
-        if registered_splits.get(ticker):
+        if registered_splits.get(ticker) and not delta_df.empty:
             delta_df, _undone = _undo_vendor_preadjustment(
                 ticker, base, delta_df, registered_splits[ticker],
             )
 
-        combined = pd.concat([base, delta_df])
         # keep="last" so delta rows win on duplicate dates (matches predictor)
+        combined = pd.concat([base, delta_df]) if not delta_df.empty else base
         combined = combined[~combined.index.duplicated(keep="last")].sort_index()
         if ticker in declared_set:
             # Final check on the merged frame: a no-op when both halves agreed;
@@ -1387,8 +1407,24 @@ class AlternativeCoverageError(RuntimeError):
     0.0 for the whole universe, which is indistinguishable from a genuine zero
     (see ``compute_and_write``'s ``val ... else 0.0``) — a red run is the honest
     outcome. A PARTIAL shortfall is logged at ERROR rather than raised, so the
-    daily append still lands on a provider hiccup.
+    daily append still lands on a provider hiccup — and in the snapshot each
+    missing ticker's alternative features are NaN, never the 0.0 defaults
+    (:func:`_mark_alternative_missing`, alpha-engine-config-I13103).
     """
+
+
+class AlternativeLoad(dict):
+    """``{ticker: entry}`` as loaded, plus whether the load came up SHORT.
+
+    A ``dict`` so every existing caller (``alt_data.get(ticker, {})``) is
+    unchanged. ``short`` is True when objects under the partition were
+    unreadable or fewer tickers loaded than the manifest's ``tickers_succeeded``
+    (alpha-engine-config-I13103) — the case that makes a snapshot DEGRADED.
+    A ticker the producer never covered (e.g. ``XLRE``, measured 2026-10-30) is
+    absent without the load being short.
+    """
+
+    short: bool = False
 
 
 def _alt_entry_from_payload(ticker_data: dict) -> dict:
@@ -1439,7 +1475,7 @@ def _alt_entry_from_payload(ticker_data: dict) -> dict:
     }
 
 
-def _load_cached_alternative(s3, bucket: str) -> dict[str, dict]:
+def _load_cached_alternative(s3, bucket: str) -> AlternativeLoad:
     """Load cached alternative data from the most recent DataPhase2 output.
 
     Reads EVERY object under the partition, and reconciles what it loaded
@@ -1485,7 +1521,7 @@ def _load_cached_alternative(s3, bucket: str) -> dict[str, dict]:
                     continue
                 keys.append(key)
 
-        alt_data: dict[str, dict] = {}
+        alt_data = AlternativeLoad()
         unreadable: list[str] = []
         for key in keys:
             ticker = key.split("/")[-1].replace(".json", "")
@@ -1496,11 +1532,13 @@ def _load_cached_alternative(s3, bucket: str) -> dict[str, dict]:
                 unreadable.append(f"{ticker}: {type(exc).__name__}")
 
         if unreadable:
+            alt_data.short = True
             # Was a bare `except Exception: pass`. A per-ticker read failure is
             # a silently-zeroed feature row, so it is named rather than dropped.
             log.error(
                 "Alternative data: %d of %d objects unreadable under %s — those "
-                "tickers get 0.0 for every alternative feature. First 10: %s",
+                "tickers get NaN for every alternative feature in the snapshot "
+                "(alpha-engine-config-I13103). First 10: %s",
                 len(unreadable), len(keys), prefix, unreadable[:10],
             )
 
@@ -1513,6 +1551,7 @@ def _load_cached_alternative(s3, bucket: str) -> dict[str, dict]:
                 prefix, len(alt_data),
             )
         elif len(alt_data) < expected:
+            alt_data.short = True
             if not alt_data:
                 raise AlternativeCoverageError(
                     f"Alternative data: manifest at {prefix}manifest.json reports "
@@ -1523,8 +1562,8 @@ def _load_cached_alternative(s3, bucket: str) -> dict[str, dict]:
             log.error(
                 "Alternative data coverage SHORTFALL for %s: loaded %d of %d "
                 "tickers the producer recorded (%.1f%%). The %d missing tickers "
-                "get 0.0 for every alternative feature, which is not "
-                "distinguishable downstream from a real zero.",
+                "get NaN for every alternative feature in the snapshot and are "
+                "listed in the run result (alpha-engine-config-I13103).",
                 latest_date, len(alt_data), expected,
                 100.0 * len(alt_data) / expected, expected - len(alt_data),
             )
@@ -1569,6 +1608,31 @@ def _expected_alternative_count(s3, bucket: str, prefix: str) -> int | None:
     return int(value) if isinstance(value, (int, float)) else None
 
 
+#: The registered ``alternative``-family columns (``features/registry.py``):
+#: every one is derived ONLY from the per-ticker DataPhase2 payload, so a ticker
+#: with no payload has no basis for any of them.
+ALTERNATIVE_FEATURES: tuple[str, ...] = tuple(GROUPS.get("alternative", ()))
+
+
+def _mark_alternative_missing(row: dict) -> None:
+    """Set every alternative feature in ``row`` to NaN: this ticker had no payload.
+
+    alpha-engine-config-I13103. ``compute_features`` fills a ticker with no
+    alternative payload with plausible constants (0.0, ``days_since_earnings``
+    1.0, ``iv_rank`` 0.5, ``iv_vs_rv`` 1.0) — the same values a genuinely quiet
+    ticker carries, so a partial DataPhase2 load (unreadable objects, or fewer
+    than the manifest's ``tickers_succeeded``) was invisible row by row. NaN is
+    the snapshot's declared "absent" state (``contracts/features_parquet.schema.json``
+    types every feature ``[number, null]``; the ``vwap_divergence_pct`` and
+    ``factor_momentum_ratio`` precedents, I7572/I7539), and a loaded ticker can
+    never be NaN in all seven — ``compute_features`` defaults every ``None`` — so
+    an all-NaN alternative block IS the row-level marker in the published file.
+    The tickers are also listed by name in the run result (``alt_data_missing``).
+    """
+    for f in ALTERNATIVE_FEATURES:
+        row[f] = float("nan")
+
+
 # ── Main computation ─────────────────────────────────────────────────────────
 
 @dataclass
@@ -1586,6 +1650,11 @@ class FeatureBuild:
     n_err: int = 0
     t_load: float = 0.0
     t_compute: float = 0.0
+    #: Tickers computed with NO alternative payload (alpha-engine-config-I13103):
+    #: their alternative columns are NaN in ``features_df``.
+    alt_data_missing: tuple[str, ...] = ()
+    #: The alternative load itself came up short (``AlternativeLoad.short``).
+    alt_load_short: bool = False
 
 
 def build_feature_frame(
@@ -1690,6 +1759,7 @@ def build_feature_frame(
     # here — while featured_df is already in hand — so the second pass below
     # can rebuild the long panel without re-computing or re-loading anything.
     fm_frames: dict[str, pd.DataFrame] = {}
+    alt_missing: list[str] = []
 
     for ticker in universe_tickers:
         try:
@@ -1704,7 +1774,10 @@ def build_feature_frame(
                 macro.get(sub_sector_etf_sym) if sub_sector_etf_sym else None
             )
 
-            # Get alt data for this ticker (if available)
+            # Get alt data for this ticker (if available). A ticker with no
+            # payload still runs through compute_features (which defaults the
+            # alternative columns) and has them set to NaN below (I13103).
+            has_alt = ticker in alt_data
             ticker_alt = alt_data.get(ticker, {})
             earnings_data = ticker_alt.get("earnings")
             revision_data = ticker_alt.get("revisions")
@@ -1758,6 +1831,9 @@ def build_feature_frame(
                     row[f] = float("nan")
                 else:
                     row[f] = 0.0
+            if not has_alt:
+                _mark_alternative_missing(row)
+                alt_missing.append(ticker)
             store_rows.append(row)
             n_ok += 1
 
@@ -1767,6 +1843,16 @@ def build_feature_frame(
             price_data.pop(ticker, None)  # still release on error path
 
     t_compute = time.time() - t0 - t_load
+    if alt_missing:
+        # ERROR when the load came up short (the run is DEGRADED); INFO for a
+        # ticker the producer simply does not cover, which recurs every run.
+        log.log(
+            logging.ERROR if getattr(alt_data, "short", False) else logging.INFO,
+            "Alternative data MISSING for %d of %d computed tickers: their %d "
+            "alternative features are NaN in this snapshot, not the 0.0/0.5/1.0 "
+            "defaults (alpha-engine-config-I13103). First 20: %s",
+            len(alt_missing), n_ok, len(ALTERNATIVE_FEATURES), sorted(alt_missing)[:20],
+        )
     log.info(
         "Feature computation complete in %.1fs: %d OK, %d skipped, %d errors "
         "(of %d universe tickers)",
@@ -1874,6 +1960,8 @@ def build_feature_frame(
         n_err=n_err,
         t_load=t_load,
         t_compute=t_compute,
+        alt_data_missing=tuple(sorted(alt_missing)),
+        alt_load_short=bool(getattr(alt_data, "short", False)),
     )
 
 
@@ -1989,6 +2077,10 @@ def compute_and_write(
     features_df = build.features_df
     macro = build.macro
     n_ok, n_skip, n_err = build.n_ok, build.n_skip, build.n_err
+    alt_data_missing = list(build.alt_data_missing)
+    # Degraded only when the LOAD was short and it reached a computed ticker; a
+    # ticker the producer never covers is NaN-marked on every run, not a defect.
+    _alt_short = bool(alt_data_missing) and build.alt_load_short
     t_load, t_compute = build.t_load, build.t_compute
 
     # ── 3. Write to S3 ───────────────────────────────────────────────────────
@@ -2123,11 +2215,16 @@ def compute_and_write(
         # A distinct status rather than "ok" so no caller can read a run whose
         # feature store carries a dead column as a fully clean one
         # (alpha-engine-config-I7572).
-        "status": "degraded" if (_zero_variance or _all_null) else "ok",
+        # A partial alternative load is DEGRADED too (alpha-engine-config-I13103):
+        # the snapshot is written with those tickers' alternative columns NaN.
+        "status": "degraded" if (_zero_variance or _all_null or _alt_short) else "ok",
         "zero_variance_columns": _zero_variance,
         # Separate key, not folded into the one above: "constant" and "empty"
         # send the reader to different producer questions.
         "all_null_columns": _all_null,
+        # alpha-engine-config-I13103: tickers written with NO alternative
+        # payload — their alternative columns are NaN in the snapshot.
+        "alt_data_missing": alt_data_missing,
         "date": date_str,
         "tickers_computed": n_ok,
         "tickers_skipped": n_skip,
@@ -2167,10 +2264,16 @@ def compute_and_write(
                 "zero-variance feature column(s) "
                 f"{dict(sorted(_zero_variance.items()))} (column: non_null_count)"
             )
+        if _alt_short:
+            _parts.append(
+                "alternative data load SHORT: no payload for "
+                f"{len(alt_data_missing)} ticker(s), alternative columns NaN: "
+                f"{alt_data_missing[:20]}"
+            )
         result["reason"] = (
             "; ".join(_parts)
-            + f" over {n_ok} tickers on the daily path — snapshot written, "
-            "column(s) carry no signal"
+            + f" over {n_ok} tickers on the daily path — snapshot written"
+            + (", column(s) carry no signal" if (_all_null or _zero_variance) else "")
         )
 
     log.info("Feature store compute complete: %s", json.dumps(result, default=str))

@@ -1710,6 +1710,20 @@ alert_classes:
     response: drain-queue
     # derived: severities [dynamic] — resolved per emission
     tier: dynamic
+  - class: data_d02_reference_diff_probe
+    # alpha-engine-config-I13045 (prevention for nous-ergon-ops-I2043): the
+    # weekday READ-ONLY rehearsal of D02's reference attestation. It names each
+    # roster change Saturday's historical_constituents would fail on, and the
+    # declaration file that would explain it, so the declaration PR lands
+    # before the weekly instead of after it fails.
+    source: "nousergon-data/validators/d02_reference_diff_probe.py"
+    severities: [warning]
+    intake: bus
+    response: drain-queue
+    # DECLARED notify-silent: the finding is days ahead of the run it would
+    # fail, so it is actionable this week, not this minute; D02 itself stays
+    # fail-closed and keeps its own page on Saturday.
+    tier: notify-silent
   - class: data_spot_quota_fallback
     source: "data-spot-dispatcher._launch_instance"
     severities: [warning]

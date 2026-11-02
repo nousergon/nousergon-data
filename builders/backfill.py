@@ -1083,8 +1083,12 @@ def backfill(
         # ``_apply_daily_delta`` AND the post-condition audit below, so the
         # audit sees this run's just-detected actions.
         registry = _build_registry(s3, bucket)
+        # override_base=False (alpha-engine-config-I13095): the cache rows are
+        # dividend-adjusted; a raw daily_closes row may only EXTEND a ticker
+        # past its own cache end, never replace an adjusted row.
         price_data, split_tickers = _apply_daily_delta(
             s3, bucket, today_str, price_data, registry=registry,
+            override_base=False,
         )
         if split_tickers:
             # data#1298: these tickers had a registered split detected and their
