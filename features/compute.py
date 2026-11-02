@@ -772,7 +772,7 @@ def _undo_vendor_preadjustment(
 
 def _apply_daily_delta(
     s3, bucket: str, date_str: str, price_data: dict[str, pd.DataFrame],
-    *, registry=None,
+    *, registry=None, override_base: bool = True,
 ) -> tuple[dict[str, pd.DataFrame], set[str]]:
     """
     Append daily_closes delta rows to price DataFrames.
@@ -792,6 +792,20 @@ def _apply_daily_delta(
     ``registry`` (keyword-only) is a ``CorporateActionRegistry``; when ``None``
     (legacy positional callers / ``s3=None`` tests) NO corporate-action
     detection or restatement is performed.
+
+    ``override_base`` (keyword-only, default ``True``): whether a delta row may
+    REPLACE a base row of the same date. The daily D31 path keeps ``True`` (its
+    base is ArcticDB, whose recent rows are the same daily captures). The
+    weekly backfill passes ``False`` (alpha-engine-config-I13095): its base is
+    the 10-year ``auto_adjust=True`` price cache, which is dividend-adjusted
+    through each ticker's own last date, while ``staging/daily_closes`` rows
+    are captured on the day and never back-adjusted. The delta window is
+    pinned by the OLDEST cache (a delisted name such as HOLX, ending
+    2026-04-07), so with ``True`` every readable daily_closes row (~20
+    trading days) replaced fresh adjusted rows for EVERY ticker, and ArcticDB
+    was rewritten with a raw tail exactly as long as ``momentum_20d``'s
+    lookback. With ``False`` a ticker only gains delta rows dated after its
+    own base ends, which is the freshness gap the delta exists to bridge.
 
     Returns (updated_price_data, split_tickers).
     """
@@ -922,7 +936,13 @@ def _apply_daily_delta(
         delta_df["source"] = make_source_series(
             [r.get("source", "unknown") for r in delta], index=delta_df.index,
         )
-        if ticker in declared_base_ok:
+        if not override_base and len(base.index):
+            # I13095: never let a raw daily capture replace an adjusted base row.
+            # An emptied delta still flows through the combine below, so the
+            # declared-basis check and any registered split restatement run on
+            # the merged frame exactly as before.
+            delta_df = delta_df[delta_df.index > base.index.max()]
+        if ticker in declared_base_ok and not delta_df.empty:
             # The daily-closes archive stays on the vendor basis, so its rows
             # are restated on their own before they can override restated base
             # rows; the frame-level evidence gate makes this a no-op when the
@@ -933,13 +953,13 @@ def _apply_daily_delta(
             if any(r["status"] == "applied" for r in res):
                 split_tickers.add(ticker)
 
-        if registered_splits.get(ticker):
+        if registered_splits.get(ticker) and not delta_df.empty:
             delta_df, _undone = _undo_vendor_preadjustment(
                 ticker, base, delta_df, registered_splits[ticker],
             )
 
-        combined = pd.concat([base, delta_df])
         # keep="last" so delta rows win on duplicate dates (matches predictor)
+        combined = pd.concat([base, delta_df]) if not delta_df.empty else base
         combined = combined[~combined.index.duplicated(keep="last")].sort_index()
         if ticker in declared_set:
             # Final check on the merged frame: a no-op when both halves agreed;
