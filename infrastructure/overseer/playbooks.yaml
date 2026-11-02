@@ -912,6 +912,24 @@ alert_classes:
       the rest of the session. crucible-executor#621 merged at 20:12Z on
       2026-10-23 and nothing flagged it; drain-queue triage alone would
       surface it after the close.
+  - class: executor_trader_unit_failed
+    source: "alpha-engine/executor/trader_unit_failed.py"
+    severities: [error]
+    intake: bus
+    response: drain-queue
+    # DECLARED page (alpha-engine-config-I12353). A v2 trader unit on the
+    # trading box (session, reconcile, shadow-books or pin-smoke) ended
+    # `failed`; systemd's OnFailure= runs the notifier, which carries the
+    # unit's state and last 50 journal lines. On 2026-10-14/15 four such runs
+    # died before writing any record and nothing paged.
+    tier: page
+    operator_reason: >-
+      The trader timers do not catch up (Persistent=false), so the failed
+      run is not retried and a paper session is lost unless a human fixes
+      the cause (provisioning, the pinned venv build or the trader) before
+      the next scheduled run. The box is stopped after the close, so its
+      journal is unreadable until morning; the page carries the tail.
+      drain-queue still owns triage of the underlying error.
 
   # ── backtester (crucible-backtester) ──
   - class: backtester_executor_opt_rejected
