@@ -65,6 +65,7 @@ class _FakeSFN:
         self._executions = executions_by_machine
         self._histories = histories
         self.listed = []
+        self.history_kwargs = []
 
     def get_paginator(self, name):
         outer = self
@@ -77,7 +78,8 @@ class _FakeSFN:
             return _ListPaginator()
         if name == "get_execution_history":
             class _HistPaginator:
-                def paginate(self, executionArn, maxResults=1000):  # noqa: N803
+                def paginate(self, executionArn, maxResults=1000, **kwargs):  # noqa: N803
+                    outer.history_kwargs.append(kwargs)
                     return [{"events": outer._histories.get(executionArn, [])}]
 
             return _HistPaginator()
@@ -139,6 +141,17 @@ def test_counts_per_machine_only_executions_entering_a_data_stage():
     assert by_name["ne-postclose-trading-pipeline"].data_stage_executions == ("e2",)
     assert result.executions_since_cutover == 2
     assert result.data_stage_executions == ("w2", "e2")
+
+
+def test_history_is_read_without_execution_data():
+    """Only the entered state's name is read, so every history page asks for
+    no state input/output: the API default ships both, ~5.9 MB vs ~99 KB per
+    page of the weekly machine, billed as Step Functions egress
+    (nous-ergon-ops-I2001)."""
+    executions = {PREOPEN: [{"executionArn": "p1", "startDate": _dt(2026, 9, 29, 12, 15)}]}
+    sfn = _FakeSFN(executions, {"p1": _entered("WaitForCollectionManifests")})
+    m.count_executions_since_cutover(sfn, cutover=CUTOVER, now=NOW)
+    assert sfn.history_kwargs == [{"includeExecutionData": False}]
 
 
 def test_stops_paging_at_the_cutover_boundary():
