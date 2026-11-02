@@ -79,6 +79,7 @@ from store.arctic_store import (
     to_arctic_safe,
 )
 from store.parquet_loader import load_parquet_from_s3
+from builders import ticker_holds as _ticker_holds
 from builders._price_cache_writeboth import (
     PRICE_CACHE_LEGACY_PREFIX,
     price_cache_read_prefixes,
@@ -1595,7 +1596,9 @@ def _splice_basis_guard(
         the operator's cue).
 
     Returns ``(bar, verdict)`` with verdict ``"ok"`` / ``"restated"`` /
-    ``"refused"``. Fail-open on missing inputs (no prior close / NaN bar
+    ``"refused"`` / ``"unexplained"``. ``"unexplained"`` is the pure-append
+    page: the bar is written exactly as on ``"ok"``, and the caller opens a
+    ticker hold (alpha-engine-config-I13044). Fail-open on missing inputs (no prior close / NaN bar
     close): the guard protects against DISCONTINUITY; absence of evidence is
     not one. ``DAILY_APPEND_SPLICE_GUARD_ALLOW=TICKER:YYYY-MM-DD`` force-writes
     through a refusal.
@@ -1816,7 +1819,10 @@ def _splice_basis_guard(
         scope, ticker, today_ts.date(),
         _SPLICE_GUARD_EX_DATE_EARLY_DAYS, _SPLICE_GUARD_EX_DATE_AHEAD_DAYS,
     )
-    return bar, "ok"
+    # alpha-engine-config-I13044: the bar is still written, but the caller
+    # also opens a machine-written hold that keeps the name out of picks
+    # until the series is restated (builders/ticker_holds.py).
+    return bar, "unexplained"
 
 
 def daily_append(
@@ -2555,6 +2561,24 @@ def _daily_append_impl(
             ca_registry = None
             splits_by_ticker = {}
 
+    # ── Machine-written ticker holds (alpha-engine-config-I13044) ────────────
+    # Loaded once so each held ticker's stored series can be checked for the
+    # restatement that clears its hold. An unreadable prefix clears nothing
+    # this run (the holds stay, which is the safe direction) and new holds
+    # are still opened.
+    ticker_holds_active: dict[str, dict] = {}
+    holds_opened: list[str] = []
+    holds_cleared: list[str] = []
+    if not dry_run:
+        try:
+            ticker_holds_active = _ticker_holds.load_active_holds(s3, bucket)
+        except Exception as exc:
+            log.error(
+                "daily_append: ticker holds unreadable under s3://%s/%s (%s) - "
+                "no hold is auto-cleared this run (alpha-engine-config-I13044)",
+                bucket, _ticker_holds.HOLDS_PREFIX, exc,
+            )
+
     # ── 4. Chunked universe pass ─────────────────────────────────────────────
     # The full-universe Phase 1+2 in one shot holds ~900 ticker histories in
     # memory simultaneously (~180MB peak resident) — on the 2GB t3.small
@@ -2625,6 +2649,32 @@ def _daily_append_impl(
                     # n_err during the batch read above, skip silently.
                     continue
 
+                # A held ticker's hold clears once the STORED series no longer
+                # prints the break (vendor re-adjustment or an applied action
+                # restated it). Evidence only: no row, no clear.
+                held = ticker_holds_active.get(ticker)
+                if held is not None:
+                    try:
+                        restated, now_ratio = _ticker_holds.break_restated(
+                            held, hist, _SPLICE_GUARD_SOFT_RATIO,
+                        )
+                        if restated:
+                            _ticker_holds.clear_hold(
+                                s3, bucket, held,
+                                reason=(
+                                    "stored series restated: the %s close over the "
+                                    "prior stored close is now %.4f (held at %s)"
+                                    % (held.get("break_date"), now_ratio, held.get("ratio"))
+                                ),
+                                cleared_by="auto:builders.daily_append",
+                            )
+                            holds_cleared.append(ticker)
+                    except Exception as exc:
+                        log.error(
+                            "daily_append: could not evaluate the hold on %s (%s) - "
+                            "the hold stays (alpha-engine-config-I13044)", ticker, exc,
+                        )
+
                 # Re-running daily_append for the same date MUST overwrite the
                 # existing row by default — universe_lib.update() is idempotent
                 # for same-date rows, but the 2026-04-17 polygon-label incident
@@ -2692,6 +2742,32 @@ def _daily_append_impl(
                     n_quality_blocked += 1
                     quality_blocked_details.append((ticker, "splice_basis_guard"))
                     continue
+                if splice_verdict == "unexplained":
+                    # The bar is still written (a genuine move is possible);
+                    # the hold keeps the name out of picks until the series is
+                    # restated or an operator clears it (I13044). A failed hold
+                    # write pages but never withholds the append.
+                    try:
+                        _prior = hist.loc[hist.index < today_ts, "Close"].dropna()
+                        _prior_close = float(_prior.iloc[-1])
+                        _bar_close = float(bar["Close"])
+                        if _ticker_holds.open_hold(
+                            s3, bucket,
+                            ticker=ticker,
+                            break_date=str(today_ts.date()),
+                            prior_date=str(pd.Timestamp(_prior.index[-1]).date()),
+                            prior_close=_prior_close,
+                            break_close=_bar_close,
+                            ratio=_bar_close / _prior_close,
+                        ) is not None:
+                            holds_opened.append(ticker)
+                    except Exception as exc:
+                        log.error(
+                            "daily_append: FAILED to open the ticker hold on %s @ %s "
+                            "(%s) - the unexplained split-like break is written and "
+                            "NOT held out of picks (alpha-engine-config-I13044)",
+                            ticker, today_ts.date(), exc,
+                        )
 
                 new_row_data = {col: bar.get(col, np.nan) for col in OHLCV_COLS}
                 # Carry per-row provenance through to the ArcticDB write. Source
@@ -3249,6 +3325,9 @@ def _daily_append_impl(
         "l2_gate_counts": dict(l2_counts_by_gate),
         "l2_block_gates": sorted(l2_block_gates),
         "schema_drift_incidents": n_schema_drift[0],
+        # alpha-engine-config-I13044: machine-written ticker holds.
+        "ticker_holds_opened": sorted(holds_opened),
+        "ticker_holds_cleared": sorted(holds_cleared),
         "load_seconds": round(t_load, 1),
         "total_seconds": round(t_total, 1),
         "dry_run": dry_run,
