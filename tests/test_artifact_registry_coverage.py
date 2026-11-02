@@ -248,6 +248,12 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # console rows, and the report/latest/last_clean writes share a call site.
     "infrastructure/preflight_sweep.py": 2,
     "builders/_price_cache_writeboth.py": 2,
+    # alpha-engine-config-I13044: per-ticker hold records under
+    # data_quality/ticker_holds/{TICKER}.json, opened by daily_append on an
+    # unexplained split-like pure append and cleared on restatement or by an
+    # operator. Event-driven, variable cardinality: grandfathered_paths entry
+    # in ARTIFACT_REGISTRY.yaml, no SLA row.
+    "builders/ticker_holds.py": 1,
     # universe_freshness.json + weekly/<date>/manifest.json (schema_drift_incidents,
     # config#1150) + feature_store/_freshness.json (ArcticDB freshness-monitor
     # sentinel, config#1787 — Brian's 2026-07-08 Option-B ruling: registered as
