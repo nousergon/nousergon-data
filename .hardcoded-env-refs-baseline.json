@@ -550,12 +550,6 @@
     "infrastructure/lambdas/friday-shell-run-report/test_handler.py": {
       "account": 3
     },
-    "infrastructure/lambdas/groom-inject-mock/deploy.sh": {
-      "account": 1
-    },
-    "infrastructure/lambdas/groom-inject-mock/iam-policy.json": {
-      "account": 1
-    },
     "infrastructure/lambdas/overseer-backstop-responder/deploy.sh": {
       "account": 1
     },
@@ -1110,10 +1104,6 @@
     "scripts/download_lm_dict.py": {
       "bucket": 1
     },
-    "scripts/fault_injection_run.py": {
-      "account": 1,
-      "bucket": 1
-    },
     "scripts/gen_observability_rows.py": {
       "bucket": 1
     },
@@ -1246,7 +1236,7 @@
       "bucket": 1
     },
     "tests/test_artifact_registry_coverage.py": {
-      "bucket": 8
+      "bucket": 7
     },
     "tests/test_backfill_no_regression.py": {
       "bucket": 2
@@ -1357,9 +1347,6 @@
     },
     "tests/test_failure_staging_is_retained.py": {
       "bucket": 1
-    },
-    "tests/test_fault_injection_staging.py": {
-      "account": 1
     },
     "tests/test_features_settled_regrade.py": {
       "bucket": 1

@@ -70,7 +70,6 @@ _REGISTER = {
     "infrastructure/lambdas/expense-collector/deploy.sh",
     "infrastructure/lambdas/freshness-monitor/deploy.sh",
     "infrastructure/lambdas/friday-shell-run-report/deploy.sh",
-    "infrastructure/lambdas/groom-inject-mock/deploy.sh",
     "infrastructure/lambdas/overseer-backstop-responder/deploy.sh",
     "infrastructure/lambdas/overseer-dispatcher/deploy.sh",
     "infrastructure/lambdas/overseer-liveness-probe/deploy.sh",
