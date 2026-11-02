@@ -259,7 +259,37 @@ def test_failed_preopen_names_the_state_and_the_real_error_end_to_end(reset_send
     assert "403" in cause_line
     assert "Write access to repository not granted" in cause_line
     assert "One or more weekday pipeline steps failed." not in cause_line
+    # Brian 2026-11-02: the alert says whether anything retries it. A git 403
+    # is a credential failure, which a retry cannot clear.
+    auto_fix = [line for line in text.splitlines() if line.startswith("Auto-fix:")]
+    assert len(auto_fix) == 1
+    assert "credential or permission" in auto_fix[0]
     assert result["status"] == "FAILED"
+
+
+def test_failed_guard_refusal_says_a_retry_cannot_help(reset_send_message):
+    """The 2026-11-02 preopen: the executor refused a 10-day-old champion
+    cohort. The alert must say no retry is coming and why."""
+    event = _event("FAILED", sm_arn=WEEKDAY_ARN)
+    reset_send_message.describe_execution.return_value = {
+        "error": "DailyPipelineFailure",
+        "cause": (
+            "executor.champion.StaleChampionFeedError: scanner_predictor_direct "
+            "champion cohort is stale. A stale champion feed must not trade silently."
+        ),
+    }
+    index.handler(event, None)
+    text = _telegram_mod.send_message.call_args.args[0]
+    auto_fix = [line for line in text.splitlines() if line.startswith("Auto-fix:")]
+    assert auto_fix == [line for line in auto_fix if "safety guard refused" in line]
+    assert len(auto_fix) == 1
+
+
+def test_succeeded_carries_no_failure_auto_fix_line(reset_send_message):
+    index.handler(_event("SUCCEEDED", sm_arn=EOD_ARN), None)
+    text = _telegram_mod.send_message.call_args.args[0]
+    assert "safety guard refused" not in text
+    assert "Unclassified failure" not in text
 
 
 def test_failed_with_describe_execution_error_still_sends(reset_send_message):
