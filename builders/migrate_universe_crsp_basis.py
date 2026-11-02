@@ -244,6 +244,15 @@ class ReconcileRecord:
     reconcile_start: str | None = None  # None ⇒ full-history (default, unchanged)
     n_common_in_window: int = 0  # common dates >= reconcile_start (gate these)
     n_common_excluded: int = 0  # common dates < reconcile_start (best-effort, ungated)
+    # ── where the residual steps (alpha-engine-config-I13034) ─────────────────
+    # The in-window date of the largest single-date move in the anchor-rebased
+    # new/reference ratio, and the largest relative deviation strictly BEFORE
+    # it. A share distribution one side folds in and the other does not is ONE
+    # level step at its ex-date with a flat residual before it; a declared row
+    # explains a CLOSE-axis residual only when this is what the series shows
+    # (``explain_close_by_declared``). ``None`` when there are not two dates.
+    step_date: str | None = None
+    pre_step_max_rel_dev: float | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -259,6 +268,8 @@ class ReconcileRecord:
             "n_common_in_window": self.n_common_in_window,
             "n_common_excluded": self.n_common_excluded,
             "pre_window_best_effort": self.n_common_excluded > 0,
+            "step_date": self.step_date,
+            "pre_step_max_rel_dev": self.pre_step_max_rel_dev,
         }
 
 
@@ -1108,6 +1119,33 @@ def _nearest_action(date: pd.Timestamp, actions: list, window_days: int) -> obje
     return best
 
 
+def _residual_step(
+    a: np.ndarray, b: np.ndarray, rel_dev: np.ndarray, dates: pd.Index,
+) -> tuple[str | None, float | None]:
+    """Locate the residual's step (alpha-engine-config-I13034).
+
+    ``a`` and ``b`` are the anchor-rebased new and reference series on the
+    in-window dates, ``rel_dev`` their per-date relative deviation. The step is
+    the date of the largest single-date move in ``log(a / b)``; the second value
+    is the largest ``rel_dev`` strictly before it. A date whose ratio is not
+    finite contributes no move. Returns ``(None, None)`` with fewer than two
+    dates or no finite move."""
+    if len(a) < 2:
+        return None, None
+    with np.errstate(divide="ignore", invalid="ignore"):
+        log_ratio = np.log(a / b)
+    moves = np.abs(np.diff(log_ratio))
+    moves = np.where(np.isfinite(moves), moves, -1.0)
+    pos = int(np.argmax(moves))
+    if moves[pos] < 0.0:
+        return None, None
+    step_pos = pos + 1
+    return (
+        pd.Timestamp(dates[step_pos]).strftime("%Y-%m-%d"),
+        float(np.max(rel_dev[:step_pos])),
+    )
+
+
 def reconcile_total_return(
     ticker: str,
     new_tr_close: pd.Series,
@@ -1241,6 +1279,8 @@ def reconcile_total_return(
     worst_pos = int(np.argmax(rel_dev))
     max_rel_dev = float(rel_dev[worst_pos])
     max_dev_date = pd.Timestamp(in_window[worst_pos]).strftime("%Y-%m-%d")
+    step_date, pre_step_max_rel_dev = _residual_step(a, b, rel_dev, in_window)
+    step_fields = dict(step_date=step_date, pre_step_max_rel_dev=pre_step_max_rel_dev)
 
     all_actions = list(split_actions or []) + list(dividend_actions or [])
     near = _nearest_action(
@@ -1269,6 +1309,7 @@ def reconcile_total_return(
             reconcile_start=reconcile_start_str,
             n_common_in_window=n_in_window,
             n_common_excluded=n_excluded,
+            **step_fields,
         )
 
     if known_divergence:
@@ -1290,6 +1331,7 @@ def reconcile_total_return(
             reconcile_start=reconcile_start_str,
             n_common_in_window=n_in_window,
             n_common_excluded=n_excluded,
+            **step_fields,
         )
 
     explanation = (
@@ -1312,6 +1354,7 @@ def reconcile_total_return(
         reconcile_start=reconcile_start_str,
         n_common_in_window=n_in_window,
         n_common_excluded=n_excluded,
+        **step_fields,
     )
 
 
@@ -1374,8 +1417,9 @@ def reconcile_close(
 # On the TOTAL-RETURN axis this is CLASSIFICATION ONLY: a declared row does NOT
 # make a residual "explained" there. On the CLOSE axis, which gates, a row of a
 # share-distribution class (``CLOSE_EXPLAINING_CLASSES``) explains a residual
-# that is inside its bound and unexpired (``explain_close_by_declared``,
-# alpha-engine-config-I12436); everything else is explained only by the
+# that is inside its bound, unexpired, and steps at the declared event with a
+# flat residual before it (``explain_close_by_declared``,
+# alpha-engine-config-I12436 / I13034); everything else is explained only by the
 # operator's ``--known-divergence``. The audit records each out-of-tolerance name's class
 # (or that it has none), whether its deviation is inside the declared bound, and
 # whether the row has expired, so a residual that outgrows its event, or a name
@@ -1552,22 +1596,78 @@ def classify_divergences(
 # axis (dividends play no part in the split-only ``Close``).
 CLOSE_EXPLAINING_CLASSES = ("spin_off", "stock_dividend")
 
+# How far (calendar days) the residual's step may sit outside the declared
+# event's date — or, for a row sourced only to the month, outside that month —
+# and still be that event's step (alpha-engine-config-I13034). It absorbs a
+# reference or new bar missing on the ex-date itself (the move then lands on the
+# next common date) and a holiday-shifted ex-date; it does not let an unrelated
+# step weeks away borrow the row. A row sourced only to the year cannot place
+# the step at all and explains nothing on this axis.
+DECLARED_EVENT_STEP_WINDOW_DAYS = 5
+
+
+def declared_event_window(
+    d: DeclaredDivergence,
+) -> tuple[pd.Timestamp, pd.Timestamp] | None:
+    """The inclusive date range the residual must step in for ``d`` to explain
+    it: the declared day, or the declared month, widened by
+    ``DECLARED_EVENT_STEP_WINDOW_DAYS`` each side. ``None`` for a year-only
+    row (alpha-engine-config-I13034)."""
+    pad = pd.Timedelta(DECLARED_EVENT_STEP_WINDOW_DAYS, unit="D")
+    if len(d.event_when) == 10:
+        day = pd.Timestamp(d.event_when).normalize()
+        return day - pad, day + pad
+    if len(d.event_when) == 7:
+        start = pd.Timestamp(d.event_when).normalize()
+        end = start + pd.offsets.MonthEnd(0)
+        return start - pad, end + pad
+    return None
+
+
+def _declared_step_refusal(
+    r: ReconcileRecord, d: DeclaredDivergence, rel_tol: float,
+) -> str | None:
+    """Why ``d`` does NOT explain ``r``'s residual, or ``None`` when the residual
+    is the declared event's: one step inside the event window with a residual
+    within ``rel_tol`` before it (alpha-engine-config-I13034). A declared row
+    that covers the size of a residual says nothing about WHERE it starts; an
+    unrelated missing split or bad close inside the bound would otherwise pass."""
+    window = declared_event_window(d)
+    if window is None:
+        return (f"the row's date {d.event_when} is year-only, so it cannot place "
+                f"the residual's step")
+    if r.step_date is None or r.pre_step_max_rel_dev is None:
+        return "the residual's step could not be located"
+    step = pd.Timestamp(r.step_date).normalize()
+    lo, hi = window
+    if not lo <= step <= hi:
+        return (f"the residual steps at {r.step_date}, outside the declared event "
+                f"window {lo:%Y-%m-%d}..{hi:%Y-%m-%d}")
+    if not np.isfinite(r.pre_step_max_rel_dev) or r.pre_step_max_rel_dev > rel_tol:
+        return (f"the residual is not flat before its step at {r.step_date} "
+                f"({r.pre_step_max_rel_dev:.4%} > {rel_tol:.2%})")
+    return None
+
 
 def explain_close_by_declared(
     records: list[ReconcileRecord],
     *,
     today: str | pd.Timestamp | None = None,
     declared: tuple[DeclaredDivergence, ...] | None = None,
+    rel_tol: float = DEFAULT_RECONCILE_REL_TOL,
 ) -> tuple[list[ReconcileRecord], list[dict]]:
     """Mark a CLOSE-axis residual explained when a reviewed, unexpired declared
     row of a share-distribution class covers it and the residual is inside the
-    row's bound (alpha-engine-config-I12436, option (a) of the 2026-10-29 card).
+    row's bound (alpha-engine-config-I12436, option (a) of the 2026-10-29 card),
+    AND the residual is that event's: it steps inside the row's event window and
+    is within ``rel_tol`` before the step (alpha-engine-config-I13034).
 
-    A residual outside the bound, past the row's expiry, with no row, or on a
-    class that does not act on the split-only ``Close`` stays unexplained and
-    fails the gate. The operator's ``--known-divergence`` is untouched: a record
-    that is already explained is returned as it came. Returns the records and
-    one audit row per name this call explained."""
+    A residual outside the bound, past the row's expiry, with no row, on a
+    class that does not act on the split-only ``Close``, or that steps anywhere
+    but the declared event stays unexplained and fails the gate exactly as it
+    would with no row. The operator's ``--known-divergence`` is untouched: a
+    record that is already explained is returned as it came. Returns the records
+    and one audit row per name this call explained."""
     table = (
         _declared_by_ticker() if declared is None
         else {d.ticker: d for d in declared}
@@ -1588,13 +1688,25 @@ def explain_close_by_declared(
         ):
             out.append(r)
             continue
+        refusal = _declared_step_refusal(r, d, rel_tol)
+        if refusal is not None:
+            out.append(dataclasses.replace(
+                r,
+                explanation=(
+                    f"{r.explanation} [NOT explained by declared "
+                    f"{d.divergence_class} row ({d.event}, {d.event_when}): "
+                    f"{refusal}]"
+                ),
+            ))
+            continue
         out.append(dataclasses.replace(
             r,
             explained=True,
             explanation=(
                 f"{r.explanation} [explained by declared {d.divergence_class} "
-                f"row: {d.event}, {d.event_when}; inside the declared bound, "
-                f"expires {d.expires}]"
+                f"row: {d.event}, {d.event_when}; steps at {r.step_date}, inside "
+                f"the declared event window and the declared bound, expires "
+                f"{d.expires}]"
             ),
         ))
         explained_rows.append({
@@ -1605,6 +1717,8 @@ def explain_close_by_declared(
             "max_rel_dev": r.max_rel_dev,
             "max_rel_dev_bound": d.max_rel_dev_bound,
             "expires": d.expires,
+            "step_date": r.step_date,
+            "pre_step_max_rel_dev": r.pre_step_max_rel_dev,
         })
     return out, explained_rows
 
@@ -2026,7 +2140,9 @@ def _run_and_report(
         if o.prior_tickers:
             prior_ticker_dividends.append({"ticker": o.ticker, "prior": o.prior_tickers})
 
-    close_records, close_declared_explained = explain_close_by_declared(close_records)
+    close_records, close_declared_explained = explain_close_by_declared(
+        close_records, rel_tol=rel_tol,
+    )
     tr_records = records
     tr_unexplained = [r for r in tr_records if not r.explained]
     close_unexplained = [r for r in close_records if not r.explained]
@@ -2187,7 +2303,8 @@ def _run_and_report(
         # gate; ``unexplained_count`` above is unchanged by it.
         "divergence_classes": divergence_classes,
         # Close-axis names a reviewed declared row explained (I12436); each is
-        # inside its bound and unexpired, and is named here so the gate's
+        # inside its bound, unexpired and steps at its declared event (I13034),
+        # with that step date, and is named here so the gate's
         # pass is never silent about why.
         "close_declared_explained": close_declared_explained,
         "classified_out_of_tol_count": len(divergence_classes["classified"]),
