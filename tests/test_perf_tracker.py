@@ -283,6 +283,45 @@ def test_a_basis_change_inside_a_window_is_reported():
     assert window(doc, "day")["nav_basis_changes"] == []
 
 
+def test_a_row_off_the_settled_basis_makes_its_window_estimated_with_a_dated_reason(monkeypatch):
+    # Ground truth is IB shares + cash at Polygon settled closes (settled_close).
+    # An ib_netliq or unrecorded row is a non-authoritative input: the number
+    # is still published, the cell says estimated and names the dated span.
+    monkeypatch.setattr(pt, "FLOWS_JOURNALED_FROM", SHORT[0])
+    rows = ledger(SHORT[:10])
+    basis = ["", "", "ib_netliq", "ib_netliq", "ib_netliq"] + ["settled_close"] * 5
+    rows = [(d, n, s, v, b) for (d, n, s, v, _), b in zip(rows, basis, strict=True)]
+    doc = build(rows)
+    inception = window(doc, "inception")["cells"]
+    want = f"{pt.REASON_NAV_BASIS}:{SHORT[0].isoformat()}..{SHORT[4].isoformat()}"
+    assert inception["absolute"]["status"] == pt.STATUS_ESTIMATED
+    assert inception["absolute"]["reasons"] == [want]
+    assert inception["absolute"]["return_pct"] is not None
+    assert want in inception["vs_spy"]["reasons"] and want in inception["alpha"]["reasons"]
+    # A window entirely on the settled basis stays clean.
+    day = window(doc, "day")["cells"]["absolute"]
+    assert day["status"] == pt.STATUS_OK and day["reasons"] == []
+
+
+def test_an_off_basis_base_row_alone_marks_the_window(monkeypatch):
+    # The base row is the first factor's denominator, so it counts.
+    monkeypatch.setattr(pt, "FLOWS_JOURNALED_FROM", SHORT[0])
+    rows = ledger(SHORT[:10])
+    rows = [(d, n, s, v, "ib_netliq" if i == 8 else b) for i, (d, n, s, v, b) in enumerate(rows)]
+    cell = window(build(rows), "day")["cells"]["absolute"]
+    assert cell["status"] == pt.STATUS_ESTIMATED
+    assert cell["reasons"] == [f"{pt.REASON_NAV_BASIS}:{SHORT[8].isoformat()}"]
+
+
+def test_a_missing_qqq_close_names_the_missing_day_not_the_next_session(monkeypatch):
+    monkeypatch.setattr(pt, "FLOWS_JOURNALED_FROM", SHORT[0])
+    rows = ledger(SHORT[:10])
+    qqq = history(SHORT[:10])
+    del qqq[SHORT[4]]
+    reasons = window(build(rows, qqq_hist=qqq), "inception")["cells"]["vs_qqq"]["reasons"]
+    assert reasons == [pt.REASON_QQQ_BASIS, f"qqq_close_missing:{SHORT[4].isoformat()}"]
+
+
 def test_one_row_is_insufficient_everywhere():
     doc = build(ledger(SHORT[:1]))
     assert doc["status_counts"][pt.STATUS_INSUFFICIENT] == len(pt.WINDOWS) * len(pt.COMPARISONS)
