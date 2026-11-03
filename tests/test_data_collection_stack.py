@@ -758,7 +758,7 @@ def test_check_live_publishes_drift_and_still_exits_non_zero(stack, tpl, monkeyp
     assert stack.main(["check-live"]) == 1
     (put,) = s3.puts
     doc = json.loads(put["Body"])
-    assert (put["Bucket"], put["Key"]) == (stack.CHECK_LIVE_BUCKET, stack.CHECK_LIVE_KEY)
+    assert (put["Bucket"], put["Key"]) == (stack.env_target("prod")["bucket"], stack.CHECK_LIVE_KEY)
     assert doc["in_sync"] is False and doc["measured"] is True and doc["drift"]
     assert doc["code_sha"] == "b" * 40 and doc["stack"] == stack.STACK_NAME
 
@@ -815,9 +815,16 @@ def test_deploy_script_verifies_its_own_effect(stack):
     # was added to the template but not to this line, so `cloudformation
     # deploy` kept its previous ENABLED value and the cutover's DISABLED default
     # never reached the live schedule (alpha-engine-config-I11269, 2026-09-28).
+    # Since S-18 slice 2 (alpha-engine-config-I12506) the line passes the
+    # helper's `parameter-overrides`, which for prod is exactly every one of them.
+    deploy_line = script[deploy_at:].splitlines()[0]
+    assert '"DefinitionS3Key=$KEY" "${OVERRIDES[@]}"' in deploy_line
+    assert 'read -r -a OVERRIDES <<< "$(field parameter-overrides)"' in script
+    overrides = dict(o.split("=", 1) for o in stack.env_fields("prod")["parameter-overrides"].split())
+    defaults = stack.parameter_defaults(stack.load_template())
     for name in stack.STATE_PARAMETERS:
-        p = f"{name}=$(field param-{name})"
-        assert p in script, f"{p} must be passed explicitly so the template Default is authoritative"
+        assert overrides.get(name) == defaults[name], \
+            f"{name} must be passed explicitly so the template Default is authoritative"
 
 # Resource types in this template that carry no `Tags` property in
 # CloudFormation, so the cost-attribution guard cannot require the key on them
