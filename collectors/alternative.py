@@ -1270,6 +1270,12 @@ def _fetch_all_alternative(ticker: str, run_date: str, bucket: str) -> dict:
 
     # 2. EPS revisions (FMP)
     result["eps_revision"] = _fetch_revisions(ticker, bucket, run_date)
+    # alpha-engine-config-I13143: the feature store's ``days_since_earnings``
+    # reads ``eps_revision.days_since_earnings``, which nothing produced, so the
+    # column was a universe-wide 0.0 from inception.
+    result["eps_revision"]["days_since_earnings"] = _fetch_days_since_earnings(
+        ticker, run_date
+    )
 
     # 3. Options flow (yfinance)
     result["options_flow"] = _fetch_options(ticker, run_date)
@@ -1647,6 +1653,54 @@ def _fetch_revisions(ticker: str, bucket: str, run_date: str) -> dict:
 
 
 # ---- 3. Options flow ----
+
+def _fetch_days_since_earnings(ticker: str, run_date: str) -> Optional[int]:
+    """Calendar days from the last REPORTED earnings date to ``run_date``.
+
+    alpha-engine-config-I13143. ``features/compute.py::_alt_entry_from_payload``
+    has always read ``eps_revision.days_since_earnings``, but no producer wrote
+    it, so the default 0.0 made ``days_since_earnings`` a universe-wide
+    constant. It went unnoticed while the one ticker with no payload (XLRE)
+    defaulted to 1.0; I13103 made that ticker NaN, and the 2026-11-02 D31
+    postflight correctly flagged the column zero-variance.
+
+    Source: yfinance ``get_earnings_dates`` (report dates, not the fiscal
+    period ends Finnhub ``/stock/earnings`` returns). Point-in-time: only a
+    date on or before ``run_date`` with a reported EPS counts. ``None`` when
+    there is none or yfinance fails (WARN, never raises, like the other
+    per-ticker sub-collectors).
+    """
+    try:
+        import pandas as pd
+        import yfinance as yf
+
+        from collectors.yahoo_session import call_yahoo
+
+        with quiet_yfinance():
+            df = call_yahoo(
+                lambda: yf.Ticker(ticker).get_earnings_dates(limit=8),
+                label=f"earnings_dates[{ticker}]",
+                is_empty=lambda d: d is None or d.empty,
+            )
+        if df is None or df.empty:
+            return None
+        anchor = pd.Timestamp(run_date).date()
+        reported = df["Reported EPS"].notna() if "Reported EPS" in df.columns else None
+        dates = [
+            d.date()
+            for d, ok in zip(
+                pd.to_datetime(df.index),
+                reported if reported is not None else [True] * len(df),
+            )
+            if ok and d.date() <= anchor
+        ]
+        if not dates:
+            return None
+        return (anchor - max(dates)).days
+    except Exception as e:  # noqa: BLE001 — yfinance raises opaque types
+        logger.warning("yfinance earnings dates failed for %s: %s", ticker, e)
+        return None
+
 
 def _fetch_options(ticker: str, run_date: str) -> dict:
     """Fetch options-derived signals from yfinance."""
