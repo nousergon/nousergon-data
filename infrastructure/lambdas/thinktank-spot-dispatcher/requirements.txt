@@ -11,4 +11,4 @@ nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.189
 # root, the same way eval-judge-spot-dispatcher pins its krepis: moving root
 # would move every weekly-path Lambda with it. 0.59.71 satisfies
 # nousergon-lib v0.124.158's krepis>=0.59.52 floor.
-krepis==0.59.89  # bumped 0.59.71 -> 0.59.89: krepis-PR282 + krepis-PR281 (alpha-engine-config-I13042), outbound alert text (Telegram, SNS, email) passes redact_secrets, so a URL-query credential such as Polygon's apiKey= no longer reaches an alert
+krepis==0.59.90  # bumped 0.59.71 -> 0.59.90: krepis-PR283 (alpha-engine-config-I13152), HTML-escaped and percent-encoded credential redaction; previously 0.59.89: krepis-PR282 + krepis-PR281 (alpha-engine-config-I13042), outbound alert text (Telegram, SNS, email) passes redact_secrets, so a URL-query credential such as Polygon's apiKey= no longer reaches an alert
