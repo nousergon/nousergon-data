@@ -120,6 +120,7 @@ setup_logging(
 
 from collectors import constituents, historical_constituents, prices, macro, universe_returns, signal_returns, alternative, daily_closes, fundamentals, short_interest, metron_market_data, universe_classification, fred_history, technical_rating_ledger
 from collectors import CaretTickerError  # I10904 write-site guard
+import universe_scope  # S-18 subset-universe chokepoint (alpha-engine-config-I12506); prod no-op
 from builders._price_cache_writeboth import (
     assert_valid_price_cache_ticker as _assert_valid_price_cache_ticker,
     price_cache_read_prefixes as _price_cache_read_prefixes,
@@ -2169,6 +2170,7 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
                 logger.info("Loaded %d tickers from existing constituents.json", len(tickers))
         except Exception as exc:
             logger.warning("S3 constituents load failed — will fall back to Wikipedia: %s", exc)
+    tickers = universe_scope.scope(tickers, path="phase1")
 
     # ── 1b. Historical (point-in-time) constituents ──────────────────────────
     # Replays S&P 500+400 index changes backward from today's roster
@@ -2608,6 +2610,7 @@ def _run_phase2(config: dict, args: argparse.Namespace) -> dict:
     existing = constituents.load_from_s3(bucket, market_prefix)
     if existing:
         universe_tickers = list(existing.get("tickers") or [])
+    universe_tickers = universe_scope.scope(universe_tickers, path="phase2")
     if not universe_tickers:
         # No silent narrowing. A missing constituents artifact used to fall
         # through to signals.json, which is exactly how the scope moved
@@ -3631,6 +3634,9 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
             except Exception as exc:
                 logger.error("Wikipedia constituents fallback failed: %s", exc)
 
+    # Scoped AFTER the straggler prune above, which keeps the full refreshed
+    # roster: a declared subset must never prune names.
+    tickers = universe_scope.scope(tickers, path="morning_enrich")
     if not tickers:
         logger.error("No tickers available for morning enrichment")
         results["status"] = "failed"
@@ -4175,7 +4181,7 @@ def _self_heal_missing_universe_days(
                 tickers_set, weekly_date = load_constituents_for_run_date(
                     s3, bucket, run_date=None
                 )
-            tickers = sorted(tickers_set)
+            tickers = universe_scope.scope(sorted(tickers_set), path="universe_gap_heal")
             # Mirror MorningEnrich's universe scope: constituents + macro keys.
             tickers = list(dict.fromkeys(tickers + _MACRO_DAILY_TICKERS))
             if not tickers:
@@ -4549,6 +4555,7 @@ def _run_morning_arctic_append(config: dict, args: argparse.Namespace) -> dict:
         except Exception as exc:
             logger.error("Wikipedia constituents fallback failed: %s", exc)
 
+    tickers = universe_scope.scope(tickers, path="morning_arctic_append")
     if not tickers:
         logger.error("No tickers available for ArcticDB append")
         results["status"] = "failed"
@@ -4645,7 +4652,7 @@ def _run_chronic_gap_heal(config: dict, args: argparse.Namespace) -> dict:
     }
 
     try:
-        chronic_tickers = _load_chronic_polygon_gaps(config)
+        chronic_tickers = universe_scope.scope(_load_chronic_polygon_gaps(config), path="chronic_gap_heal")
         if not chronic_tickers:
             logger.info("chronic-gap heal: no chronic_polygon_gaps configured — nothing to do.")
             results["status"] = "ok"
@@ -4864,6 +4871,7 @@ def _load_daily_universe_tickers(config: dict, run_date: str | None = None) -> l
             logger.info("Loaded %d tickers from Wikipedia (S3 fallback)", len(tickers))
         except Exception as exc:
             logger.error("Wikipedia constituents fallback failed: %s", exc)
+    tickers = universe_scope.scope(tickers, path="daily_universe")
     if not tickers:
         return []
     return _augment_with_macro_daily_tickers(tickers)

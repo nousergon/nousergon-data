@@ -122,8 +122,10 @@ RUNTIME_GAPS: tuple[tuple[str, str, tuple[str, str, bool] | None], ...] = (
     ),
     (
         "subset-universe",
-        "staging declares universe scope=subset (registry `universe`); the collection workloads read the "
-        "full roster.",
+        "staging declares universe scope=subset (registry `universe`). weekly_collector.py now scopes every "
+        "roster it forms through universe_scope.scope, but only when NE_ENV reaches the workload box: the "
+        "data-spot dispatcher does not yet pass its NE_ENV into the box command, and a box without NE_ENV "
+        "runs as prod (full roster). Close it with the dispatcher-deploy staging target (I12506).",
         None,
     ),
 )
