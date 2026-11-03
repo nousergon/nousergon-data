@@ -50,6 +50,10 @@ class _SpotQuotaExceededError(_SpotLaunchError):
     pass
 
 
+#: The environments the stubbed ``nousergon_lib.env`` declares.
+_REGISTRY_ENV_NAMES = ("prod", "staging")
+
+
 def _install_stubs(monkeypatch, launch_impl, boto_clients, publish_impl=None):
     # Every sys.modules write goes through monkeypatch.setitem so it is UNDONE
     # at teardown. A bare `sys.modules[...] = stub` outlives this file: any test
@@ -69,6 +73,14 @@ def _install_stubs(monkeypatch, launch_impl, boto_clients, publish_impl=None):
     nousergon_lib_mod = types.ModuleType("nousergon_lib")
     nousergon_lib_mod.ec2_spot = ec2_spot_mod
     monkeypatch.setitem(sys.modules, "nousergon_lib", nousergon_lib_mod)
+    # `nousergon_lib.env` is imported outside prod only (the box-command
+    # NE_ENV prefix validates against the registry's names; I12506). The
+    # stub declares the registry's environments; the real registry is
+    # pinned to contain them by test_stub_registry_names_match_the_real_registry.
+    env_mod = types.ModuleType("nousergon_lib.env")
+    env_mod.environment_names = lambda: list(_REGISTRY_ENV_NAMES)
+    nousergon_lib_mod.env = env_mod
+    monkeypatch.setitem(sys.modules, "nousergon_lib.env", env_mod)
 
     krepis_mod = types.ModuleType("krepis")
     krepis_alerts_mod = types.ModuleType("krepis.alerts")
@@ -1896,3 +1908,93 @@ def test_staging_renders_its_own_store_and_launch(monkeypatch):
         assert "alpha-engine-research" not in cmd
         assert "{store}" not in cmd
     assert index._run_log_uri("w", "2026-09-14", "i-x").startswith("s3://staging-bucket/data_collection/logs/")
+
+
+# ── staging S-18 (alpha-engine-config-I12506): the box runs in its environment ─
+def _every_workload_event(index):
+    return [{"workload": w, "trading_day": "2026-09-14"} for w in sorted(index._WORKLOADS)]
+
+
+def _template_render(index, workload, store):
+    """Today's command for ``workload``, rebuilt from the template alone."""
+    template = index._WORKLOADS[workload].replace("{store}", store)
+    if workload in index._WORKLOADS_REQUIRING_TRADING_DAY:
+        return template.format(trading_day="2026-09-14")
+    return template
+
+
+def test_prod_box_command_is_byte_identical_for_every_workload(monkeypatch):
+    """Prod adds NOTHING: every workload's command is exactly its template with
+    the prod store and the trading day, with no NE_ENV anywhere in it."""
+    _clear_per_env(monkeypatch)
+    index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
+    assert index.BOX_ENV_PREFIX == ""
+    events = _every_workload_event(index)
+    assert len(events) == len(index._WORKLOADS) > 30
+    for event in events:
+        workload, cmd = index._resolve_workload(event)
+        expected = _template_render(index, workload, "s3://alpha-engine-research/data_collection")
+        assert cmd == expected, workload
+        assert "NE_ENV" not in cmd, workload
+
+
+def test_prod_never_reads_the_registry(monkeypatch):
+    _clear_per_env(monkeypatch)
+
+    class _NoRegistry:
+        def __iter__(self):
+            raise AssertionError("prod must not read the environment registry")
+
+    monkeypatch.setattr(sys.modules[__name__], "_REGISTRY_ENV_NAMES", _NoRegistry())
+    index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
+    assert index.BOX_ENV_PREFIX == ""
+    assert index._box_env_prefix() == ""
+
+
+def test_staging_prefixes_ne_env_onto_every_workload(monkeypatch):
+    _clear_per_env(monkeypatch)
+    index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x", env=_STAGING_ENV)
+    assert index.BOX_ENV_PREFIX == "export NE_ENV=staging; "
+    for event in _every_workload_event(index):
+        workload, cmd = index._resolve_workload(event)
+        expected = _template_render(index, workload, "s3://staging-bucket/data_collection")
+        assert cmd == "export NE_ENV=staging; " + expected, workload
+        # It reaches the box script as the collector command, export first.
+        script = index._bootstrap_command(workload, cmd, "tok", instance_id="i-x", trading_day="2026-09-14")
+        assert "\nexport NE_ENV=staging; " in script, workload
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["Staging", "staging; rm -rf /", "nope", "staging ", "$(id)", "prod2"],
+)
+def test_an_environment_the_registry_does_not_declare_refuses_at_import(monkeypatch, bad):
+    _clear_per_env(monkeypatch)
+    env = {**_STAGING_ENV, "NE_ENV": bad}
+    if bad.strip() == "staging":
+        # NE_ENV is stripped on read; a padded declared name is that name.
+        index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x", env=env)
+        assert index.BOX_ENV_PREFIX == "export NE_ENV=staging; "
+        return
+    with pytest.raises(RuntimeError, match="registry declares"):
+        _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x", env=env)
+
+
+def test_a_declared_name_is_shell_quoted(monkeypatch):
+    """Registry names are ``[a-z][a-z0-9-]*`` today, so quoting is a no-op on
+    them; it is still applied, so a looser registry cannot inject."""
+    _clear_per_env(monkeypatch)
+    monkeypatch.setattr(sys.modules[__name__], "_REGISTRY_ENV_NAMES", ("prod", "staging", "odd name"))
+    index, _ssm, _ec2 = _load(
+        monkeypatch, launch_impl=lambda t, s, **kw: "i-x", env={**_STAGING_ENV, "NE_ENV": "odd name"}
+    )
+    assert index.BOX_ENV_PREFIX == "export NE_ENV='odd name'; "
+
+
+def test_stub_registry_names_match_the_real_registry():
+    """The stub above declares what the real packaged registry declares."""
+    import importlib
+
+    real = importlib.import_module("nousergon_lib.env")
+    assert getattr(real, "__file__", None), "nousergon_lib.env is a stub here, not the real module"
+    assert set(_REGISTRY_ENV_NAMES) <= set(real.environment_names())

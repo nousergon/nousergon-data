@@ -55,6 +55,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import uuid
 
 import boto3
@@ -96,6 +97,39 @@ def _per_env(var: str, prod_default: str) -> str:
 
 #: The collection store every shadow/parity command passes as ``--store``.
 STORE_URI = _per_env("DATA_COLLECTION_STORE", "s3://alpha-engine-research/data_collection")
+
+
+def _box_env_prefix() -> str:
+    """What goes in front of every workload's box command: the environment.
+
+    The box runs ``nousergon_lib.env``-aware code (the universe chokepoint, the
+    registry lookups), and a box with no ``NE_ENV`` resolves as prod: a staging
+    dispatcher would launch a staging box that collects prod's full universe
+    (alpha-engine-config-I12506, ``dispatcher-deploy``). So outside prod the
+    command is prefixed ``export NE_ENV=<env>; `` (an ``export``, not an
+    assignment prefix, so it reaches every statement of a compound workload).
+
+    Prod: the empty string, so prod's command is byte-identical to before.
+    Outside prod the name must be one the environment registry declares
+    (``nousergon_lib.env.environment_names()``), and it is shell-quoted; any
+    other value REFUSES at import rather than reaching a root shell.
+    """
+    if NE_ENV == "prod":
+        return ""
+    from nousergon_lib import env as _env_registry  # noqa: PLC0415 — outside prod only
+
+    declared = _env_registry.environment_names()
+    if NE_ENV not in declared:
+        raise RuntimeError(
+            f"NE_ENV={NE_ENV!r} is not an environment the registry declares "
+            f"({sorted(declared)}); refusing to tag box commands with it "
+            "(alpha-engine-config-I12506)"
+        )
+    return f"export NE_ENV={shlex.quote(NE_ENV)}; "
+
+
+#: Prefixed onto every workload command ``_resolve_workload`` returns.
+BOX_ENV_PREFIX = _box_env_prefix()
 
 # Kill-switch: DATA_SPOT_DISPATCH_ENABLED=false disables the launch without
 # deleting the SF states — the SF's CheckDataSpotLaunched -> *Skipped branch
@@ -1089,8 +1123,8 @@ def _resolve_workload(event: dict) -> tuple[str, str]:
             raise ValueError(
                 f"workload {w!r} trading_day={trading_day!r} is not a valid calendar date"
             ) from exc
-        return w, template.format(trading_day=trading_day)
-    return w, template
+        return w, BOX_ENV_PREFIX + template.format(trading_day=trading_day)
+    return w, BOX_ENV_PREFIX + template
 
 
 _MARKET_TZ = "America/New_York"
