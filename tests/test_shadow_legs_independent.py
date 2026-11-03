@@ -41,7 +41,7 @@ def _dispatcher():
 
 
 def _shadow_weekday() -> str:
-    return _dispatcher()._WORKLOADS["shadow-weekday"].format(trading_day="2026-09-18")
+    return _dispatcher()._resolve_workload({"workload": "shadow-weekday", "trading_day": "2026-09-18"})[1]
 
 
 def test_no_leg_or_the_comparator_is_guarded_by_a_preceding_and():

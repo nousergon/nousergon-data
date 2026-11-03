@@ -12,6 +12,8 @@ Holds four properties:
    prod store, a prod topic or a schedule that is on;
 4. staging rendering refuses while a runtime gap is open, and each gap's probe
    still holds (a closed gap is deleted in the PR that closes it).
+5. the data-spot dispatcher defaults its store, run-log bucket and launch
+   resources in prod only, and its non-prod store comes from the registry.
 """
 
 from __future__ import annotations
@@ -290,3 +292,56 @@ def test_deploy_script_takes_every_value_from_the_helper():
     assert 'NE_ENV="${NE_ENV:-prod}"' in text and "export NE_ENV" in text
     assert '"${OVERRIDES[@]}"' in text and "field param-" not in text
     assert "get-caller-identity" in text  # a non-prod deploy refuses the wrong account
+
+
+# ── 5. the data-spot dispatcher takes its store, run log and launch from its env ──
+DISPATCHER = REPO / "infrastructure" / "lambdas" / "data-spot-dispatcher" / "index.py"
+#: Every per-environment value the dispatcher must not default outside prod
+#: (the closed gaps dispatcher-store, dispatcher-run-log, dispatcher-launch).
+DISPATCHER_PER_ENV = {
+    "DATA_COLLECTION_STORE",
+    "DATA_COLLECTION_RUN_LOG_BUCKET",
+    "DATA_SPOT_SUBNETS",
+    "DATA_SPOT_SECURITY_GROUP",
+    "DATA_SPOT_KEY_NAME",
+    "DATA_SPOT_IAM_PROFILE",
+}
+
+
+def _dispatcher_prod_defaults() -> dict[str, str]:
+    import ast
+
+    out: dict[str, str] = {}
+    for node in ast.walk(ast.parse(DISPATCHER.read_text(encoding="utf-8"))):
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "_per_env":
+            var, default = node.args
+            out[ast.literal_eval(var)] = ast.literal_eval(default)
+    return out
+
+
+def test_dispatcher_reads_every_per_env_value_through_the_prod_only_default():
+    assert set(_dispatcher_prod_defaults()) == DISPATCHER_PER_ENV
+    text = DISPATCHER.read_text(encoding="utf-8")
+    for var in DISPATCHER_PER_ENV:
+        assert f'os.environ.get("{var}"' not in text, f"{var} read with a default that holds in every environment"
+
+
+def test_dispatcher_commands_name_no_literal_store(prod):
+    text = DISPATCHER.read_text(encoding="utf-8")
+    assert f"--store s3://{prod.bucket('research')}" not in text
+    assert "--store {store}" in text
+
+
+def test_dispatcher_environment_prod_is_the_dispatchers_prod_default(mod):
+    defaults = _dispatcher_prod_defaults()
+    env_vals = mod.dispatcher_environment("prod")
+    assert env_vals.pop("NE_ENV") == "prod"
+    assert env_vals == {k: defaults[k] for k in env_vals}
+
+
+def test_dispatcher_environment_staging_writes_only_its_own_bucket(mod, prod, staging):
+    env_vals = mod.dispatcher_environment("staging")
+    assert env_vals["NE_ENV"] == "staging"
+    assert env_vals["DATA_COLLECTION_RUN_LOG_BUCKET"] == staging.bucket("crucible")
+    assert env_vals["DATA_COLLECTION_STORE"] == f"s3://{staging.bucket('crucible')}/data_collection"
+    assert prod.bucket("research") not in json.dumps(env_vals)

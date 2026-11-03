@@ -79,7 +79,9 @@ def workloads() -> dict[str, str]:
     assert spec.loader is not None
     spec.loader.exec_module(module)
     try:
-        yield module._WORKLOADS
+        # The store is per environment (I12506): render it as the dispatcher
+        # does, so command assertions read what the box is sent.
+        yield {k: v.replace("{store}", module.STORE_URI) for k, v in module._WORKLOADS.items()}
     finally:
         for name in stubs:
             sys.modules.pop(name, None)
