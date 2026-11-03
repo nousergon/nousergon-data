@@ -6,8 +6,10 @@ name: Performance tracker (daily)
 # The producer is data/derived/perf_tracker.py; its docstring is normative for
 # the return, benchmark and alpha definitions and for every input's basis.
 #
-# WHY A GITHUB ACTIONS CRON. The job reads four S3 objects (the eod_pnl
-# export, the ledger journal copies, two close_history files) and writes two.
+# WHY A GITHUB ACTIONS CRON. The job reads a handful of S3 objects (the
+# eod_pnl export, the ledger journal copies, the SPY/QQQ/ONEQ/IWM
+# close_history files, and Metron's metron/perf/personal_returns.json) and
+# writes two. The last three are optional: unreadable, their cells say so.
 # No ArcticDB, no box, no vendor call: the same shape as
 # inst-ownership-weekly.yml, so the same answer, a GitHub-hosted runner under
 # a dedicated least-privilege OIDC role.
