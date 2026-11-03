@@ -8,11 +8,12 @@ is the parameter half of that deploy: for every template parameter it DECLARES
 how each environment sets it, so a parameter added to the template without a
 decision fails ``tests/test_data_collection_env_params.py``, not a deploy.
 
-Code only. Nothing here calls AWS, and nothing reads it on a deploy path yet:
-``deploy-data-collection-stack.sh`` still deploys prod from the template
-defaults. That is deliberate (see RUNTIME_GAPS ``deploy-script-env``); the
-tests prove that prod, resolved through this module, is byte-for-byte the
-values that script deploys today, so wiring it in is a no-op for prod.
+Nothing here calls AWS. ``deploy-data-collection-stack.sh`` and its
+``check-live`` read this module for any ``NE_ENV`` other than prod, through
+``data_collection_stack.env_target`` (S-18 slice 2). prod still deploys from
+the template defaults with no registry read, because its workflow installs no
+nousergon-lib; the tests prove that prod, resolved through this module, is
+byte-for-byte those values.
 
 Every value that names an account, a region, a stack, a bucket or a topic is
 resolved from the fleet environment registry through ``nousergon_lib.env``
@@ -112,19 +113,6 @@ RUNTIME_GAPS: tuple[tuple[str, str, tuple[str, str, bool] | None], ...] = (
         "DATA_SPOT_SUBNETS / _SECURITY_GROUP / _KEY_NAME / _IAM_PROFILE from staging launch resources that do "
         "not exist yet (staging tofu); the dispatcher refuses to import outside prod without them (I12506).",
         ("infrastructure/lambdas/data-spot-dispatcher/deploy.sh", "NE_ENV", False),
-    ),
-    (
-        "check-live-publish",
-        "data_collection_stack.py check-live publishes its verdict to prod research, which staging cannot "
-        "write, and reads the stack by a fixed name.",
-        ("infrastructure/data_collection_stack.py", 'CHECK_LIVE_BUCKET = "{research}"', True),
-    ),
-    (
-        "deploy-script-env",
-        "deploy-data-collection-stack.sh takes no environment: it passes only DefinitionS3Key and the four "
-        "states and stages the definition into the template's default bucket. Needs it to read this module "
-        "(prod unchanged, proven by the tests).",
-        ("infrastructure/deploy-data-collection-stack.sh", "data_collection_env_params", False),
     ),
     (
         "replay-inputs",
