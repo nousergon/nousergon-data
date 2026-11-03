@@ -1461,7 +1461,11 @@ def _alt_entry_from_payload(ticker_data: dict) -> dict:
     return {
         "earnings": {
             "surprise_pct": surprise,
-            "days_since_earnings": eps.get("days_since_earnings", 0.0),
+            # None, never 0.0, when absent: 0.0 reads as "reported today" and
+            # was every ticker's value until the producer wrote the field
+            # (alpha-engine-config-I13143). feature_engineer defaults None
+            # to 90 days.
+            "days_since_earnings": eps.get("days_since_earnings"),
         },
         "revisions": {
             "eps_revision_4w": eps.get("revision_4w", 0.0),
