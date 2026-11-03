@@ -518,3 +518,72 @@ def test_workflow_passes_the_store_uri_host_segment_as_the_bucket():
             capture_output=True, text=True, check=True,
         ).stdout.splitlines()
         assert out[out.index("--bucket") + 1] == "alpha-engine-research", step["name"]
+
+
+# ── risk block (alpha-engine-config-I12784) ──────────────────────────────────
+
+
+def test_risk_metrics_on_known_daily_returns():
+    port = [0.01, -0.02, 0.03, -0.01] * 20          # 80 observations
+    spy = [0.005, -0.01, 0.01, 0.0] * 20
+    r = pt.risk_metrics(port, spy, ())
+    assert r["status"] == r["annualised_status"] == "ok" and r["reasons"] == []
+    mean = sum(port) / len(port)
+    sd = (sum((x - mean) ** 2 for x in port) / (len(port) - 1)) ** 0.5
+    assert r["volatility_ann_pct"] == round(sd * 252 ** 0.5 * 100, 4)
+    assert r["sharpe"] == round(mean * 252 / (sd * 252 ** 0.5), 4)
+    down = (sum(min(x, 0) ** 2 for x in port) / len(port)) ** 0.5 * 252 ** 0.5
+    assert r["sortino"] == round(mean * 252 / down, 4)
+    assert r["up_days_pct"] == 50.0
+    assert r["days_beating_spy_pct"] == 50.0
+    assert r["tracking_error_ann_pct"] is not None and r["information_ratio"] is not None
+    assert r["turnover"] is None
+    # Deepest fall below the running peak, against a direct walk of the wealth index.
+    w = pk = 1.0
+    worst = 0.0
+    for x in port:
+        w *= 1 + x
+        pk = max(pk, w)
+        worst = min(worst, w / pk - 1)
+    assert r["max_drawdown_pct"] == round(worst * 100, 4)
+
+
+def test_annualised_risk_needs_sixty_observations_but_drawdown_does_not():
+    r = pt.risk_metrics([0.01, -0.02, 0.005], [0.0, 0.0, 0.0], ())
+    assert r["annualised_status"] == "insufficient_history"
+    assert r["volatility_ann_pct"] is r["sharpe"] is r["tracking_error_ann_pct"] is None
+    assert r["max_drawdown_pct"] == -2.0
+    assert r["status"] == "ok"
+
+
+def test_risk_inherits_estimate_reasons_and_flags_an_unaligned_spy_leg():
+    r = pt.risk_metrics([0.01] * 70, None, ("external_flows_not_journaled",))
+    assert r["status"] == r["annualised_status"] == "estimated"
+    assert r["reasons"] == ["external_flows_not_journaled", "spy_daily_not_aligned"]
+    assert r["volatility_ann_pct"] == 0.0 and r["sharpe"] is None   # zero vol: no ratio
+    assert r["tracking_error_ann_pct"] is None and r["days_beating_spy_pct"] is None
+    assert r["max_drawdown_pct"] == 0.0
+
+
+def test_every_window_carries_a_risk_block_and_the_underwater_series(monkeypatch):
+    monkeypatch.setattr(pt, "FLOWS_JOURNALED_FROM", date(2000, 1, 1))
+    rows = ledger(LONG)
+    rows[150] = (rows[150][0], rows[150][1] * 0.9, *rows[150][2:])   # one bad day
+    doc = build(rows)
+    for w in doc["windows"]:
+        assert set(w["risk"]) >= {"status", "annualised_status", "volatility_ann_pct",
+                                  "max_drawdown_pct", "information_ratio"}
+    inc = window(doc, "inception")
+    assert inc["risk"]["observations"] == len(LONG) - 1
+    assert inc["risk"]["annualised_status"] == "ok"
+    uw = doc["underwater_pct"]
+    assert list(uw) == [d.isoformat() for d in LONG]
+    assert uw[LONG[0].isoformat()] == 0.0 and max(uw.values()) == 0.0
+    assert min(uw.values()) == inc["risk"]["max_drawdown_pct"] < 0
+    assert window(doc, "day")["risk"]["annualised_status"] == "insufficient_history"
+
+
+def test_an_insufficient_window_has_an_insufficient_risk_block():
+    doc = build(ledger(SHORT))
+    yoy = window(doc, "yoy")["risk"]
+    assert yoy["status"] == "insufficient_history" and yoy["observations"] == 0
