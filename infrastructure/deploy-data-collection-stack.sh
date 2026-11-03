@@ -13,6 +13,13 @@
 #   bash infrastructure/deploy-data-collection-stack.sh --lint      # static checks only, no AWS
 #   bash infrastructure/deploy-data-collection-stack.sh --check-live
 #
+# Environment: $NE_ENV (default prod). Every per-environment value (stack,
+# definition bucket, region, account, parameter overrides) comes from
+# data_collection_stack.py `get`, which resolves a non-prod environment through
+# infrastructure/data_collection_env_params.py and REFUSES (exit 3) while that
+# module lists an open runtime gap (staging S-18, alpha-engine-config-I12506).
+# prod reads only the template, exactly as before; the tests prove the two agree.
+#
 # The stack contains no IAM. Its two runtime roles are codified in
 # nous-ergon-ops infrastructure/iam/ and must exist before the first apply; the
 # preflight below fails LOUD naming the exact command when they do not.
@@ -26,6 +33,8 @@ TEMPLATE="$SCRIPT_DIR/cloudformation/nousergon-data-collection.yaml"
 DEFINITION="$SCRIPT_DIR/step-functions/data-collection.asl.json"
 REGION="${AWS_REGION:-us-east-1}"
 PYTHON="${PYTHON:-python3}"
+NE_ENV="${NE_ENV:-prod}"
+export NE_ENV
 
 MODE="deploy"
 case "${1:-}" in
@@ -54,7 +63,20 @@ fi
 STACK_NAME="$(field stack-name)"
 BUCKET="$(field definition-bucket)"
 KEY="$(field definition-key)"
+read -r -a OVERRIDES <<< "$(field parameter-overrides)"
 GIT_SHA="${GITHUB_SHA:-$(git -C "$REPO_ROOT" rev-parse HEAD)}"
+
+if [ "$NE_ENV" != "prod" ]; then
+    REGION="$(field region)"
+    ACCOUNT="$(field account)"
+    echo "==> Preflight: caller is in the $NE_ENV account"
+    CALLER="$(aws sts get-caller-identity --query Account --output text)"
+    if [ "$CALLER" != "$ACCOUNT" ]; then
+        echo "ERROR: NE_ENV=$NE_ENV deploys to account $ACCOUNT but the caller is in $CALLER. Nothing was applied." >&2
+        exit 1
+    fi
+fi
+echo "==> Environment $NE_ENV: stack $STACK_NAME, region $REGION"
 
 echo "==> Preflight: runtime roles exist (codified in nous-ergon-ops)"
 for role in nousergon-data-collection-sfn-role alpha-engine-eventbridge-sfn-role; do
@@ -87,7 +109,7 @@ echo "==> Stage definition s3://$BUCKET/$KEY"
 aws s3 cp "$DEFINITION" "s3://$BUCKET/$KEY" --region "$REGION" --only-show-errors
 
 echo "==> Deploy stack $STACK_NAME"
-aws cloudformation deploy --region "$REGION" --stack-name "$STACK_NAME" --template-file "$TEMPLATE" --no-fail-on-empty-changeset --parameter-overrides "DefinitionS3Key=$KEY" "CollectionState=$(field param-CollectionState)" "DailyHealState=$(field param-DailyHealState)" "ShadowSamedayState=$(field param-ShadowSamedayState)" "ShadowMorningState=$(field param-ShadowMorningState)" --tags "git-sha=$GIT_SHA" "template-sha256=$(field template-sha256)" "definition-sha256=$(field definition-sha256)" system=data-collection
+aws cloudformation deploy --region "$REGION" --stack-name "$STACK_NAME" --template-file "$TEMPLATE" --no-fail-on-empty-changeset --parameter-overrides "DefinitionS3Key=$KEY" "${OVERRIDES[@]}" --tags "git-sha=$GIT_SHA" "template-sha256=$(field template-sha256)" "definition-sha256=$(field definition-sha256)" system=data-collection
 
 # "No changes to deploy" is also what a correct re-apply prints. Prove the
 # effect instead of trusting the exit code: the live stack must carry THIS
