@@ -106,39 +106,11 @@ DECLARED: dict[str, tuple[str, str]] = {
 #: gap is deleted here in the PR that closes it. ``None`` = declared, no probe.
 RUNTIME_GAPS: tuple[tuple[str, str, tuple[str, str, bool] | None], ...] = (
     (
-        "dispatcher-store",
-        "the data-spot dispatcher's on-box commands pass --store s3://<prod research>/data_collection, so a "
-        "staging run would write the prod store (denied by S-08; plan: staging outputs go to the staging bucket "
-        "only). Needs the store derived from the registry and passed in the dispatcher's environment.",
-        (
-            "infrastructure/lambdas/data-spot-dispatcher/index.py",
-            "--store s3://{research}/data_collection",
-            True,
-        ),
-    ),
-    (
-        "dispatcher-run-log",
-        "the dispatcher's run-log bucket defaults to prod research (DATA_COLLECTION_RUN_LOG_BUCKET).",
-        (
-            "infrastructure/lambdas/data-spot-dispatcher/index.py",
-            '"DATA_COLLECTION_RUN_LOG_BUCKET", "{research}"',
-            True,
-        ),
-    ),
-    (
-        "dispatcher-launch",
-        "the dispatcher's spot launch defaults name prod-account resources (security group, key pair, box "
-        "instance profile); staging needs its own, set through the dispatcher's environment.",
-        (
-            "infrastructure/lambdas/data-spot-dispatcher/index.py",
-            'os.environ.get("DATA_SPOT_SECURITY_GROUP", "sg-',
-            True,
-        ),
-    ),
-    (
         "dispatcher-deploy",
         "deploy-data-spot-dispatcher.yml deploys the prod account only; no staging dispatcher exists for the "
-        "staging state machines to invoke.",
+        "staging state machines to invoke. Its staging deploy must set dispatcher_environment('staging') plus "
+        "DATA_SPOT_SUBNETS / _SECURITY_GROUP / _KEY_NAME / _IAM_PROFILE from staging launch resources that do "
+        "not exist yet (staging tofu); the dispatcher refuses to import outside prod without them (I12506).",
         ("infrastructure/lambdas/data-spot-dispatcher/deploy.sh", "NE_ENV", False),
     ),
     (
@@ -192,6 +164,31 @@ def _registry_values(e) -> dict[str, str]:  # noqa: ANN001 — nousergon_lib.env
     return {
         "definition_bucket": e.bucket(DEFINITION_BUCKET_ROLE[e.name]),
         "alerts_topic": e.topic("alerts"),
+    }
+
+
+#: The data-spot dispatcher's collection-store prefix inside its store bucket.
+DISPATCHER_STORE_PREFIX = "data_collection"
+
+
+def dispatcher_environment(env_name: str | None = None, *, registry: Path | None = None) -> dict[str, str]:
+    """The data-spot dispatcher's store and run-log bucket for one environment.
+
+    Derived from the registry: the store lives in the one bucket the
+    environment may write (``DEFINITION_BUCKET_ROLE``; prod research, staging
+    its own crucible bucket). Prod's values are the dispatcher's in-code prod
+    defaults (pinned equal by the tests), so prod's deploy sets none of them.
+    The launch values (subnets, security group, key pair, box profile) are
+    account resources the registry does not carry; see ``dispatcher-deploy``.
+    """
+    e = _resolve(env_name, registry)
+    if e.name not in DEFINITION_BUCKET_ROLE:
+        raise KeyError(f"no store bucket role declared for environment {e.name!r}")
+    bucket = e.bucket(DEFINITION_BUCKET_ROLE[e.name])
+    return {
+        "NE_ENV": e.name,
+        "DATA_COLLECTION_STORE": f"s3://{bucket}/{DISPATCHER_STORE_PREFIX}",
+        "DATA_COLLECTION_RUN_LOG_BUCKET": bucket,
     }
 
 

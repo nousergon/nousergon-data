@@ -1836,3 +1836,63 @@ def test_the_real_nousergon_lib_still_resolves_after_this_file():
         return
     run_manifest = importlib.import_module("nousergon_lib.run_manifest")
     assert run_manifest.__file__, "nousergon_lib.run_manifest has no file: not the real module"
+
+
+# ── staging S-18 (alpha-engine-config-I12506): per-environment values ─────────
+_PER_ENV_VARS = (
+    "DATA_COLLECTION_STORE",
+    "DATA_COLLECTION_RUN_LOG_BUCKET",
+    "DATA_SPOT_SUBNETS",
+    "DATA_SPOT_SECURITY_GROUP",
+    "DATA_SPOT_KEY_NAME",
+    "DATA_SPOT_IAM_PROFILE",
+)
+_STAGING_ENV = {
+    "NE_ENV": "staging",
+    "DATA_COLLECTION_STORE": "s3://staging-bucket/data_collection",
+    "DATA_COLLECTION_RUN_LOG_BUCKET": "staging-bucket",
+    "DATA_SPOT_SUBNETS": "subnet-s1,subnet-s2",
+    "DATA_SPOT_SECURITY_GROUP": "sg-staging",
+    "DATA_SPOT_KEY_NAME": "staging-key",
+    "DATA_SPOT_IAM_PROFILE": "staging-profile",
+}
+
+
+def _clear_per_env(monkeypatch):
+    for var in ("NE_ENV", *_PER_ENV_VARS):
+        monkeypatch.delenv(var, raising=False)
+
+
+def test_prod_keeps_every_prod_default(monkeypatch):
+    _clear_per_env(monkeypatch)
+    index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
+    assert index.NE_ENV == "prod"
+    assert index.STORE_URI == "s3://alpha-engine-research/data_collection"
+    assert index.RUN_LOG_BUCKET == "alpha-engine-research"
+    assert index.SECURITY_GROUP == "sg-03cd3c4bd91e610b0"
+    assert index.KEY_NAME == "alpha-engine-key"
+    assert index.IAM_PROFILE == "nousergon-data-collection-box-profile"
+    assert len(index.SUBNETS) == 6
+
+
+@pytest.mark.parametrize("missing", _PER_ENV_VARS)
+def test_outside_prod_a_missing_value_refuses_at_import(monkeypatch, missing):
+    _clear_per_env(monkeypatch)
+    env = {k: v for k, v in _STAGING_ENV.items() if k != missing}
+    with pytest.raises(RuntimeError, match=missing):
+        _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x", env=env)
+
+
+def test_staging_renders_its_own_store_and_launch(monkeypatch):
+    _clear_per_env(monkeypatch)
+    index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x", env=_STAGING_ENV)
+    assert index.SUBNETS == ["subnet-s1", "subnet-s2"]
+    assert (index.SECURITY_GROUP, index.KEY_NAME, index.IAM_PROFILE) == (
+        "sg-staging", "staging-key", "staging-profile",
+    )
+    for workload in ("shadow-parity", "arctic-parity", "shadow-sameday", "shadow-weekday", "shadow-morning"):
+        _resolved, cmd = index._resolve_workload({"workload": workload, "trading_day": "2026-09-14"})
+        assert "--store s3://staging-bucket/data_collection" in cmd
+        assert "alpha-engine-research" not in cmd
+        assert "{store}" not in cmd
+    assert index._run_log_uri("w", "2026-09-14", "i-x").startswith("s3://staging-bucket/data_collection/logs/")
