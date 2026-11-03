@@ -21,17 +21,21 @@ from tests.test_crsp_basis_gate_on_close_i12436 import _audit, _flat_name, _run
 from tests.test_migrate_universe_crsp_basis import _FakePolygon
 
 
-def _row(ticker="X", cls="spin_off", bound=0.6, expires="2027-01-31"):
+def _row(ticker="X", cls="spin_off", bound=0.6, expires="2027-01-31", when="2026-03"):
     return m.DeclaredDivergence(
-        ticker, cls, "synthetic event", "2026-03", bound, "synthetic evidence", expires,
+        ticker, cls, "synthetic event", when, bound, "synthetic evidence", expires,
     )
 
 
 def _rec(ticker="X", dev=0.4, status="out_of_tol", explained=False):
+    # The residual steps inside the declared month and is flat before it
+    # (alpha-engine-config-I13034); tests/test_crsp_basis_declared_step_i13034.py
+    # covers a residual that does not.
     return m.ReconcileRecord(
         ticker=ticker, status=status, n_common_dates=8, max_rel_dev=dev,
         max_dev_date="2026-03-20", explained=explained,
         explanation="CLOSE axis: OUT-OF-TOL",
+        step_date="2026-03-10", pre_step_max_rel_dev=0.0,
     )
 
 
@@ -71,14 +75,15 @@ def test_the_gate_passes_on_a_declared_row_and_fails_without_it(monkeypatch, tmp
     old_close = pd.Series([100.0] * 8, index=idx)
     client = _FakePolygon(splits={}, dividends={})
 
-    monkeypatch.setattr(m, "DECLARED_RECONCILE_DIVERGENCES", (_row(bound=0.9),))
+    # The reference steps on idx[3] (2024-01-05); the row declares that day.
+    monkeypatch.setattr(m, "DECLARED_RECONCILE_DIVERGENCES", (_row(bound=0.9, when="2024-01-05"),))
     s3, scratch, kw = _run(monkeypatch, raw=raw, old_close=old_close, client=client, apply=True)
     result = m.migrate_universe_crsp_basis(spill_dir=str(tmp_path), **kw)
     assert result["status"] == "ok" and result["unexplained_count"] == 0
     assert [r["ticker"] for r in _audit(s3)["close_declared_explained"]] == ["X"]
     assert scratch.write.call_count == 1
 
-    monkeypatch.setattr(m, "DECLARED_RECONCILE_DIVERGENCES", (_row(bound=0.1),))
+    monkeypatch.setattr(m, "DECLARED_RECONCILE_DIVERGENCES", (_row(bound=0.1, when="2024-01-05"),))
     s3, scratch, kw = _run(monkeypatch, raw=raw, old_close=old_close, client=client, apply=True)
     with pytest.raises(RuntimeError, match="FAILED LOUD.*close axis"):
         m.migrate_universe_crsp_basis(spill_dir=str(tmp_path), **kw)
