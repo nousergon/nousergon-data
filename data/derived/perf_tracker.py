@@ -59,6 +59,14 @@ the excess over SPY (``R_p - R_spy``); the beta-adjusted alpha is
 daily SPY returns over the window, published only with at least
 :data:`MIN_BETA_OBSERVATIONS` days. No risk-free leg.
 
+Risk (alpha-engine-config-I12784): each window also carries a ``risk`` block
+over the same daily portfolio returns (volatility, Sharpe, Sortino, max
+drawdown, tracking error, information ratio, up days, days beating SPY), and
+the document carries ``underwater_pct``, the since-inception drawdown series
+behind the max-drawdown figure. Definitions travel in ``definitions.risk``.
+The block inherits the window's estimate reasons; turnover stays null until a
+trade-level input is read.
+
 Determinism: the same inputs and ``now`` give the same bytes. The CLI logs
 counts, dates and keys only, never a value (this repository and its run logs
 are public).
@@ -98,6 +106,13 @@ STATUSES = (STATUS_OK, STATUS_INSUFFICIENT, STATUS_ESTIMATED)
 YEAR_WINDOW_MIN_DAYS = 365
 #: Fewer daily observations than this and beta is not published.
 MIN_BETA_OBSERVATIONS = 60
+#: Fewer daily observations than this and the ANNUALISED risk metrics
+#: (volatility, Sharpe, Sortino, tracking error, information ratio) are not
+#: published: the same bar as beta, so a window's risk block and its beta
+#: become publishable together.
+MIN_RISK_OBSERVATIONS = MIN_BETA_OBSERVATIONS
+#: Trading days per year, for annualising daily moments.
+TRADING_DAYS_PER_YEAR = 252
 #: The ledger source that journals deposits and withdrawals
 #: (alpha-engine-config-I12557 deliverable 2, "Transfers").
 TRANSFER_SOURCE = "transfer"
@@ -150,6 +165,18 @@ DEFINITIONS = {
     "alpha": "excess over SPY: R_p - R_spy",
     "beta_adjusted_alpha": "R_p - beta * R_spy, beta the OLS slope of daily R_p on daily "
     f"R_spy over the window, published with >= {MIN_BETA_OBSERVATIONS} observations; no risk-free leg",
+    "risk": "per window, over the same daily portfolio returns the TWR chains: "
+    f"volatility = sample stdev x sqrt({TRADING_DAYS_PER_YEAR}); Sharpe = annualised mean / "
+    "volatility; Sortino = annualised mean / annualised downside deviation (root mean square "
+    "of min(r, 0) over every day); tracking error = annualised stdev of (R_p - R_spy) daily; "
+    "information ratio = annualised mean of (R_p - R_spy) / tracking error; risk-free = 0 "
+    "(no risk-free source named yet, as for alpha); annualised metrics need >= "
+    f"{MIN_RISK_OBSERVATIONS} observations. Max drawdown = deepest fall of the window's "
+    "flow-adjusted wealth index from its running peak (base row included). Up days = share "
+    "of days with R_p > 0; days beating SPY = share with R_p > R_spy. Turnover is not "
+    "published yet (no trade-level input).",
+    "underwater_pct": "since inception, each NAV row's flow-adjusted wealth index as % below "
+    "its running peak (0 at a new high)",
     "status": "ok | insufficient_history | estimated (a missing or non-authoritative input; "
     "reasons name it)",
 }
@@ -362,6 +389,98 @@ def _beta(port: Sequence[float], bench: Sequence[float]) -> float | None:
     return sum((p - mp) * (b - mb) for p, b in zip(port, bench, strict=True)) / var
 
 
+def _mean(xs: Sequence[float]) -> float:
+    return sum(xs) / len(xs)
+
+
+def _stdev(xs: Sequence[float]) -> float | None:
+    """Sample standard deviation; None under two observations."""
+    if len(xs) < 2:
+        return None
+    m = _mean(xs)
+    return math.sqrt(sum((x - m) ** 2 for x in xs) / (len(xs) - 1))
+
+
+def _ratio(num: float, den: float | None) -> float | None:
+    return None if den is None or den <= 0 else num / den
+
+
+def _r4(x: float | None) -> float | None:
+    return None if x is None else round(x, 4)
+
+
+def _drawdowns(daily: Sequence[float]) -> list[float]:
+    """Fall below the running peak after each day, the base (wealth 1.0)
+    counted as the first peak; 0.0 at a new high, negative below one."""
+    wealth = peak = 1.0
+    out = []
+    for r in daily:
+        wealth *= 1.0 + r
+        peak = max(peak, wealth)
+        out.append(wealth / peak - 1.0)
+    return out
+
+
+def risk_metrics(
+    port: Sequence[float],
+    spy: Sequence[float] | None,
+    reasons: Sequence[str],
+) -> dict[str, Any]:
+    """The window's risk block over its daily portfolio returns.
+
+    ``spy`` is the SPY leg's daily returns over the same intervals, or None
+    when that leg could not be aligned (then tracking error, the information
+    ratio and days-beating-SPY are null). ``reasons`` are the window's estimate
+    reasons (portfolio plus SPY); the block is ``estimated`` whenever any is
+    present, exactly as the return cells are. Pure; no I/O.
+    """
+    n = len(port)
+    out: dict[str, Any] = {
+        "observations": n,
+        "volatility_ann_pct": None,
+        "sharpe": None,
+        "sortino": None,
+        "max_drawdown_pct": None,
+        "tracking_error_ann_pct": None,
+        "information_ratio": None,
+        "up_days_pct": None,
+        "days_beating_spy_pct": None,
+        "turnover": None,
+    }
+    if n == 0:
+        out.update(status=STATUS_INSUFFICIENT, annualised_status=STATUS_INSUFFICIENT, reasons=[])
+        return out
+    aligned = spy is not None and len(spy) == n
+    dd = _drawdowns(port)
+    out["max_drawdown_pct"] = _pct(min(0.0, *dd))
+    out["up_days_pct"] = _pct(sum(1 for r in port if r > 0) / n)
+    if aligned:
+        out["days_beating_spy_pct"] = _pct(sum(1 for p, s in zip(port, spy, strict=True) if p > s) / n)
+    rs = list(dict.fromkeys(reasons))
+    if not aligned:
+        rs.append("spy_daily_not_aligned")
+    status = STATUS_ESTIMATED if rs else STATUS_OK
+    annualised = STATUS_INSUFFICIENT
+    if n >= MIN_RISK_OBSERVATIONS:
+        annualised = status
+        root = math.sqrt(TRADING_DAYS_PER_YEAR)
+        sd = _stdev(port)
+        mean_ann = _mean(port) * TRADING_DAYS_PER_YEAR
+        vol = None if sd is None else sd * root
+        downside = math.sqrt(_mean([min(r, 0.0) ** 2 for r in port])) * root
+        out["volatility_ann_pct"] = _pct(vol)
+        out["sharpe"] = _r4(_ratio(mean_ann, vol))
+        out["sortino"] = _r4(_ratio(mean_ann, downside))
+        if aligned:
+            active = [p - s for p, s in zip(port, spy, strict=True)]
+            asd = _stdev(active)
+            te = None if asd is None else asd * root
+            out["tracking_error_ann_pct"] = _pct(te)
+            out["information_ratio"] = _r4(_ratio(_mean(active) * TRADING_DAYS_PER_YEAR, te))
+    out.update(status=status, annualised_status=annualised, reasons=rs)
+    return out
+
+
 # ── the build ────────────────────────────────────────────────────────────────
 
 
@@ -477,6 +596,7 @@ def build(
         return STATUS_ESTIMATED if reasons or value is None else STATUS_OK
 
     windows_out = []
+    underwater: dict[str, float | None] = {}
     counts = dict.fromkeys(STATUSES, 0)
     for wid, label in WINDOWS:
         base, end, partial, insufficient = window_bounds(wid, days)
@@ -493,6 +613,7 @@ def build(
                 c: {"status": STATUS_INSUFFICIENT, "reasons": []} for c in COMPARISONS
             }
             counts[STATUS_INSUFFICIENT] += len(COMPARISONS)
+            win["risk"] = risk_metrics((), None, ())
             windows_out.append(win)
             continue
         lo, hi = index[base], index[end]
@@ -544,7 +665,20 @@ def build(
         for cell in cells.values():
             counts[cell["status"]] += 1
         win["cells"] = cells
+        win["risk"] = risk_metrics(
+            port.daily,
+            spy.daily if len(spy.daily) == len(port.daily) else None,
+            vs_spy["reasons"],
+        )
         windows_out.append(win)
+
+        if wid == "inception":
+            # The underwater series behind the max-drawdown figure, one point
+            # per NAV row since inception, for the console's chart
+            # (alpha-engine-config-I12784).
+            underwater[rows[lo].day.isoformat()] = 0.0
+            for i, dd in enumerate(_drawdowns(port.daily), start=lo + 1):
+                underwater[rows[i].day.isoformat()] = _pct(dd)
 
     inception, last = days[0], days[-1]
     return {
@@ -573,6 +707,7 @@ def build(
             },
         },
         "windows": windows_out,
+        "underwater_pct": underwater,
         "status_counts": counts,
     }
 
