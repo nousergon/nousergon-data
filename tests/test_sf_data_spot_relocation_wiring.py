@@ -520,7 +520,8 @@ class TestDispatcherLambdaAndIam:
         # default made every collection write an executor write. Standard
         # fleet SG, no IB port.
         src = (_DISPATCHER / "index.py").read_text()
-        assert 'os.environ.get("DATA_SPOT_IAM_PROFILE", "nousergon-data-collection-box-profile")' in src
+        # Prod default only; outside prod the env must set it (I12506).
+        assert '_per_env("DATA_SPOT_IAM_PROFILE", "nousergon-data-collection-box-profile")' in src
         # No IB gateway port opened anywhere in the launcher.
         assert "4001" not in src and "4002" not in src
 

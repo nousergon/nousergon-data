@@ -12,6 +12,8 @@ Holds four properties:
    prod store, a prod topic or a schedule that is on;
 4. staging rendering refuses while a runtime gap is open, and each gap's probe
    still holds (a closed gap is deleted in the PR that closes it).
+5. the data-spot dispatcher defaults its store, run-log bucket and launch
+   resources in prod only, and its non-prod store comes from the registry.
 """
 
 from __future__ import annotations
@@ -215,7 +217,131 @@ def test_cli_table_and_target(mod, capsys, staging):
     assert json.loads(capsys.readouterr().out)["stack"] == staging.stack("data_collection")
 
 
-def test_deploy_path_does_not_read_this_module_yet():
-    """Code only (S-18 slice 1): merging this module changes no deploy. The slice that
-    wires it in deletes the ``deploy-script-env`` gap and this test together."""
-    assert "data_collection_env_params" not in DEPLOY_SCRIPT.read_text(encoding="utf-8")
+# ── S-18 slice 2: the deploy path and check-live read the environment ─────────
+
+
+def _no_gaps(monkeypatch, stack, mod):
+    """Stand-in for the day every staging gap is closed."""
+    monkeypatch.setattr(mod, "RUNTIME_GAPS", ())
+    monkeypatch.setattr(stack, "_env_params", lambda: mod)
+
+
+def test_prod_env_target_is_the_template_and_needs_no_registry(stack, prod, monkeypatch):
+    monkeypatch.delenv("NE_ENV", raising=False)
+    t = stack.env_target()
+    f = stack.deploy_fields()
+    assert t["env"] == "prod" and t["stack"] == prod.stack("data_collection") == f["stack-name"]
+    # check-live publishes where the data gate reads: prod research.
+    assert t["bucket"] == prod.bucket("research") == f["definition-bucket"]
+    # The overrides are exactly the four states the script always passed, nothing more.
+    assert list(t["params"]) == list(stack.STATE_PARAMETERS)
+    assert stack.env_fields()["parameter-overrides"] == " ".join(
+        f"{p}={f['param-' + p]}" for p in stack.STATE_PARAMETERS)
+
+
+def test_staging_is_refused_while_any_gap_is_open(stack, mod, monkeypatch, capsys):
+    assert mod.RUNTIME_GAPS, "every gap closed: replace this test with the first staging deploy's proof"
+    monkeypatch.setenv("NE_ENV", "staging")
+    with pytest.raises(stack.EnvRefused, match="runtime gap"):
+        stack.env_target()
+    assert stack.main(["get", "stack-name"]) == 3
+    assert "refusing" in capsys.readouterr().err
+    assert stack.main(["check-live", "--no-publish"]) == 2
+
+
+def test_staging_target_once_gaps_close_is_its_own_account_stack_and_bucket(stack, mod, staging, monkeypatch):
+    _no_gaps(monkeypatch, stack, mod)
+    t = stack.env_target("staging")
+    assert (t["account"], t["region"], t["stack"]) == (
+        str(staging.account), staging.region, staging.stack("data_collection"))
+    assert t["bucket"] == staging.bucket("crucible")
+    assert {t["params"][p] for p in ("CollectionState", "DailyHealState")} == {"DISABLED"}
+    overrides = stack.env_fields("staging")["parameter-overrides"].split()
+    assert sorted(o.split("=", 1)[0] for o in overrides) == sorted(mod.resolve("staging")["params"])
+
+
+def test_check_live_declares_staging_schedules_disabled(stack, mod, monkeypatch):
+    _no_gaps(monkeypatch, stack, mod)
+    t = stack.env_target("staging")
+    tpl = stack.load_template()
+    f = stack.deploy_fields()
+
+    class _Cfn:
+        def describe_stacks(self, StackName):
+            assert StackName == t["stack"]
+            return {"Stacks": [{"StackStatus": "UPDATE_COMPLETE", "Tags": [
+                {"Key": k, "Value": f[k]} for k in ("template-sha256", "definition-sha256")]}]}
+
+    class _Sched:
+        def __init__(self, state):
+            self.state = state
+
+        def get_schedule(self, GroupName, Name):
+            s = next(x for x in stack.schedules(tpl) if x["name"] == Name)
+            state = self.state if s["state_parameter"] in ("CollectionState", "DailyHealState") \
+                else s["declared_state"]
+            return {"State": state, "ScheduleExpression": s["expression"]}
+
+    assert stack.live_findings(_Cfn(), _Sched("DISABLED"), t) == []
+    enabled = stack.live_findings(_Cfn(), _Sched("ENABLED"), t)
+    assert enabled and all("DISABLED declared for staging" in x for x in enabled)
+
+
+def test_deploy_script_takes_every_value_from_the_helper():
+    text = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+    assert 'NE_ENV="${NE_ENV:-prod}"' in text and "export NE_ENV" in text
+    assert '"${OVERRIDES[@]}"' in text and "field param-" not in text
+    assert "get-caller-identity" in text  # a non-prod deploy refuses the wrong account
+
+
+# ── 5. the data-spot dispatcher takes its store, run log and launch from its env ──
+DISPATCHER = REPO / "infrastructure" / "lambdas" / "data-spot-dispatcher" / "index.py"
+#: Every per-environment value the dispatcher must not default outside prod
+#: (the closed gaps dispatcher-store, dispatcher-run-log, dispatcher-launch).
+DISPATCHER_PER_ENV = {
+    "DATA_COLLECTION_STORE",
+    "DATA_COLLECTION_RUN_LOG_BUCKET",
+    "DATA_SPOT_SUBNETS",
+    "DATA_SPOT_SECURITY_GROUP",
+    "DATA_SPOT_KEY_NAME",
+    "DATA_SPOT_IAM_PROFILE",
+}
+
+
+def _dispatcher_prod_defaults() -> dict[str, str]:
+    import ast
+
+    out: dict[str, str] = {}
+    for node in ast.walk(ast.parse(DISPATCHER.read_text(encoding="utf-8"))):
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "_per_env":
+            var, default = node.args
+            out[ast.literal_eval(var)] = ast.literal_eval(default)
+    return out
+
+
+def test_dispatcher_reads_every_per_env_value_through_the_prod_only_default():
+    assert set(_dispatcher_prod_defaults()) == DISPATCHER_PER_ENV
+    text = DISPATCHER.read_text(encoding="utf-8")
+    for var in DISPATCHER_PER_ENV:
+        assert f'os.environ.get("{var}"' not in text, f"{var} read with a default that holds in every environment"
+
+
+def test_dispatcher_commands_name_no_literal_store(prod):
+    text = DISPATCHER.read_text(encoding="utf-8")
+    assert f"--store s3://{prod.bucket('research')}" not in text
+    assert "--store {store}" in text
+
+
+def test_dispatcher_environment_prod_is_the_dispatchers_prod_default(mod):
+    defaults = _dispatcher_prod_defaults()
+    env_vals = mod.dispatcher_environment("prod")
+    assert env_vals.pop("NE_ENV") == "prod"
+    assert env_vals == {k: defaults[k] for k in env_vals}
+
+
+def test_dispatcher_environment_staging_writes_only_its_own_bucket(mod, prod, staging):
+    env_vals = mod.dispatcher_environment("staging")
+    assert env_vals["NE_ENV"] == "staging"
+    assert env_vals["DATA_COLLECTION_RUN_LOG_BUCKET"] == staging.bucket("crucible")
+    assert env_vals["DATA_COLLECTION_STORE"] == f"s3://{staging.bucket('crucible')}/data_collection"
+    assert prod.bucket("research") not in json.dumps(env_vals)

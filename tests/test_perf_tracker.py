@@ -9,6 +9,7 @@ from __future__ import annotations
 import io
 import json
 from datetime import UTC, date, datetime, timedelta
+from itertools import pairwise
 
 import pytest
 
@@ -518,3 +519,205 @@ def test_workflow_passes_the_store_uri_host_segment_as_the_bucket():
             capture_output=True, text=True, check=True,
         ).stdout.splitlines()
         assert out[out.index("--bucket") + 1] == "alpha-engine-research", step["name"]
+
+
+# ── risk block (alpha-engine-config-I12784) ──────────────────────────────────
+
+
+def test_risk_metrics_on_known_daily_returns():
+    port = [0.01, -0.02, 0.03, -0.01] * 20          # 80 observations
+    spy = [0.005, -0.01, 0.01, 0.0] * 20
+    r = pt.risk_metrics(port, spy, ())
+    assert r["status"] == r["annualised_status"] == "ok" and r["reasons"] == []
+    mean = sum(port) / len(port)
+    sd = (sum((x - mean) ** 2 for x in port) / (len(port) - 1)) ** 0.5
+    assert r["volatility_ann_pct"] == round(sd * 252 ** 0.5 * 100, 4)
+    assert r["sharpe"] == round(mean * 252 / (sd * 252 ** 0.5), 4)
+    down = (sum(min(x, 0) ** 2 for x in port) / len(port)) ** 0.5 * 252 ** 0.5
+    assert r["sortino"] == round(mean * 252 / down, 4)
+    assert r["up_days_pct"] == 50.0
+    assert r["days_beating_spy_pct"] == 50.0
+    assert r["tracking_error_ann_pct"] is not None and r["information_ratio"] is not None
+    assert r["turnover"] is None
+    # Deepest fall below the running peak, against a direct walk of the wealth index.
+    w = pk = 1.0
+    worst = 0.0
+    for x in port:
+        w *= 1 + x
+        pk = max(pk, w)
+        worst = min(worst, w / pk - 1)
+    assert r["max_drawdown_pct"] == round(worst * 100, 4)
+
+
+def test_annualised_risk_needs_sixty_observations_but_drawdown_does_not():
+    r = pt.risk_metrics([0.01, -0.02, 0.005], [0.0, 0.0, 0.0], ())
+    assert r["annualised_status"] == "insufficient_history"
+    assert r["volatility_ann_pct"] is r["sharpe"] is r["tracking_error_ann_pct"] is None
+    assert r["max_drawdown_pct"] == -2.0
+    assert r["status"] == "ok"
+
+
+def test_risk_inherits_estimate_reasons_and_flags_an_unaligned_spy_leg():
+    r = pt.risk_metrics([0.01] * 70, None, ("external_flows_not_journaled",))
+    assert r["status"] == r["annualised_status"] == "estimated"
+    assert r["reasons"] == ["external_flows_not_journaled", "spy_daily_not_aligned"]
+    assert r["volatility_ann_pct"] == 0.0 and r["sharpe"] is None   # zero vol: no ratio
+    assert r["tracking_error_ann_pct"] is None and r["days_beating_spy_pct"] is None
+    assert r["max_drawdown_pct"] == 0.0
+
+
+def test_every_window_carries_a_risk_block_and_the_underwater_series(monkeypatch):
+    monkeypatch.setattr(pt, "FLOWS_JOURNALED_FROM", date(2000, 1, 1))
+    rows = ledger(LONG)
+    rows[150] = (rows[150][0], rows[150][1] * 0.9, *rows[150][2:])   # one bad day
+    doc = build(rows)
+    for w in doc["windows"]:
+        assert set(w["risk"]) >= {"status", "annualised_status", "volatility_ann_pct",
+                                  "max_drawdown_pct", "information_ratio"}
+    inc = window(doc, "inception")
+    assert inc["risk"]["observations"] == len(LONG) - 1
+    assert inc["risk"]["annualised_status"] == "ok"
+    uw = doc["underwater_pct"]
+    assert list(uw) == [d.isoformat() for d in LONG]
+    assert uw[LONG[0].isoformat()] == 0.0 and max(uw.values()) == 0.0
+    assert min(uw.values()) == inc["risk"]["max_drawdown_pct"] < 0
+    assert window(doc, "day")["risk"]["annualised_status"] == "insufficient_history"
+
+
+def test_an_insufficient_window_has_an_insufficient_risk_block():
+    doc = build(ledger(SHORT))
+    yoy = window(doc, "yoy")["risk"]
+    assert yoy["status"] == "insufficient_history" and yoy["observations"] == 0
+
+
+# ── Brian 2026-11-03: Nasdaq Composite, Russell 2000 and the personal portfolio ──
+
+
+def personal_rows(days: list[date], step: float = 0.0008, *, estimated_at: date | None = None):
+    return [
+        pt.PersonalRow(a, b, step, b == estimated_at)
+        for a, b in pairwise(days)
+    ]
+
+
+def build_full(rows, *, extra=None, personal=None, as_of=None):
+    days = [r[0] for r in rows]
+    return pt.build(
+        pt.parse_nav_csv(nav_csv(rows)),
+        [],
+        {"entries_read": 0, "transfer_entries": 0},
+        history(days, 100.0, 0.0005),
+        history(days),
+        now=NOW,
+        as_of=as_of,
+        extra_histories=extra,
+        personal=personal,
+    )
+
+
+def test_every_window_carries_the_four_indexes_and_the_personal_cell():
+    doc = build_full(ledger(SHORT))
+    for w in doc["windows"]:
+        assert {"vs_spy", "vs_qqq", "vs_oneq", "vs_iwm", "vs_personal"} <= set(w["cells"])
+    assert set(doc["benchmark_labels"]) == {"vs_spy", "vs_qqq", "vs_oneq", "vs_iwm", "vs_personal"}
+
+
+def test_close_history_benchmarks_chain_and_are_marked_not_settled():
+    oneq = history(SHORT, 40.0, 0.0003)
+    iwm = history(SHORT, 200.0, -0.0001)
+    doc = build_full(ledger(SHORT), extra={"ONEQ": oneq, "IWM": iwm})
+    inc = window(doc, "inception")["cells"]
+    assert inc["vs_oneq"]["benchmark_pct"] == pytest.approx(((1.0003) ** 39 - 1) * 100, abs=1e-3)
+    assert inc["vs_iwm"]["benchmark_pct"] == pytest.approx(((0.9999) ** 39 - 1) * 100, abs=1e-3)
+    assert "oneq_not_polygon_settled" in inc["vs_oneq"]["reasons"]
+    assert inc["vs_iwm"]["excess_pct"] == pytest.approx(
+        inc["absolute"]["return_pct"] - inc["vs_iwm"]["benchmark_pct"], abs=1e-3
+    )
+    assert doc["inputs"]["oneq"]["readable"] is True
+
+
+def test_an_unreadable_index_history_is_null_and_named_never_zero():
+    doc = build_full(ledger(SHORT), extra={"ONEQ": None})
+    cell = window(doc, "inception")["cells"]["vs_oneq"]
+    assert cell["benchmark_pct"] is None and cell["excess_pct"] is None
+    assert "oneq_close_history_unreadable" in cell["reasons"]
+    # The other cells are untouched.
+    assert window(doc, "inception")["cells"]["vs_spy"]["benchmark_pct"] is not None
+
+
+def test_personal_portfolio_chains_over_the_window_dates():
+    doc = build_full(ledger(SHORT), personal=personal_rows(SHORT))
+    inc = window(doc, "inception")["cells"]["vs_personal"]
+    assert inc["benchmark_pct"] == pytest.approx(((1.0008) ** 39 - 1) * 100, abs=1e-3)
+    assert inc["excess_pct"] == pytest.approx(
+        window(doc, "inception")["cells"]["absolute"]["return_pct"] - inc["benchmark_pct"], abs=1e-3
+    )
+    assert not [r for r in inc["reasons"] if r.startswith("personal_")]
+    day = window(doc, "day")["cells"]["vs_personal"]
+    assert day["benchmark_pct"] == pytest.approx(0.08, abs=1e-6)
+    assert doc["inputs"]["personal"]["rows"] == 39
+
+
+def test_personal_unavailable_or_starting_late_is_null_and_named():
+    doc = build_full(ledger(SHORT))
+    cell = window(doc, "inception")["cells"]["vs_personal"]
+    assert cell["benchmark_pct"] is None and pt.REASON_PERSONAL_UNAVAILABLE in cell["reasons"]
+    late = build_full(ledger(SHORT), personal=personal_rows(SHORT[10:]))
+    inc = window(late, "inception")["cells"]["vs_personal"]
+    assert inc["benchmark_pct"] is None
+    assert f"personal_series_starts:{SHORT[10].isoformat()}" in inc["reasons"]
+    # A window inside the personal series' span still computes.
+    assert window(late, "day")["cells"]["vs_personal"]["benchmark_pct"] is not None
+
+
+def test_personal_gap_late_end_and_estimated_rows_mark_the_cell():
+    rows = personal_rows(SHORT[:30], estimated_at=SHORT[5])
+    del rows[10]                                  # a gap
+    doc = build_full(ledger(SHORT), personal=rows)
+    reasons = window(doc, "inception")["cells"]["vs_personal"]["reasons"]
+    assert f"personal_series_gap:{SHORT[11].isoformat()}" in reasons
+    assert f"personal_series_ends:{SHORT[29].isoformat()}" in reasons
+    assert f"personal_nav_estimated:{SHORT[5].isoformat()}" in reasons
+    assert window(doc, "inception")["cells"]["vs_personal"]["status"] == pt.STATUS_ESTIMATED
+
+
+def test_parse_personal_returns_refuses_an_unknown_schema_and_skips_bad_rows():
+    with pytest.raises(pt.PerfInputError):
+        pt.parse_personal_returns({"schema_version": "v0", "returns": []})
+    parsed = pt.parse_personal_returns({
+        "schema_version": pt.PERSONAL_SCHEMA_VERSION,
+        "returns": [
+            {"start": "2026-03-09", "end": "2026-03-10", "return": 0.01},
+            {"start": "2026-03-10", "end": "2026-03-11", "return": "nan"},
+            {"start": "2026-03-11", "end": "2026-03-11", "return": 0.01},
+            {"start": "2026-03-11", "end": "2026-03-12", "return": -0.02, "estimated": True},
+        ],
+    })
+    assert [(r.end.isoformat(), r.estimated) for r in parsed] == [("2026-03-10", False), ("2026-03-12", True)]
+
+
+def test_load_reads_the_optional_inputs_and_survives_their_absence():
+    rows = ledger(SHORT)
+    closes = {"closes": [[d.isoformat(), 100.0 + i] for i, d in enumerate(SHORT)]}
+    base = {
+        pt.NAV_KEY: nav_csv(rows).encode(),
+        pt.CLOSE_HISTORY_KEY.format(symbol="SPY"): json.dumps(closes).encode(),
+        pt.CLOSE_HISTORY_KEY.format(symbol="QQQ"): json.dumps(closes).encode(),
+    }
+    bare = pt.load_and_build(FakeS3(base), "bucket", now=NOW)
+    inc = window(bare, "inception")["cells"]
+    assert inc["vs_iwm"]["benchmark_pct"] is None and inc["vs_personal"]["benchmark_pct"] is None
+    personal = {
+        "schema_version": pt.PERSONAL_SCHEMA_VERSION,
+        "returns": [{"start": a.isoformat(), "end": b.isoformat(), "return": 0.001}
+                    for a, b in pairwise(SHORT)],
+    }
+    full = pt.load_and_build(FakeS3({
+        **base,
+        pt.CLOSE_HISTORY_KEY.format(symbol="ONEQ"): json.dumps(closes).encode(),
+        pt.CLOSE_HISTORY_KEY.format(symbol="IWM"): json.dumps(closes).encode(),
+        pt.PERSONAL_KEY: json.dumps(personal).encode(),
+    }), "bucket", now=NOW)
+    inc = window(full, "inception")["cells"]
+    assert inc["vs_iwm"]["benchmark_pct"] is not None
+    assert inc["vs_personal"]["benchmark_pct"] == pytest.approx((1.001 ** 39 - 1) * 100, abs=1e-3)

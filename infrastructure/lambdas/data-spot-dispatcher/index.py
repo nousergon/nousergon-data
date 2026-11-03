@@ -55,6 +55,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import uuid
 
 import boto3
@@ -67,6 +68,68 @@ logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
 REGION = os.environ.get("AWS_REGION", "us-east-1")
+
+# ── Environment (staging S-18, alpha-engine-config-I12506) ──────────────────
+# NE_ENV names the environment this dispatcher serves; unset is prod. Every
+# value that names a prod-account resource (subnets, security group, key pair,
+# box instance profile) or the prod store keeps its default ONLY in prod. In
+# any other environment the function's environment must carry it (its deploy
+# derives the store and run-log bucket from the registry:
+# infrastructure/data_collection_env_params.py::dispatcher_environment), and a
+# missing one REFUSES at import. A staging dispatcher that fell back to a prod
+# default would launch into prod's network and pass the prod store to the box
+# (ENV-PROD-OWNS-DATA; plan: staging writes only its own bucket).
+NE_ENV = os.environ.get("NE_ENV", "").strip() or "prod"
+
+
+def _per_env(var: str, prod_default: str) -> str:
+    """``$var`` when set; ``prod_default`` in prod only; otherwise RAISES."""
+    value = os.environ.get(var, "").strip()
+    if value:
+        return value
+    if NE_ENV == "prod":
+        return prod_default
+    raise RuntimeError(
+        f"{var} is unset and NE_ENV={NE_ENV!r}: outside prod it has no default "
+        "(alpha-engine-config-I12506); set it in the function's environment"
+    )
+
+
+#: The collection store every shadow/parity command passes as ``--store``.
+STORE_URI = _per_env("DATA_COLLECTION_STORE", "s3://alpha-engine-research/data_collection")
+
+
+def _box_env_prefix() -> str:
+    """What goes in front of every workload's box command: the environment.
+
+    The box runs ``nousergon_lib.env``-aware code (the universe chokepoint, the
+    registry lookups), and a box with no ``NE_ENV`` resolves as prod: a staging
+    dispatcher would launch a staging box that collects prod's full universe
+    (alpha-engine-config-I12506, ``dispatcher-deploy``). So outside prod the
+    command is prefixed ``export NE_ENV=<env>; `` (an ``export``, not an
+    assignment prefix, so it reaches every statement of a compound workload).
+
+    Prod: the empty string, so prod's command is byte-identical to before.
+    Outside prod the name must be one the environment registry declares
+    (``nousergon_lib.env.environment_names()``), and it is shell-quoted; any
+    other value REFUSES at import rather than reaching a root shell.
+    """
+    if NE_ENV == "prod":
+        return ""
+    from nousergon_lib import env as _env_registry  # noqa: PLC0415 — outside prod only
+
+    declared = _env_registry.environment_names()
+    if NE_ENV not in declared:
+        raise RuntimeError(
+            f"NE_ENV={NE_ENV!r} is not an environment the registry declares "
+            f"({sorted(declared)}); refusing to tag box commands with it "
+            "(alpha-engine-config-I12506)"
+        )
+    return f"export NE_ENV={shlex.quote(NE_ENV)}; "
+
+
+#: Prefixed onto every workload command ``_resolve_workload`` returns.
+BOX_ENV_PREFIX = _box_env_prefix()
 
 # Kill-switch: DATA_SPOT_DISPATCH_ENABLED=false disables the launch without
 # deleting the SF states — the SF's CheckDataSpotLaunched -> *Skipped branch
@@ -120,7 +183,7 @@ INSTANCE_TYPES = [
 ]
 SUBNETS = [
     s.strip()
-    for s in os.environ.get(
+    for s in _per_env(
         "DATA_SPOT_SUBNETS",
         "subnet-a61ec0fb,subnet-1e58307a,subnet-789d3857,"
         "subnet-c670118d,subnet-7cff7c43,subnet-e07166ec",
@@ -128,10 +191,10 @@ SUBNETS = [
     if s.strip()
 ]
 AMI_ID = os.environ.get("DATA_SPOT_AMI_ID", "ami-0c421724a94bba6d6")  # AL2023 x86_64
-KEY_NAME = os.environ.get("DATA_SPOT_KEY_NAME", "alpha-engine-key")
+KEY_NAME = _per_env("DATA_SPOT_KEY_NAME", "alpha-engine-key")
 # NO IB port exposure (config#1767 deliverable #3): reuse the standard fleet SG,
 # which does not open the IB Gateway port. The data spot only needs egress + SSM.
-SECURITY_GROUP = os.environ.get("DATA_SPOT_SECURITY_GROUP", "sg-03cd3c4bd91e610b0")
+SECURITY_GROUP = _per_env("DATA_SPOT_SECURITY_GROUP", "sg-03cd3c4bd91e610b0")
 # The box's Arctic-write + S3 read/write come from this profile. It used to be
 # the trading component's `alpha-engine-executor-profile` (component 3), so
 # every collection write landed in CloudTrail as an executor write:
@@ -145,7 +208,7 @@ SECURITY_GROUP = os.environ.get("DATA_SPOT_SECURITY_GROUP", "sg-03cd3c4bd91e610b
 # live since 2026-09-15; this Lambda's role may PassRole it to EC2
 # (`PassDataCollectionBoxRoleToEc2`). DATA_SPOT_IAM_PROFILE stays an override
 # (e.g. to roll back to the executor profile without a code change).
-IAM_PROFILE = os.environ.get("DATA_SPOT_IAM_PROFILE", "nousergon-data-collection-box-profile")
+IAM_PROFILE = _per_env("DATA_SPOT_IAM_PROFILE", "nousergon-data-collection-box-profile")
 # Large ephemeral disk so daily_closes fetch + ArcticDB append never hit the
 # /tmp-100% failure mode that motivated this move (config#1767 gotcha).
 VOLUME_SIZE_GB = int(os.environ.get("DATA_SPOT_VOLUME_SIZE_GB", "60"))
@@ -734,7 +797,7 @@ _WORKLOADS: dict[str, str] = {
         "--daily-arctic-append --date {trading_day}; "
         "RC=$?; printf 'post-market-arctic-append\\t%s\\n' $RC >> $LEGS; [ $RC -ne 0 ] && RC_ALL=$RC; "
         "python -m shadow parity --trading-day {trading_day} --legs-file $LEGS "
-        "--store s3://alpha-engine-research/data_collection; PARITY_RC=$?; "
+        "--store {store}; PARITY_RC=$?; "
         "[ $RC_ALL -ne 0 ] && exit $RC_ALL; exit $PARITY_RC )"
     ),
     # SAME-DAY shadow run (Brian ruling 2026-09-21, alpha-engine-config-I11203).
@@ -820,9 +883,9 @@ _WORKLOADS: dict[str, str] = {
         "--daily-arctic-append --date $TD; "
         "RC=$?; printf 'post-market-arctic-append\\t%s\\n' $RC >> $LEGS; [ $RC -ne 0 ] && RC_ALL=$RC; "
         "python -m shadow parity --trading-day $TD --legs-file $LEGS --legs-group sameday "
-        "--store s3://alpha-engine-research/data_collection --dispatch-gate; PARITY_RC=$?; "
+        "--store {store} --dispatch-gate; PARITY_RC=$?; "
         "python -m shadow recompute-lineage --trading-day $TD "
-        "--store s3://alpha-engine-research/data_collection; LINEAGE_RC=$?; "
+        "--store {store}; LINEAGE_RC=$?; "
         # alpha-engine-config-I11447 (Brian, 2026-09-24): once the day is
         # graded, drop shadow libraries past the 7-day window. "Graded" is
         # parity exit 0 (MET) or 1 (ran, NOT MET); exit 2 means the comparison
@@ -936,10 +999,10 @@ _WORKLOADS: dict[str, str] = {
         "--morning-arctic-append --date $TD; "
         "RC=$?; printf 'morning-arctic-append\\t%s\\n' $RC >> $LEGS; [ $RC -ne 0 ] && RC_ALL=$RC; "
         "python -m shadow parity --trading-day $TD --legs-file $LEGS --legs-group morning "
-        "--store s3://alpha-engine-research/data_collection; PARITY_RC=$?; ARCTIC_RC=2; "
+        "--store {store}; PARITY_RC=$?; ARCTIC_RC=2; "
         "if [ $PARITY_RC -ne 2 ]; then "
         "python -m shadow arctic-parity --trading-day $TD "
-        "--store s3://alpha-engine-research/data_collection "
+        "--store {store} "
         "--await-live-unit D18 --await-timeout-seconds 2700 "
         "--dispatch-gate; ARCTIC_RC=$?; fi; "
         "[ $RC_ALL -ne 0 ] && exit $RC_ALL; [ $PARITY_RC -eq 2 ] && exit $PARITY_RC; exit $ARCTIC_RC )"
@@ -987,11 +1050,11 @@ _WORKLOADS: dict[str, str] = {
     # unreachable the way `arctic_parity` did (alpha-engine-config-I10920).
     "shadow-parity": (
         "python -m shadow parity --trading-day {trading_day} "
-        "--store s3://alpha-engine-research/data_collection"
+        "--store {store}"
     ),
     "arctic-parity": (
         "python -m shadow arctic-parity --trading-day {trading_day} "
-        "--store s3://alpha-engine-research/data_collection"
+        "--store {store}"
     ),
     # alpha-engine-config-I11447: shadow ArcticDB retention, REPORT ONLY. Every
     # shadow run seeds a full copy of each live library as
@@ -1041,7 +1104,10 @@ def _resolve_workload(event: dict) -> tuple[str, str]:
         raise ValueError(
             f"unknown data-spot workload {w!r} — expected one of {sorted(_WORKLOADS)}"
         )
-    template = _WORKLOADS[w]
+    # `{store}` is substituted for EVERY workload, before the trading-day
+    # format, so a template without a trading day still names this
+    # environment's store (STORE_URI holds no brace).
+    template = _WORKLOADS[w].replace("{store}", STORE_URI)
     if w in _WORKLOADS_REQUIRING_TRADING_DAY:
         import datetime as _dt
 
@@ -1057,8 +1123,8 @@ def _resolve_workload(event: dict) -> tuple[str, str]:
             raise ValueError(
                 f"workload {w!r} trading_day={trading_day!r} is not a valid calendar date"
             ) from exc
-        return w, template.format(trading_day=trading_day)
-    return w, template
+        return w, BOX_ENV_PREFIX + template.format(trading_day=trading_day)
+    return w, BOX_ENV_PREFIX + template
 
 
 _MARKET_TZ = "America/New_York"
@@ -1225,7 +1291,7 @@ def _bootstrap_spec(
 #: historical ``_ssm_logs/`` tree on purpose: the run manifests this log is the
 #: evidence for live at ``data_collection/runs/…``, and the daily report's
 #: log-resolution row (`data_gate.report`) lists one prefix, not two.
-RUN_LOG_BUCKET = os.environ.get("DATA_COLLECTION_RUN_LOG_BUCKET", "alpha-engine-research")
+RUN_LOG_BUCKET = _per_env("DATA_COLLECTION_RUN_LOG_BUCKET", "alpha-engine-research")
 RUN_LOG_PREFIX = os.environ.get("DATA_COLLECTION_RUN_LOG_PREFIX", "data_collection/logs")
 
 #: The env var the box exports and ``run_units.resolve_log_location()`` reads,

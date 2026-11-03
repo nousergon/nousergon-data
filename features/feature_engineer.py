@@ -1119,7 +1119,8 @@ def compute_features(
     if earnings_data:
         df["earnings_surprise_pct"] = _safe_float(earnings_data.get("surprise_pct"), 0.0)
         days_since = _safe_float(earnings_data.get("days_since_earnings"), 90.0)
-        df["days_since_earnings"] = days_since / 90.0
+        # Capped at 90 days, as registry.py declares (I13143).
+        df["days_since_earnings"] = min(max(days_since, 0.0), 90.0) / 90.0
     else:
         df["earnings_surprise_pct"] = 0.0
         df["days_since_earnings"] = 1.0

@@ -8,11 +8,12 @@ is the parameter half of that deploy: for every template parameter it DECLARES
 how each environment sets it, so a parameter added to the template without a
 decision fails ``tests/test_data_collection_env_params.py``, not a deploy.
 
-Code only. Nothing here calls AWS, and nothing reads it on a deploy path yet:
-``deploy-data-collection-stack.sh`` still deploys prod from the template
-defaults. That is deliberate (see RUNTIME_GAPS ``deploy-script-env``); the
-tests prove that prod, resolved through this module, is byte-for-byte the
-values that script deploys today, so wiring it in is a no-op for prod.
+Nothing here calls AWS. ``deploy-data-collection-stack.sh`` and its
+``check-live`` read this module for any ``NE_ENV`` other than prod, through
+``data_collection_stack.env_target`` (S-18 slice 2). prod still deploys from
+the template defaults with no registry read, because its workflow installs no
+nousergon-lib; the tests prove that prod, resolved through this module, is
+byte-for-byte those values.
 
 Every value that names an account, a region, a stack, a bucket or a topic is
 resolved from the fleet environment registry through ``nousergon_lib.env``
@@ -106,64 +107,18 @@ DECLARED: dict[str, tuple[str, str]] = {
 #: gap is deleted here in the PR that closes it. ``None`` = declared, no probe.
 RUNTIME_GAPS: tuple[tuple[str, str, tuple[str, str, bool] | None], ...] = (
     (
-        "dispatcher-store",
-        "the data-spot dispatcher's on-box commands pass --store s3://<prod research>/data_collection, so a "
-        "staging run would write the prod store (denied by S-08; plan: staging outputs go to the staging bucket "
-        "only). Needs the store derived from the registry and passed in the dispatcher's environment.",
-        (
-            "infrastructure/lambdas/data-spot-dispatcher/index.py",
-            "--store s3://{research}/data_collection",
-            True,
-        ),
-    ),
-    (
-        "dispatcher-run-log",
-        "the dispatcher's run-log bucket defaults to prod research (DATA_COLLECTION_RUN_LOG_BUCKET).",
-        (
-            "infrastructure/lambdas/data-spot-dispatcher/index.py",
-            '"DATA_COLLECTION_RUN_LOG_BUCKET", "{research}"',
-            True,
-        ),
-    ),
-    (
-        "dispatcher-launch",
-        "the dispatcher's spot launch defaults name prod-account resources (security group, key pair, box "
-        "instance profile); staging needs its own, set through the dispatcher's environment.",
-        (
-            "infrastructure/lambdas/data-spot-dispatcher/index.py",
-            'os.environ.get("DATA_SPOT_SECURITY_GROUP", "sg-',
-            True,
-        ),
-    ),
-    (
         "dispatcher-deploy",
         "deploy-data-spot-dispatcher.yml deploys the prod account only; no staging dispatcher exists for the "
-        "staging state machines to invoke.",
+        "staging state machines to invoke. Its staging deploy must set dispatcher_environment('staging') plus "
+        "DATA_SPOT_SUBNETS / _SECURITY_GROUP / _KEY_NAME / _IAM_PROFILE from staging launch resources that do "
+        "not exist yet (staging tofu); the dispatcher refuses to import outside prod without them, and outside "
+        "prod it prefixes `export NE_ENV=<env>; ` on every box command so the box scopes its universe (I12506).",
         ("infrastructure/lambdas/data-spot-dispatcher/deploy.sh", "NE_ENV", False),
-    ),
-    (
-        "check-live-publish",
-        "data_collection_stack.py check-live publishes its verdict to prod research, which staging cannot "
-        "write, and reads the stack by a fixed name.",
-        ("infrastructure/data_collection_stack.py", 'CHECK_LIVE_BUCKET = "{research}"', True),
-    ),
-    (
-        "deploy-script-env",
-        "deploy-data-collection-stack.sh takes no environment: it passes only DefinitionS3Key and the four "
-        "states and stages the definition into the template's default bucket. Needs it to read this module "
-        "(prod unchanged, proven by the tests).",
-        ("infrastructure/deploy-data-collection-stack.sh", "data_collection_env_params", False),
     ),
     (
         "replay-inputs",
         "S-18 acceptance is a green light run on REPLAYED vendor inputs; the collection workloads have no "
         "replay input mode and would call live vendors.",
-        None,
-    ),
-    (
-        "subset-universe",
-        "staging declares universe scope=subset (registry `universe`); the collection workloads read the "
-        "full roster.",
         None,
     ),
 )
@@ -192,6 +147,31 @@ def _registry_values(e) -> dict[str, str]:  # noqa: ANN001 — nousergon_lib.env
     return {
         "definition_bucket": e.bucket(DEFINITION_BUCKET_ROLE[e.name]),
         "alerts_topic": e.topic("alerts"),
+    }
+
+
+#: The data-spot dispatcher's collection-store prefix inside its store bucket.
+DISPATCHER_STORE_PREFIX = "data_collection"
+
+
+def dispatcher_environment(env_name: str | None = None, *, registry: Path | None = None) -> dict[str, str]:
+    """The data-spot dispatcher's store and run-log bucket for one environment.
+
+    Derived from the registry: the store lives in the one bucket the
+    environment may write (``DEFINITION_BUCKET_ROLE``; prod research, staging
+    its own crucible bucket). Prod's values are the dispatcher's in-code prod
+    defaults (pinned equal by the tests), so prod's deploy sets none of them.
+    The launch values (subnets, security group, key pair, box profile) are
+    account resources the registry does not carry; see ``dispatcher-deploy``.
+    """
+    e = _resolve(env_name, registry)
+    if e.name not in DEFINITION_BUCKET_ROLE:
+        raise KeyError(f"no store bucket role declared for environment {e.name!r}")
+    bucket = e.bucket(DEFINITION_BUCKET_ROLE[e.name])
+    return {
+        "NE_ENV": e.name,
+        "DATA_COLLECTION_STORE": f"s3://{bucket}/{DISPATCHER_STORE_PREFIX}",
+        "DATA_COLLECTION_RUN_LOG_BUCKET": bucket,
     }
 
 

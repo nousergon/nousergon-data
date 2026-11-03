@@ -125,7 +125,13 @@ source "${SCRIPT_DIR}/../_shared/run_handler_tests.sh"
 # through data_gate/descriptors.py, which imports yaml (alpha-engine-config-
 # I10787). Lazy-imported in index.py, so the hermetic guard does not demand a
 # stub — but the tests exercise the real loader, so the gate installs it.
-run_handler_tests "${SCRIPT_DIR}" krepis PyYAML
+# `nousergon-lib` (the requirements.txt pin, alpha-engine-config-I12506):
+# test_stub_registry_names_match_the_real_registry imports the REAL
+# nousergon_lib.env to prove the stub's environment names exist in the packaged
+# registry. Measured — deploy-data-spot-dispatcher failed on main 2026-11-03
+# (run 41594163913) with ModuleNotFoundError: No module named 'nousergon_lib'.
+NOUSERGON_LIB_REQ=$(requirement_pin "${SCRIPT_DIR}/requirements.txt" nousergon-lib)
+run_handler_tests "${SCRIPT_DIR}" krepis PyYAML "${NOUSERGON_LIB_REQ}"
 
 # ----- 0. Scratch dir + validate handler syntax ------------------------------
 
