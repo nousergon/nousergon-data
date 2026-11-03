@@ -215,7 +215,78 @@ def test_cli_table_and_target(mod, capsys, staging):
     assert json.loads(capsys.readouterr().out)["stack"] == staging.stack("data_collection")
 
 
-def test_deploy_path_does_not_read_this_module_yet():
-    """Code only (S-18 slice 1): merging this module changes no deploy. The slice that
-    wires it in deletes the ``deploy-script-env`` gap and this test together."""
-    assert "data_collection_env_params" not in DEPLOY_SCRIPT.read_text(encoding="utf-8")
+# ── S-18 slice 2: the deploy path and check-live read the environment ─────────
+
+
+def _no_gaps(monkeypatch, stack, mod):
+    """Stand-in for the day every staging gap is closed."""
+    monkeypatch.setattr(mod, "RUNTIME_GAPS", ())
+    monkeypatch.setattr(stack, "_env_params", lambda: mod)
+
+
+def test_prod_env_target_is_the_template_and_needs_no_registry(stack, prod, monkeypatch):
+    monkeypatch.delenv("NE_ENV", raising=False)
+    t = stack.env_target()
+    f = stack.deploy_fields()
+    assert t["env"] == "prod" and t["stack"] == prod.stack("data_collection") == f["stack-name"]
+    # check-live publishes where the data gate reads: prod research.
+    assert t["bucket"] == prod.bucket("research") == f["definition-bucket"]
+    # The overrides are exactly the four states the script always passed, nothing more.
+    assert list(t["params"]) == list(stack.STATE_PARAMETERS)
+    assert stack.env_fields()["parameter-overrides"] == " ".join(
+        f"{p}={f['param-' + p]}" for p in stack.STATE_PARAMETERS)
+
+
+def test_staging_is_refused_while_any_gap_is_open(stack, mod, monkeypatch, capsys):
+    assert mod.RUNTIME_GAPS, "every gap closed: replace this test with the first staging deploy's proof"
+    monkeypatch.setenv("NE_ENV", "staging")
+    with pytest.raises(stack.EnvRefused, match="runtime gap"):
+        stack.env_target()
+    assert stack.main(["get", "stack-name"]) == 3
+    assert "refusing" in capsys.readouterr().err
+    assert stack.main(["check-live", "--no-publish"]) == 2
+
+
+def test_staging_target_once_gaps_close_is_its_own_account_stack_and_bucket(stack, mod, staging, monkeypatch):
+    _no_gaps(monkeypatch, stack, mod)
+    t = stack.env_target("staging")
+    assert (t["account"], t["region"], t["stack"]) == (
+        str(staging.account), staging.region, staging.stack("data_collection"))
+    assert t["bucket"] == staging.bucket("crucible")
+    assert {t["params"][p] for p in ("CollectionState", "DailyHealState")} == {"DISABLED"}
+    overrides = stack.env_fields("staging")["parameter-overrides"].split()
+    assert sorted(o.split("=", 1)[0] for o in overrides) == sorted(mod.resolve("staging")["params"])
+
+
+def test_check_live_declares_staging_schedules_disabled(stack, mod, monkeypatch):
+    _no_gaps(monkeypatch, stack, mod)
+    t = stack.env_target("staging")
+    tpl = stack.load_template()
+    f = stack.deploy_fields()
+
+    class _Cfn:
+        def describe_stacks(self, StackName):
+            assert StackName == t["stack"]
+            return {"Stacks": [{"StackStatus": "UPDATE_COMPLETE", "Tags": [
+                {"Key": k, "Value": f[k]} for k in ("template-sha256", "definition-sha256")]}]}
+
+    class _Sched:
+        def __init__(self, state):
+            self.state = state
+
+        def get_schedule(self, GroupName, Name):
+            s = next(x for x in stack.schedules(tpl) if x["name"] == Name)
+            state = self.state if s["state_parameter"] in ("CollectionState", "DailyHealState") \
+                else s["declared_state"]
+            return {"State": state, "ScheduleExpression": s["expression"]}
+
+    assert stack.live_findings(_Cfn(), _Sched("DISABLED"), t) == []
+    enabled = stack.live_findings(_Cfn(), _Sched("ENABLED"), t)
+    assert enabled and all("DISABLED declared for staging" in x for x in enabled)
+
+
+def test_deploy_script_takes_every_value_from_the_helper():
+    text = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+    assert 'NE_ENV="${NE_ENV:-prod}"' in text and "export NE_ENV" in text
+    assert '"${OVERRIDES[@]}"' in text and "field param-" not in text
+    assert "get-caller-identity" in text  # a non-prod deploy refuses the wrong account

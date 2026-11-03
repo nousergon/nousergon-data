@@ -12,12 +12,23 @@ Subcommands::
 
     lint                 static checks, no credentials (exit 1 on any finding)
     get <field>          one deploy argument, printed bare, for the deploy script
+                         (for the environment ``$NE_ENV``; exit 3 when that
+                         environment is refused, see ``env_target``)
     check-live           compare the live stack and schedules to this checkout
                          (boto3; exit 1 on drift, 2 when it cannot measure) and
-                         publish the verdict to s3://alpha-engine-research/
+                         publish the verdict to s3://<env definition bucket>/
                          data_collection/deploy/check-live/latest.json on EVERY
                          run, failures included (exit 3 if only the publish
-                         fails). --no-publish for a local read.
+                         fails). In prod that bucket is alpha-engine-research.
+                         --no-publish for a local read.
+
+ENVIRONMENTS (staging S-18, alpha-engine-config-I12506). ``$NE_ENV`` unset or
+``prod`` is what runs today and reads only the template: the deploy workflow
+installs no nousergon-lib, and tests prove prod resolved through
+``data_collection_env_params`` is these same values. Any other environment is
+resolved through that module from the fleet registry, and is REFUSED while the
+module lists an open runtime gap, so no staging deploy or check-live can run
+on a parameter set known to touch prod.
 
 ``check-live`` exists because "No changes to deploy" is indistinguishable from
 success, and a merged-but-unapplied stack is a known fleet failure: the deploy
@@ -29,7 +40,9 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import importlib.util
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -42,6 +55,7 @@ TEMPLATE = INFRA / "cloudformation" / "nousergon-data-collection.yaml"
 DEFINITION = INFRA / "step-functions" / "data-collection.asl.json"
 DISPATCHER = INFRA / "lambdas" / "data-spot-dispatcher" / "index.py"
 PAUSE_MANIFEST = INFRA / "automation_pause.json"
+ENV_PARAMS = INFRA / "data_collection_env_params.py"
 
 STACK_NAME = "nousergon-data-collection"
 DEFINITION_PREFIX = "infrastructure/nousergon-data-collection/"
@@ -204,6 +218,63 @@ def deploy_fields() -> dict[str, str]:
         "template-sha256": sha256_of(TEMPLATE),
         "definition-sha256": sha256_of(DEFINITION),
         **{f"param-{p}": defaults[p] for p in STATE_PARAMETERS},
+    }
+
+
+class EnvRefused(RuntimeError):
+    """The environment cannot be deployed or checked from this checkout."""
+
+
+def _env_params():  # the data_collection_env_params module
+    spec = importlib.util.spec_from_file_location("data_collection_env_params", ENV_PARAMS)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def env_target(name: str | None = None) -> dict:
+    """Where and with what one environment deploys: ``{env, stack, bucket,
+    account, region, params}``. ``params`` are the overrides the deploy passes
+    besides ``DefinitionS3Key``: the four schedule states in prod (exactly what
+    the script has always passed), every rendered parameter elsewhere.
+    ``account`` and ``region`` are empty for prod (the workflow's own role and
+    region decide them, as before)."""
+    name = name or os.environ.get("NE_ENV") or "prod"
+    if name == "prod":
+        f = deploy_fields()
+        return {"env": "prod", "stack": STACK_NAME, "bucket": f["definition-bucket"], "account": "",
+                "region": "", "params": {p: f[f"param-{p}"] for p in STATE_PARAMETERS}}
+    try:
+        r = _env_params().resolve(name)
+    except (KeyError, ValueError) as exc:
+        raise EnvRefused(f"environment {name!r} does not resolve: {exc}") from exc
+    if r["undeclared"] or r["stale"]:
+        raise EnvRefused(f"{name}: undeclared parameters {r['undeclared']}, stale declarations {r['stale']}")
+    if r["gaps"]:
+        raise EnvRefused(
+            f"{name}: {len(r['gaps'])} runtime gap(s) open ({', '.join(g for g, _ in r['gaps'])}); "
+            f"see `python3 infrastructure/data_collection_env_params.py table --env {name}`"
+        )
+    return {"env": name, "stack": r["target"]["stack"], "bucket": r["params"]["DefinitionS3Bucket"],
+            "account": str(r["target"]["account"]), "region": r["target"]["region"],
+            "params": dict(r["params"])}
+
+
+def env_fields(name: str | None = None) -> dict[str, str]:
+    """``deploy_fields`` for one environment, plus ``account``, ``region`` and
+    ``parameter-overrides`` (space-separated ``Key=Value``, for the deploy)."""
+    t = env_target(name)
+    for k, v in t["params"].items():
+        if not v or any(c.isspace() for c in str(v)):
+            raise EnvRefused(f"{t['env']}: parameter {k}={v!r} is empty or has whitespace")
+    return {
+        **deploy_fields(),
+        "stack-name": t["stack"],
+        "definition-bucket": t["bucket"],
+        "account": t["account"],
+        "region": t["region"],
+        "parameter-overrides": " ".join(f"{k}={v}" for k, v in t["params"].items()),
+        **{f"param-{k}": str(v) for k, v in t["params"].items()},
     }
 
 
@@ -545,13 +616,14 @@ def lint() -> list[str]:
 
 
 # ── live check ───────────────────────────────────────────────────────────────
-def live_findings(cfn, scheduler) -> list[str]:  # noqa: ANN001 — boto3 clients
+def live_findings(cfn, scheduler, target: dict | None = None) -> list[str]:  # noqa: ANN001 — boto3 clients
     fields = deploy_fields()
+    target = target or env_target()
     findings: list[str] = []
-    stacks = cfn.describe_stacks(StackName=STACK_NAME)["Stacks"]
+    stacks = cfn.describe_stacks(StackName=target["stack"])["Stacks"]
     stack = stacks[0]
     if stack["StackStatus"] not in COMPLETE:
-        findings.append(f"stack {STACK_NAME} is {stack['StackStatus']}, not *_COMPLETE")
+        findings.append(f"stack {target['stack']} is {stack['StackStatus']}, not *_COMPLETE")
     tags = {t["Key"]: t["Value"] for t in stack.get("Tags", [])}
     for key in ("template-sha256", "definition-sha256"):
         if tags.get(key) != fields[key]:
@@ -561,10 +633,12 @@ def live_findings(cfn, scheduler) -> list[str]:  # noqa: ANN001 — boto3 client
             )
     for s in schedules(load_template()):
         live = scheduler.get_schedule(GroupName=s["group"], Name=s["name"])
-        if live.get("State") != s["declared_state"]:
+        # The environment's state override wins (staging: every schedule DISABLED).
+        declared = target["params"].get(s["state_parameter"], s["declared_state"])
+        if live.get("State") != declared:
             findings.append(
                 f"schedule {s['qualified_name']} is {live.get('State')} live but "
-                f"{s['declared_state']} in the template"
+                f"{declared} declared for {target['env']}"
             )
         if live.get("ScheduleExpression") != s["expression"]:
             findings.append(
@@ -579,8 +653,10 @@ def live_findings(cfn, scheduler) -> list[str]:  # noqa: ANN001 — boto3 client
 #: The gate reads it relative to its store root `data_collection/`
 #: (`data_gate.evidence.STACK_CHECK_LIVE_KEY`); a test pins the two together.
 #: The writer, github-actions-data-collection-stack-deploy, holds s3:PutObject
-#: on exactly this key (nous-ergon-ops infrastructure/iam/).
-CHECK_LIVE_BUCKET = "alpha-engine-research"
+#: on exactly this key (nous-ergon-ops infrastructure/iam/). The BUCKET is the
+#: environment's definition bucket (``env_target``): prod's research bucket,
+#: which is what the gate reads; staging's own bucket, since staging may write
+#: nothing in prod. tests/test_data_collection_env_params.py pins prod's.
 CHECK_LIVE_KEY = "data_collection/deploy/check-live/latest.json"
 CHECK_LIVE_SCHEMA = "data_collection_check_live.v1"
 
@@ -600,7 +676,8 @@ def _code_sha() -> str:
         return "unknown (git rev-parse failed)"
 
 
-def check_live_verdict(findings: list[str], *, error: str | None, now=None) -> dict:  # noqa: ANN001
+def check_live_verdict(findings: list[str], *, error: str | None, now=None,  # noqa: ANN001
+                       stack: str = STACK_NAME) -> dict:
     """The published verdict. A run that could not measure is ``measured: false``
     and ``in_sync: false`` — never silent, never in sync."""
     import datetime as dt
@@ -610,7 +687,7 @@ def check_live_verdict(findings: list[str], *, error: str | None, now=None) -> d
         "schema_version": CHECK_LIVE_SCHEMA,
         "as_of": moment.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "code_sha": _code_sha(),
-        "stack": STACK_NAME,
+        "stack": stack,
         "measured": error is None,
         "in_sync": error is None and not findings,
         "drift": list(findings),
@@ -618,9 +695,9 @@ def check_live_verdict(findings: list[str], *, error: str | None, now=None) -> d
     }
 
 
-def publish_verdict(s3, verdict: dict) -> None:  # noqa: ANN001 — boto3 client
+def publish_verdict(s3, verdict: dict, bucket: str) -> None:  # noqa: ANN001 — boto3 client
     s3.put_object(
-        Bucket=CHECK_LIVE_BUCKET,
+        Bucket=bucket,
         Key=CHECK_LIVE_KEY,
         Body=json.dumps(verdict, indent=2).encode("utf-8"),
         ContentType="application/json",
@@ -639,7 +716,11 @@ def main(argv: list[str]) -> int:
         print(f"data-collection lint: {len(problems)} finding(s)")
         return 1 if problems else 0
     if cmd == "get" and len(argv) == 2:
-        fields = deploy_fields()
+        try:
+            fields = env_fields()
+        except EnvRefused as exc:
+            print(f"refusing: {exc}", file=sys.stderr)
+            return 3
         if argv[1] not in fields:
             print(f"unknown field {argv[1]!r}; one of {sorted(fields)}", file=sys.stderr)
             return 2
@@ -649,11 +730,17 @@ def main(argv: list[str]) -> int:
         import boto3
 
         publish = "--no-publish" not in argv[1:]
+        try:
+            target = env_target()
+        except EnvRefused as exc:
+            print(f"::error::check-live refused, nothing measured or published: {exc}")
+            return 2
+        bucket = target["bucket"]
         findings: list[str] = []
         error: str | None = None
         try:
             findings = live_findings(
-                boto3.client("cloudformation"), boto3.client("scheduler")
+                boto3.client("cloudformation"), boto3.client("scheduler"), target
             )
         except Exception as exc:  # noqa: BLE001 — published as measured:false, exit 2
             error = f"{type(exc).__name__}: {exc}"
@@ -664,16 +751,16 @@ def main(argv: list[str]) -> int:
         rc = 2 if error else (1 if findings else 0)
         if not publish:
             return rc
-        verdict = check_live_verdict(findings, error=error)
+        verdict = check_live_verdict(findings, error=error, stack=target["stack"])
         try:
-            publish_verdict(boto3.client("s3"), verdict)
+            publish_verdict(boto3.client("s3"), verdict, bucket)
         except Exception as exc:  # noqa: BLE001 — fail loud: an unpublished verdict is exit 3
             print(
                 f"::error::check-live could not publish its verdict to "
-                f"s3://{CHECK_LIVE_BUCKET}/{CHECK_LIVE_KEY}: {type(exc).__name__}: {exc}"
+                f"s3://{bucket}/{CHECK_LIVE_KEY}: {type(exc).__name__}: {exc}"
             )
             return rc or 3
-        print(f"data-collection check-live: verdict published to s3://{CHECK_LIVE_BUCKET}/{CHECK_LIVE_KEY}")
+        print(f"data-collection check-live: verdict published to s3://{bucket}/{CHECK_LIVE_KEY}")
         return rc
     print(__doc__)
     return 2
