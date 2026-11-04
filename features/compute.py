@@ -1425,6 +1425,44 @@ class AlternativeLoad(dict):
     """
 
     short: bool = False
+    #: Features in :data:`UNPUBLISHED_FIELD_GRACE` whose producer field NO
+    #: loaded payload carries (alpha-engine-config-I13143): the partition
+    #: predates the producer, so the column cannot vary yet.
+    unpublished: frozenset = frozenset()
+
+
+#: alpha-engine-config-I13143 — RED LINE 3 (narrows what the dead-column
+#: postflight grades; Brian merges). ``days_since_earnings`` reads
+#: ``eps_revision.days_since_earnings``, which no producer wrote until
+#: nousergon-data#2408 (merged 2026-11-03). That producer runs only in the
+#: weekly DataPhase2, so every daily D31/D50 between the merge and the next
+#: Saturday reads a partition whose payloads have NO such key, every ticker
+#: takes the 90-day default, and the postflight correctly fails a column that
+#: no daily-path input can fill. The grace is keyed on the field's ABSENCE from
+#: every payload, never on its values: a partition written after #2408 carries
+#: the key on every eps_revision block (``None`` when yfinance had no date), so
+#: the column is graded again from the first daily run that reads one, and a
+#: producer that ran and wrote only ``None`` still fails the guard.
+#: ``{feature: (payload block, payload key)}``.
+UNPUBLISHED_FIELD_GRACE: dict[str, tuple[str, str]] = {
+    "days_since_earnings": ("eps_revision", "days_since_earnings"),
+}
+#: Absolute backstop on the grace (the trading day being computed, never the
+#: wall clock, so a D50 regrade grades its day exactly as D31 did). The
+#: Saturday 2026-11-07 DataPhase2 is the first partition carrying the key;
+#: past this day an absent key is a producer failure and is graded as one.
+UNPUBLISHED_FIELD_GRACE_LAST_DAY = "2026-11-09"
+
+
+def _unpublished_fields(payloads: list[dict]) -> frozenset:
+    """The :data:`UNPUBLISHED_FIELD_GRACE` features whose key no payload carries."""
+    if not payloads:
+        return frozenset()
+    return frozenset(
+        feature
+        for feature, (block, key) in UNPUBLISHED_FIELD_GRACE.items()
+        if not any(key in (p.get(block) or {}) for p in payloads)
+    )
 
 
 def _alt_entry_from_payload(ticker_data: dict) -> dict:
@@ -1527,13 +1565,17 @@ def _load_cached_alternative(s3, bucket: str) -> AlternativeLoad:
 
         alt_data = AlternativeLoad()
         unreadable: list[str] = []
+        payloads: list[dict] = []
         for key in keys:
             ticker = key.split("/")[-1].replace(".json", "")
             try:
                 obj = s3.get_object(Bucket=bucket, Key=key)
-                alt_data[ticker] = _alt_entry_from_payload(json.loads(obj["Body"].read()))
+                payload = json.loads(obj["Body"].read())
+                alt_data[ticker] = _alt_entry_from_payload(payload)
+                payloads.append(payload)
             except Exception as exc:  # noqa: BLE001 — recorded, then reported below
                 unreadable.append(f"{ticker}: {type(exc).__name__}")
+        alt_data.unpublished = _unpublished_fields(payloads)
 
         if unreadable:
             alt_data.short = True
@@ -1659,6 +1701,8 @@ class FeatureBuild:
     alt_data_missing: tuple[str, ...] = ()
     #: The alternative load itself came up short (``AlternativeLoad.short``).
     alt_load_short: bool = False
+    #: ``AlternativeLoad.unpublished`` (alpha-engine-config-I13143).
+    alt_unpublished: tuple[str, ...] = ()
 
 
 def build_feature_frame(
@@ -1966,27 +2010,48 @@ def build_feature_frame(
         t_compute=t_compute,
         alt_data_missing=tuple(sorted(alt_missing)),
         alt_load_short=bool(getattr(alt_data, "short", False)),
+        alt_unpublished=tuple(sorted(getattr(alt_data, "unpublished", ()))),
     )
 
 
 
-def dead_column_scope() -> tuple[list[str], frozenset[str]]:
+def unpublished_ungraded(build: "FeatureBuild", date_str: str) -> frozenset[str]:
+    """Columns the postflight skips for ``date_str`` because no input can fill them yet.
+
+    Only :data:`UNPUBLISHED_FIELD_GRACE` features whose producer key was absent
+    from EVERY loaded payload, and only through
+    :data:`UNPUBLISHED_FIELD_GRACE_LAST_DAY` (alpha-engine-config-I13143).
+    """
+    if str(date_str) > UNPUBLISHED_FIELD_GRACE_LAST_DAY:
+        return frozenset()
+    return frozenset(getattr(build, "alt_unpublished", ())) & frozenset(UNPUBLISHED_FIELD_GRACE)
+
+
+def dead_column_scope(
+    ungraded: frozenset[str] = frozenset(),
+) -> tuple[list[str], frozenset[str]]:
     """The columns the dead-column postflight grades, and the ones it exempts.
 
     Macro-group columns broadcast one value to the whole universe by
     construction, so they are not graded. ``ALL_NULL_EXPECTED``
     (``vwap_divergence_pct``) is all-NaN on the latest row of every daily run by
-    design and joins the exempt set. One definition, shared by
-    :func:`compute_and_write` and the D50 settled regrade
-    (`features.settled_regrade`), so the two can never grade different columns.
+    design and joins the exempt set. ``ungraded`` is
+    :func:`unpublished_ungraded`'s set for the run, removed from the graded
+    columns. One definition, shared by :func:`compute_and_write` and the D50
+    settled regrade (`features.settled_regrade`), so the two can never grade
+    different columns.
     """
-    non_macro = [f for f in FEATURES if f not in GROUPS.get("macro", ())]
+    non_macro = [
+        f for f in FEATURES if f not in GROUPS.get("macro", ()) and f not in ungraded
+    ]
     return non_macro, frozenset(ZERO_VARIANCE_EXEMPT | ALL_NULL_EXPECTED)
 
 
-def assert_snapshot_columns_live(features_df: pd.DataFrame) -> None:
+def assert_snapshot_columns_live(
+    features_df: pd.DataFrame, ungraded: frozenset[str] = frozenset(),
+) -> None:
     """The ``zero_variance_fatal=True`` postflight: raise before anything is written."""
-    columns, exempt = dead_column_scope()
+    columns, exempt = dead_column_scope(ungraded)
     assert_no_dead_feature_columns(features_df, columns, exempt=exempt)
 
 
@@ -2096,7 +2161,15 @@ def compute_and_write(
     # excluded — they broadcast one value to the whole universe on a date BY
     # CONSTRUCTION (e.g. the VIX level), so zero cross-sectional variance
     # there is the expected shape, not a defect.
-    _non_macro_features, _dead_column_exempt = dead_column_scope()
+    _ungraded = unpublished_ungraded(build, date_str)
+    if _ungraded:
+        log.warning(
+            "Dead-column postflight NOT grading %s for %s: the alternative "
+            "partition read carries no producer key for it, so no daily input "
+            "can fill it (alpha-engine-config-I13143; grace ends %s)",
+            sorted(_ungraded), date_str, UNPUBLISHED_FIELD_GRACE_LAST_DAY,
+        )
+    _non_macro_features, _dead_column_exempt = dead_column_scope(_ungraded)
     # alpha-engine-config-I7572: ALL_NULL_EXPECTED (vwap_divergence_pct) is
     # all-NaN on the latest row EVERY daily run by pipeline design (see
     # postflight.ALL_NULL_EXPECTED) — union it into the exempt set so the
@@ -2229,6 +2302,9 @@ def compute_and_write(
         # alpha-engine-config-I13103: tickers written with NO alternative
         # payload — their alternative columns are NaN in the snapshot.
         "alt_data_missing": alt_data_missing,
+        # alpha-engine-config-I13143: columns the postflight did not grade this
+        # run because their producer field is absent from every payload.
+        "dead_column_ungraded": sorted(_ungraded),
         "date": date_str,
         "tickers_computed": n_ok,
         "tickers_skipped": n_skip,
