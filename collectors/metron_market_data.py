@@ -193,7 +193,9 @@ INTRADAY_PREFIX = "market_data/intraday/"
 # (Nasdaq-100) are both carried because the broad Composite and the mega-cap-100 routinely
 # diverge intraday — the headline "Nasdaq" most readers see is the Composite. Quotes land
 # under the artifact's `indices` key (same per-symbol shape as held `quotes`).
-INDEX_PROXY_SYMBOLS = ["SPY", "ONEQ", "QQQ", "IWM"]
+# DIA (Dow Jones Industrial Average) added 2026-11-04 (Brian): the Holdings stats strip tracks
+# the Dow, S&P 500, Nasdaq Composite, Nasdaq 100 and Russell 2000.
+INDEX_PROXY_SYMBOLS = ["DIA", "SPY", "ONEQ", "QQQ", "IWM"]
 # Technical ratings — the intraday sibling of TECHNICALS_PREFIX's per-symbol `rating`
 # object (metron-ops#293). Computed inside collect_intraday from the SAME fetch that
 # produces `quotes` (no new vendor call): today's `last` is appended/replaces a
@@ -3000,6 +3002,18 @@ def _sp_window_return(series: list[tuple[date, float]], start: date) -> float | 
     return round(last / ref - 1.0, 6)
 
 
+def _sp_since_prior_close(series: list[tuple[date, float]], start: date) -> float | None:
+    """Return from the last close BEFORE ``start`` to the latest close, so a month-to-date
+    figure includes the month's first session. None when no close precedes ``start``."""
+    if len(series) < 2:
+        return None
+    ref = next((c for d, c in reversed(series) if d < start), None)
+    last = series[-1][1]
+    if ref is None or ref <= 0:
+        return None
+    return round(last / ref - 1.0, 6)
+
+
 def _sp_year_ago(as_of: date) -> date:
     try:
         return as_of.replace(year=as_of.year - 1)
@@ -3050,6 +3064,7 @@ def _compute_security_performance(
     period_returns = _sp_period_returns(series, as_of)
     out: dict = {
         "period_returns": period_returns,
+        "mtd_pct": _sp_since_prior_close(series, date(as_of.year, as_of.month, 1)),
         "ytd_pct": _sp_window_return(series, date(as_of.year, 1, 1)),
         "ltm_pct": _sp_window_return(series, _sp_year_ago(as_of)),
         "n_bars": len(series),
@@ -3093,12 +3108,12 @@ def collect_security_performance(
     strip), computed from ``close_history`` artifacts already on the spine — **no new fetch**:
 
         market_data/security_performance/latest.json
-            {schema_version, as_of, performance: {yf_symbol: {period_returns, ytd_pct,
+            {schema_version, as_of, performance: {yf_symbol: {period_returns, mtd_pct, ytd_pct,
              ltm_pct, volatility, sharpe, sortino, max_drawdown, beta_vs_spy,
              vs_spy_1y, vs_spy_window, n_bars, history_from}}}
 
-    Daily cadence; runs after ``collect_history``. Universe = SP1500 ∪ Metron held/watchlist.
-    Fail-soft per symbol."""
+    Daily cadence; runs after ``collect_history``. Universe = SP1500 ∪ Metron held/watchlist
+    ∪ the index ETF proxies. Fail-soft per symbol."""
     if run_date is None:
         from dates import default_run_date
 
@@ -3109,7 +3124,9 @@ def collect_security_performance(
     holdings, _ = load_price_derived_universe(bucket, s3_client)
     if not holdings:
         return {"status": "skipped", "reason": "empty price-derived universe", "universe": 0}
-    yf_symbols = sorted({h["yf_symbol"] for h in holdings})
+    # + the index ETF proxies, so the markets strip gets Day/MTD/YTD/LTM for every index
+    # (they are not in SP1500 and are rarely held, so the universe alone missed them).
+    yf_symbols = sorted({h["yf_symbol"] for h in holdings} | set(INDEX_PROXY_SYMBOLS))
     as_of = date.fromisoformat(str(run_date)[:10])
     spy_hist = _read_json(s3_client, bucket, f"{CLOSE_HISTORY_PREFIX}{BENCHMARK}.json")
     spy_closes = (spy_hist or {}).get("closes")
