@@ -30,14 +30,25 @@
 #   requirements  a pip requirements file or pyproject: its pyarrow spec must
 #                 equal the venv's exactly; a numpy spec in it must not admit
 #                 NumPy 1.x while the venv's pyarrow admits >= 26.
-#   lock          a compiled lock: its `pyarrow==X` must satisfy the venv's spec.
-#   bootstrap     a script that builds the venv: a `pip install ... numpy<2`
-#                 in it must match the venv's `numpy_below_2`, both ways.
+#   lock          a compiled lock (pip-compile `pyarrow==X`, or a uv.lock
+#                 package table): its pyarrow pin must satisfy the venv's spec.
+#   bootstrap     a script or workflow that builds the venv: a `pip install
+#                 ... numpy<2` in it must match the venv's `numpy_below_2`,
+#                 both ways, and a pyarrow spec it pip-installs inline must
+#                 equal the venv's.
 #   dependabot    .github/dependabot.yml: its pyarrow `ignore` versions must
 #                 equal `pyarrow_ignore`; with `group`, pyarrow and numpy must
 #                 sit in that dedicated group so a held bump holds nothing else.
 #
 # `repo` omitted means this repository.
+#
+# Other repos check THEIR registered surfaces on their own pull requests with
+#   python3 scripts/check_pyarrow_numpy_constraint.py --repo <repo> --root <checkout>
+# (a `pyarrow-numpy-constraint` workflow in that repo), which also fails on any
+# file there that declares or pip-installs the pair without being registered
+# here. So a Dependabot pyarrow bump in that repo goes red on its own PR. Change
+# the TOML here FIRST, then the surface: the surface's PR reads this file from
+# nousergon-data main.
 
 schema = 1
 
@@ -166,6 +177,12 @@ repo = "alpha-engine-config"
 path = "infrastructure/canary_replay_spot_bootstrap.sh"
 kind = "bootstrap"
 
+[[venvs.research.surfaces]]
+repo = "crucible-research"
+path = ".github/dependabot.yml"
+kind = "dependabot"
+pyarrow_ignore = []
+
 # ---------------------------------------------------------------------------
 [venvs.crucible]
 about = "The crucible harness (pyproject + uv.lock). pyarrow >=26 is held by Dependabot ignore under Brian's ruling #25 (2026-10-14) until alpha-engine-config-I12318 lifts it; the ignore is declared here so it cannot drift from the data venv unseen."
@@ -182,3 +199,104 @@ repo = "crucible"
 path = ".github/dependabot.yml"
 kind = "dependabot"
 pyarrow_ignore = [">=26"]
+
+[[venvs.crucible.surfaces]]
+repo = "crucible"
+path = "uv.lock"
+kind = "lock"
+
+# crucible-trader installs crucible from git and resolves pyarrow through it, so
+# its lock sits in crucible's venv. Its Dependabot carries no pyarrow ignore:
+# pyarrow is not a direct dependency there.
+[[venvs.crucible.surfaces]]
+repo = "crucible-trader"
+path = "uv.lock"
+kind = "lock"
+
+[[venvs.crucible.surfaces]]
+repo = "crucible-trader"
+path = ".github/dependabot.yml"
+kind = "dependabot"
+pyarrow_ignore = []
+
+# ---------------------------------------------------------------------------
+[venvs.predictor]
+about = "crucible-predictor: the training/inference venv (requirements.txt) and the predictor Lambda image (requirements-lambda.txt)."
+pyarrow = ">=25.0.1"
+numpy_below_2 = false
+
+[[venvs.predictor.surfaces]]
+repo = "crucible-predictor"
+path = "requirements.txt"
+kind = "requirements"
+
+[[venvs.predictor.surfaces]]
+repo = "crucible-predictor"
+path = "requirements-lambda.txt"
+kind = "requirements"
+
+[[venvs.predictor.surfaces]]
+repo = "crucible-predictor"
+path = ".github/dependabot.yml"
+kind = "dependabot"
+pyarrow_ignore = []
+
+# ---------------------------------------------------------------------------
+[venvs.backtester]
+about = "crucible-backtester: the backtest spot box venv, built by infrastructure/spot_backtest.sh from requirements.txt."
+pyarrow = "~=25.0"
+numpy_below_2 = false
+
+[[venvs.backtester.surfaces]]
+repo = "crucible-backtester"
+path = "requirements.txt"
+kind = "requirements"
+
+[[venvs.backtester.surfaces]]
+repo = "crucible-backtester"
+path = "infrastructure/spot_backtest.sh"
+kind = "bootstrap"
+
+[[venvs.backtester.surfaces]]
+repo = "crucible-backtester"
+path = ".github/dependabot.yml"
+kind = "dependabot"
+pyarrow_ignore = []
+
+# ---------------------------------------------------------------------------
+[venvs.executor]
+about = "crucible-executor: the executor's deployed venv, pip-compiled from requirements.in. Its pyproject.toml (pyarrow>=25.0.1, numpy<3) is not registered yet: it disagrees with requirements.in and is tracked on alpha-engine-config-I13002."
+pyarrow = "~=25.0"
+numpy_below_2 = false
+
+[[venvs.executor.surfaces]]
+repo = "crucible-executor"
+path = "requirements.in"
+kind = "requirements"
+
+[[venvs.executor.surfaces]]
+repo = "crucible-executor"
+path = "requirements.txt"
+kind = "lock"
+
+# ---------------------------------------------------------------------------
+[venvs.aec-ci-tools]
+about = "alpha-engine-config GitHub runner jobs that pip-install pyarrow inline for spend reports (system Python on the runner, NumPy 2 resolved)."
+pyarrow = ">=17"
+numpy_below_2 = false
+
+[[venvs.aec-ci-tools.surfaces]]
+repo = "alpha-engine-config"
+path = ".github/workflows/aws-spend-monitor.yml"
+kind = "bootstrap"
+
+[[venvs.aec-ci-tools.surfaces]]
+repo = "alpha-engine-config"
+path = ".github/workflows/monthly-budget-review.yml"
+kind = "bootstrap"
+
+[[venvs.aec-ci-tools.surfaces]]
+repo = "alpha-engine-config"
+path = ".github/dependabot.yml"
+kind = "dependabot"
+pyarrow_ignore = []

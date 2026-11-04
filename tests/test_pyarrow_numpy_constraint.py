@@ -17,8 +17,10 @@ What these tests hold, on every PR to this repo:
 - the checker actually fails on each shape that broke the fleet.
 
 The other repos' registered surfaces are checked by
-``python3 scripts/check_pyarrow_numpy_constraint.py --remote``; that needs the
-network, so it is not part of this gate.
+``python3 scripts/check_pyarrow_numpy_constraint.py --remote`` (daily, from
+alpha-engine-config) and, on each of those repos' own pull requests, by
+``--repo <repo> --root <checkout>``. Both read other repos, so neither runs
+here; the ``--repo`` mode itself is tested below against a temporary checkout.
 """
 
 from __future__ import annotations
@@ -65,11 +67,14 @@ def test_declaration_never_pairs_numpy_below_2_with_pyarrow_26():
         assert c.check_venv_rule(venv, threshold) == []
 
 
-def test_every_registered_venv_has_a_requirements_surface_and_known_kinds():
+def test_every_registered_venv_has_a_spec_carrying_surface_and_known_kinds():
+    # A venv's pyarrow spec is carried by a requirements file, or (for a runner
+    # job with no requirements file) inline by the bootstrap that installs it,
+    # which the checker now compares to the declaration too.
     _, venvs, surfaces = c.load()
     for name in venvs:
         kinds = {s.kind for s in surfaces if s.venv == name}
-        assert "requirements" in kinds, f"venv {name} has no requirements surface"
+        assert kinds & {"requirements", "bootstrap"}, f"venv {name} has no spec-carrying surface"
     assert {s.kind for s in surfaces} <= set(c.KINDS)
     assert {s.venv for s in surfaces} <= set(venvs)
 
@@ -157,3 +162,78 @@ def test_dependabot_pair_group_must_come_first():
         "26",
     )
     assert any("FIRST group" in f for f in out), out
+
+
+# --- uv.lock, inline bootstrap specs, and the --repo mode (other repos' PRs) --
+
+_UV_LOCK = (
+    'version = 1\n\n[[package]]\nname = "numpy"\nversion = "2.5.4"\n\n'
+    '[[package]]\nname = "pyarrow"\nversion = "{v}"\nsource = {{ registry = "https://pypi.org/simple" }}\n'
+)
+
+
+def test_uv_lock_pin_is_read_and_a_bump_past_the_cap_is_refused():
+    assert c.lock_pins("uv.lock", _UV_LOCK.format(v="25.0.1")) == ["25.0.1"]
+    ok = c.check_surface(_surface("lock", "uv.lock"), _UV_LOCK.format(v="25.0.1"), _venv("~=25.0"), "26")
+    assert ok == [], ok
+    out = c.check_surface(_surface("lock", "uv.lock"), _UV_LOCK.format(v="26.0.0"), _venv("~=25.0"), "26")
+    assert any("outside the declared" in f for f in out), out
+
+
+def test_inline_pyarrow_spec_in_a_bootstrap_must_match():
+    line = "          python3 -m pip install -q 'boto3>=1.39' pyyaml 'pyarrow>=17'\n"
+    assert c.check_surface(_surface("bootstrap", "w.yml"), line, _venv(">=17"), "26") == []
+    out = c.check_surface(_surface("bootstrap", "w.yml"), line.replace(">=17", ">=26"), _venv(">=17"), "26")
+    assert any("inline" in f and "disagrees" in f for f in out), out
+    assert c.inline_pyarrow_specs("pip install -r requirements.txt pyarrow-stubs\n") == []
+
+
+def _other_repo(tmp_path: Path, files: dict[str, str]) -> Path:
+    for rel, text in files.items():
+        p = tmp_path / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text)
+    return tmp_path
+
+
+def _toml(tmp_path: Path) -> Path:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    t = tmp_path / "decl.toml"
+    t.write_text(
+        'schema = 1\n[rule]\npyarrow_needs_numpy2_from = "26"\n'
+        '[venvs.x]\npyarrow = "~=25.0"\nnumpy_below_2 = false\n'
+        '[[venvs.x.surfaces]]\nrepo = "other"\npath = "requirements.txt"\nkind = "requirements"\n'
+    )
+    return t
+
+
+def test_repo_mode_refuses_a_dependabot_bump_on_the_other_repos_pr(tmp_path):
+    decl = _toml(tmp_path / "d")
+    root = _other_repo(tmp_path / "r", {"requirements.txt": "pyarrow~=25.0\nnumpy>=2\n"})
+    assert c.run(remote=False, constraint_file=decl, only_repo="other", root=root) == []
+    (root / "requirements.txt").write_text("pyarrow~=26.0\nnumpy>=2\n")  # the bump
+    out = c.run(remote=False, constraint_file=decl, only_repo="other", root=root)
+    assert any("disagrees with the declared" in f for f in out), out
+
+
+def test_repo_mode_reports_unregistered_surfaces_in_the_other_repo(tmp_path):
+    decl = _toml(tmp_path / "d")
+    root = _other_repo(
+        tmp_path / "r",
+        {
+            "requirements.txt": "pyarrow~=25.0\n",
+            "lambda/requirements-x.txt": "pyarrow>=14\n",
+            "uv.lock": _UV_LOCK.format(v="25.0.1"),
+            ".github/dependabot.yml": "version: 2\nupdates:\n  - package-ecosystem: pip\n    directory: /\n",
+            "requirements-numpy-only.txt": "numpy>=2.5\n",
+            "requirements-numpy-1.txt": "numpy<2\n",
+        },
+    )
+    got = set(c.unregistered_local_surfaces(decl, repo="other", root=root))
+    assert got == {
+        "lambda/requirements-x.txt",
+        "uv.lock",
+        ".github/dependabot.yml",
+        "requirements-numpy-1.txt",
+    }, got
+
