@@ -261,6 +261,12 @@ GH_PAT_SSM = os.environ.get(
 GH_CREDENTIAL = _per_env("DATA_SPOT_GH_CREDENTIAL", "pat")
 if GH_CREDENTIAL not in ("pat", "app"):
     raise RuntimeError(f"DATA_SPOT_GH_CREDENTIAL={GH_CREDENTIAL!r} is not 'pat' or 'app'")
+#: The SSM prefix holding the App's id, installation id and key (`app` only).
+#: The fleet's own is /alpha-engine/groom/; staging's registry declares no
+#: /alpha-engine/ prefix, so its deploy sets /nous-ergon/github_app/.
+GH_APP_SSM_PREFIX = os.environ.get("DATA_SPOT_GH_APP_SSM_PREFIX", "/alpha-engine/groom/")
+if not re.fullmatch(r"(/[a-z0-9_-]+)+/", GH_APP_SSM_PREFIX):
+    raise RuntimeError(f"DATA_SPOT_GH_APP_SSM_PREFIX={GH_APP_SSM_PREFIX!r} is not an SSM path prefix")
 # Hard ceiling for the on-box SSM command (matches the bootstrap watchdog). Sized
 # above the observed ~50 min enrich + ~38 min append tail with headroom.
 MAX_RUNTIME_SECONDS = int(os.environ.get("DATA_SPOT_MAX_RUNTIME_SECONDS", "7200"))
@@ -1589,8 +1595,8 @@ git clone --depth 1 --branch {CONFIG_BRANCH} \\
     app_clone = "" if GH_CREDENTIAL != "app" else f"""# alpha-engine-config is PRIVATE. An App installation token is minted HERE,
 # on the box, from its own instance role, narrowed to contents:read on that
 # one repository (alpha-engine-config-I13187) — never known to this Lambda.
-GH_TOKEN=$(python -c 'import sys; from nousergon_lib.github_app import installation_token; print(installation_token(region=sys.argv[1], permissions={{"contents": "read"}}, repositories=[sys.argv[2]]))' \\
-  {REGION} {CONFIG_REPO.rsplit("/", 1)[-1]}) || fail "App token mint failed"
+GH_TOKEN=$(python -c 'import sys; from nousergon_lib.github_app import installation_token; print(installation_token(ssm_prefix=sys.argv[3], region=sys.argv[1], permissions={{"contents": "read"}}, repositories=[sys.argv[2]]))' \\
+  {REGION} {CONFIG_REPO.rsplit("/", 1)[-1]} {GH_APP_SSM_PREFIX}) || fail "App token mint failed"
 [ -n "$GH_TOKEN" ] || fail "App token empty"
 rm -rf /home/ec2-user/alpha-engine-config
 git clone --depth 1 --branch {CONFIG_BRANCH} \\

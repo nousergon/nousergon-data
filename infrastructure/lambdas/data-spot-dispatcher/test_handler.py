@@ -2021,7 +2021,8 @@ def test_staging_box_mints_a_narrowed_app_token_after_the_venv(monkeypatch):
     assert "PAT=" not in script and "github_pat" not in script
     mint = next(ln for ln in script.splitlines() if "installation_token(" in ln)
     assert 'permissions={"contents": "read"}' in mint and "repositories=[sys.argv[2]]" in mint
-    assert f"{index.REGION} alpha-engine-config) || fail" in script
+    assert f"{index.REGION} alpha-engine-config /alpha-engine/groom/) || fail" in script
+    assert "ssm_prefix=sys.argv[3]" in mint
     # The mint needs nousergon_lib, which only the venv carries; the clone
     # still lands before anything reads the checkout (the DLP preflight).
     assert script.index("deps install failed") < script.index("installation_token(")
@@ -2034,3 +2035,13 @@ def test_an_unknown_credential_mode_refuses_at_import(monkeypatch):
     _clear_per_env(monkeypatch)
     with pytest.raises(RuntimeError, match="DATA_SPOT_GH_CREDENTIAL"):
         _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x", env={**_STAGING_ENV, "DATA_SPOT_GH_CREDENTIAL": "ssh"})
+
+
+def test_staging_reads_the_app_from_its_own_registry_prefix(monkeypatch):
+    _clear_per_env(monkeypatch)
+    env = {**_STAGING_ENV, "DATA_SPOT_GH_APP_SSM_PREFIX": "/nous-ergon/github_app/"}
+    index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x", env=env)
+    script = index._bootstrap_command("shadow-weekday", "true", "tok", instance_id="i-x", trading_day="2026-09-14")
+    assert f"{index.REGION} alpha-engine-config /nous-ergon/github_app/) || fail" in script
+    with pytest.raises(RuntimeError, match="DATA_SPOT_GH_APP_SSM_PREFIX"):
+        _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x", env={**env, "DATA_SPOT_GH_APP_SSM_PREFIX": "x; id"})

@@ -159,7 +159,7 @@ v.update(m.dispatcher_environment("staging"))
 assert v["NE_ENV"] == "staging", v
 v.update({"DATA_SPOT_SUBNETS": "${STAGING_SUBNETS}", "DATA_SPOT_SECURITY_GROUP": "${STAGING_SG}",
           "DATA_SPOT_KEY_NAME": "${STAGING_KEY_NAME}", "DATA_SPOT_IAM_PROFILE": "${STAGING_PROFILE}",
-          "DATA_SPOT_GH_CREDENTIAL": "app"})
+          "DATA_SPOT_GH_CREDENTIAL": "app", "DATA_SPOT_GH_APP_SSM_PREFIX": "/nous-ergon/github_app/"})
 print(json.dumps({"Variables": v}, sort_keys=True))
 PY
 )
