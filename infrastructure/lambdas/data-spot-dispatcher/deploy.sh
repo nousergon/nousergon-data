@@ -88,7 +88,9 @@ FN_ENV="${PROD_ENV}"
 # the four launch values the dispatcher has no default for outside prod
 # (index.py::_per_env): subnets (the default-for-az subnets) and the security
 # group id (by name) are resolved here with the two Describe calls the staging
-# deploy role holds; the key pair and instance profile are names.
+# deploy role holds; the key pair and instance profile are names. The box
+# clones alpha-engine-config with an App token it mints itself
+# (DATA_SPOT_GH_CREDENTIAL=app, option (a)): staging has no fleet PAT.
 DEPLOY_ENV="${NE_ENV:-prod}"
 STAGING_SG_NAME="alpha-engine-data-spot"
 STAGING_KEY_NAME="alpha-engine-data-spot"
@@ -156,7 +158,8 @@ v = {"LOG_LEVEL": "INFO", "DATA_SPOT_DISPATCH_ENABLED": "true"}
 v.update(m.dispatcher_environment("staging"))
 assert v["NE_ENV"] == "staging", v
 v.update({"DATA_SPOT_SUBNETS": "${STAGING_SUBNETS}", "DATA_SPOT_SECURITY_GROUP": "${STAGING_SG}",
-          "DATA_SPOT_KEY_NAME": "${STAGING_KEY_NAME}", "DATA_SPOT_IAM_PROFILE": "${STAGING_PROFILE}"})
+          "DATA_SPOT_KEY_NAME": "${STAGING_KEY_NAME}", "DATA_SPOT_IAM_PROFILE": "${STAGING_PROFILE}",
+          "DATA_SPOT_GH_CREDENTIAL": "app"})
 print(json.dumps({"Variables": v}, sort_keys=True))
 PY
 )

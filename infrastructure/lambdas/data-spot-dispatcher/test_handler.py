@@ -1858,6 +1858,7 @@ _PER_ENV_VARS = (
     "DATA_SPOT_SECURITY_GROUP",
     "DATA_SPOT_KEY_NAME",
     "DATA_SPOT_IAM_PROFILE",
+    "DATA_SPOT_GH_CREDENTIAL",
 )
 _STAGING_ENV = {
     "NE_ENV": "staging",
@@ -1867,6 +1868,7 @@ _STAGING_ENV = {
     "DATA_SPOT_SECURITY_GROUP": "sg-staging",
     "DATA_SPOT_KEY_NAME": "staging-key",
     "DATA_SPOT_IAM_PROFILE": "staging-profile",
+    "DATA_SPOT_GH_CREDENTIAL": "app",
 }
 
 
@@ -1998,3 +2000,37 @@ def test_stub_registry_names_match_the_real_registry():
     real = importlib.import_module("nousergon_lib.env")
     assert getattr(real, "__file__", None), "nousergon_lib.env is a stub here, not the real module"
     assert set(_REGISTRY_ENV_NAMES) <= set(real.environment_names())
+
+
+# ── alpha-engine-config-I13187 option (a): the staging box's config credential ─
+def test_prod_box_still_clones_with_the_fleet_pat(monkeypatch):
+    _clear_per_env(monkeypatch)
+    index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
+    assert index.GH_CREDENTIAL == "pat"
+    script = index._bootstrap_command("shadow-weekday", "true", "tok", instance_id="i-x", trading_day="2026-09-14")
+    assert "aws ssm get-parameter --name /alpha-engine/saturday_sf_watch/github_pat" in script
+    assert "installation_token" not in script
+    assert script.index("config clone failed") < script.index("deps install failed")
+
+
+def test_staging_box_mints_a_narrowed_app_token_after_the_venv(monkeypatch):
+    _clear_per_env(monkeypatch)
+    index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x", env=_STAGING_ENV)
+    assert index.GH_CREDENTIAL == "app"
+    script = index._bootstrap_command("shadow-weekday", "true", "tok", instance_id="i-x", trading_day="2026-09-14")
+    assert "PAT=" not in script and "github_pat" not in script
+    mint = next(ln for ln in script.splitlines() if "installation_token(" in ln)
+    assert 'permissions={"contents": "read"}' in mint and "repositories=[sys.argv[2]]" in mint
+    assert f"{index.REGION} alpha-engine-config) || fail" in script
+    # The mint needs nousergon_lib, which only the venv carries; the clone
+    # still lands before anything reads the checkout (the DLP preflight).
+    assert script.index("deps install failed") < script.index("installation_token(")
+    assert script.index("installation_token(") < script.index("config clone failed")
+    assert script.index("config clone failed") < script.index("session_dlp preflight")
+    assert "unset GH_TOKEN" in script
+
+
+def test_an_unknown_credential_mode_refuses_at_import(monkeypatch):
+    _clear_per_env(monkeypatch)
+    with pytest.raises(RuntimeError, match="DATA_SPOT_GH_CREDENTIAL"):
+        _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x", env={**_STAGING_ENV, "DATA_SPOT_GH_CREDENTIAL": "ssh"})

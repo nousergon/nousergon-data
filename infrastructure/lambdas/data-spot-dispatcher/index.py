@@ -250,6 +250,17 @@ CONFIG_BRANCH = os.environ.get("DATA_SPOT_CONFIG_BRANCH", "main")
 GH_PAT_SSM = os.environ.get(
     "DATA_SPOT_GH_PAT_SSM", "/alpha-engine/saturday_sf_watch/github_pat"
 )
+# How the box authenticates its config clone (alpha-engine-config-I13187,
+# option (a)). `pat`: the fleet PAT above, prod's path, unchanged. `app`: a
+# short-lived GitHub App installation token minted ON THE BOX from its own
+# instance role (`nousergon_lib.github_app.installation_token`, SSM
+# /alpha-engine/groom/github_app_*), narrowed to `contents: read` on the config
+# repo alone -- the dashboard box's git-credential-nousergon-app contract,
+# through the library the box venv already installs. Prod keeps `pat`; outside
+# prod it must be set (staging has no fleet PAT parameter).
+GH_CREDENTIAL = _per_env("DATA_SPOT_GH_CREDENTIAL", "pat")
+if GH_CREDENTIAL not in ("pat", "app"):
+    raise RuntimeError(f"DATA_SPOT_GH_CREDENTIAL={GH_CREDENTIAL!r} is not 'pat' or 'app'")
 # Hard ceiling for the on-box SSM command (matches the bootstrap watchdog). Sized
 # above the observed ~50 min enrich + ~38 min append tail with headroom.
 MAX_RUNTIME_SECONDS = int(os.environ.get("DATA_SPOT_MAX_RUNTIME_SECONDS", "7200"))
@@ -1561,10 +1572,7 @@ def _bootstrap_command(
             outcome_location=_outcome_uri(workload, resolved_day, instance_id),
         ),
     )
-    tail = f"""set +e
-set -uo pipefail
-git config --global --add safe.directory '*' || true
-# alpha-engine-config is PRIVATE. The PAT is read HERE, on the box, from SSM
+    pat_clone = "" if GH_CREDENTIAL != "pat" else f"""# alpha-engine-config is PRIVATE. The PAT is read HERE, on the box, from SSM
 # via the instance profile — never known to this Lambda, never in the SSM
 # document.
 PAT=$(aws ssm get-parameter --name {GH_PAT_SSM} --with-decryption \\
@@ -1574,7 +1582,26 @@ rm -rf /home/ec2-user/alpha-engine-config
 git clone --depth 1 --branch {CONFIG_BRANCH} \\
   "https://x-access-token:${{PAT}}@github.com/{CONFIG_REPO}.git" \\
   /home/ec2-user/alpha-engine-config || fail "config clone failed"
-cd /home/ec2-user/alpha-engine-data
+"""
+    # `app` (I13187): minted after the venv exists, because the minting code is
+    # nousergon_lib's, which the venv installs; nothing between here and the
+    # PAT block's old position reads the config checkout.
+    app_clone = "" if GH_CREDENTIAL != "app" else f"""# alpha-engine-config is PRIVATE. An App installation token is minted HERE,
+# on the box, from its own instance role, narrowed to contents:read on that
+# one repository (alpha-engine-config-I13187) — never known to this Lambda.
+GH_TOKEN=$(python -c 'import sys; from nousergon_lib.github_app import installation_token; print(installation_token(region=sys.argv[1], permissions={{"contents": "read"}}, repositories=[sys.argv[2]]))' \\
+  {REGION} {CONFIG_REPO.rsplit("/", 1)[-1]}) || fail "App token mint failed"
+[ -n "$GH_TOKEN" ] || fail "App token empty"
+rm -rf /home/ec2-user/alpha-engine-config
+git clone --depth 1 --branch {CONFIG_BRANCH} \\
+  "https://x-access-token:${{GH_TOKEN}}@github.com/{CONFIG_REPO}.git" \\
+  /home/ec2-user/alpha-engine-config || fail "config clone failed"
+unset GH_TOKEN
+"""
+    tail = f"""set +e
+set -uo pipefail
+git config --global --add safe.directory '*' || true
+{pat_clone}cd /home/ec2-user/alpha-engine-data
 # python3.12 literally, matching the renderer, which has already installed and
 # ASSERTED it: requirements.txt is resolved against 3.12 and the AMI's python3
 # resolves different wheels.
@@ -1582,7 +1609,7 @@ python3.12 -m venv .venv || fail "venv create failed"
 source .venv/bin/activate
 pip install --upgrade pip -q || fail "pip upgrade failed"
 pip install -q -r requirements.txt || fail "deps install failed"
-# gitleaks + DLP preflight boot gate, for EVERY workload (alpha-engine-config-I10370,
+{app_clone}# gitleaks + DLP preflight boot gate, for EVERY workload (alpha-engine-config-I10370,
 # I10866). Same pin, same asset, same gate as _spot_common.sh::install_gitleaks_dlp.
 # Without it, flow-doctor's diagnosis fails closed with "gitleaks binary not found
 # on PATH", and the page goes out with no diagnosis. Runs as root, so no sudo.
