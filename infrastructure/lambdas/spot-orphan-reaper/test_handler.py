@@ -906,3 +906,107 @@ class TestFinishedExecutionBoxes:
         # The grant must cover exactly the state machines the code may look up.
         (sm,) = index_module.FINISHED_REAP_STATE_MACHINES
         assert grants[0]["Resource"] == f"arn:aws:states:us-east-1:711398986525:execution:{sm}:*"
+
+
+# ── alpha-engine-config-I13194: a box that never boots ─────────────────────
+def _status(instance_id: str, impaired_for_seconds: int | None, status: str = "impaired"):
+    details = [{"Name": "reachability", "Status": "failed" if status == "impaired" else "passed"}]
+    if impaired_for_seconds is not None:
+        details[0]["ImpairedSince"] = (
+            datetime.now(timezone.utc) - timedelta(seconds=impaired_for_seconds)
+        )
+    return {"InstanceId": instance_id, "InstanceStatus": {"Status": status, "Details": details}}
+
+
+def _run_with_status(index_module, spots, statuses=None, status_error=None,
+                     s3_marker_exists: bool = False):
+    ec2 = MagicMock()
+    ec2.get_paginator.return_value = _describe_instances_paginator(spots)
+    if status_error is not None:
+        ec2.describe_instance_status.side_effect = status_error
+    else:
+        ec2.describe_instance_status.return_value = {"InstanceStatuses": statuses or []}
+    cw = MagicMock()
+    s3 = MagicMock()
+    if s3_marker_exists:
+        s3.head_object.return_value = {}
+    else:
+        s3.head_object.side_effect = _NotFound("404 Not Found")
+    clients = {"ec2": ec2, "cloudwatch": cw, "s3": s3}
+    with patch.object(index_module.boto3, "client",
+                      side_effect=lambda svc, **kw: clients[svc]):
+        out = index_module.handler({}, None)
+    return out, ec2, cw
+
+
+class TestImpairedEarlyReap:
+    """The 2026-11-03 Think Tank box failed its instance status check from
+    boot and never ran its user-data; its 9000s watchdog never armed, and
+    nothing told anyone. An impaired box is ended at the next scan."""
+
+    def _tt(self, age_seconds: int = 2700):
+        return _spot("i-tt", "alpha-engine-thinktank-spot", age_seconds=age_seconds,
+                     thinktank_trading_day="2026-11-03", thinktank_run_token="tok6c29")
+
+    def test_impaired_past_grace_is_reaped_early_and_alerts(self, index_module):
+        out, ec2, cw = _run_with_status(
+            index_module, [self._tt()], [_status("i-tt", impaired_for_seconds=2400)],
+        )
+        assert out["terminated"] == ["i-tt"]
+        assert out["impaired_reaps"] == ["i-tt"]
+        assert out["orphan_detail"][0]["reap_reason"] == "impaired"
+        assert out["thinktank_incomplete_reaps"] == ["i-tt"]
+        (text,), _kw = index_module._test_send_message.calls[0]
+        assert "IMPAIRED" in text and "never ran" in text and "tok6c29" in text
+        # A failure, not a designed teardown: it rides the orphan series.
+        assert _metric_calls(cw, index_module.ORPHAN_METRIC)
+
+    def test_impaired_inside_grace_is_not_reaped(self, index_module):
+        out, ec2, _cw = _run_with_status(
+            index_module, [self._tt()], [_status("i-tt", impaired_for_seconds=300)],
+        )
+        assert out["terminated"] == []
+        ec2.terminate_instances.assert_not_called()
+
+    def test_undated_impairment_is_not_reaped(self, index_module):
+        out, ec2, _cw = _run_with_status(
+            index_module, [self._tt()], [_status("i-tt", impaired_for_seconds=None)],
+        )
+        assert out["terminated"] == []
+
+    def test_healthy_status_is_not_reaped(self, index_module):
+        out, ec2, _cw = _run_with_status(
+            index_module, [self._tt()], [_status("i-tt", 2400, status="ok")],
+        )
+        assert out["terminated"] == []
+
+    def test_status_call_failure_falls_back_to_deadline_only(self, index_module):
+        """AccessDenied before deploy.sh --apply-iam: no early reaps, no crash,
+        and a box past its deadline is still reaped."""
+        old = _spot("i-old", "alpha-engine-groom-spot", age_seconds=THRESHOLD + 600)
+        out, ec2, _cw = _run_with_status(
+            index_module, [self._tt(), old], status_error=Exception("AccessDenied"),
+        )
+        assert out["terminated"] == ["i-old"]
+        assert out["impaired_reaps"] == []
+
+    def test_impaired_box_with_completion_marker_does_not_alert(self, index_module):
+        out, _ec2, _cw = _run_with_status(
+            index_module, [self._tt()], [_status("i-tt", 2400)], s3_marker_exists=True,
+        )
+        assert out["terminated"] == ["i-tt"]
+        assert index_module._test_send_message.calls == []
+
+    def test_status_queried_in_batches_of_100(self, index_module):
+        spots = [_spot(f"i-{n:03d}", "alpha-engine-groom-spot", age_seconds=60) for n in range(150)]
+        _out, ec2, _cw = _run_with_status(index_module, spots, [])
+        sizes = [len(c.kwargs["InstanceIds"]) for c in ec2.describe_instance_status.call_args_list]
+        assert sizes == [100, 50]
+
+    def test_iam_policy_grants_describe_instance_status(self):
+        policy = json.loads((Path(__file__).parent / "iam-policy.json").read_text())
+        actions = {
+            a for st in policy["Statement"]
+            for a in ([st["Action"]] if isinstance(st["Action"], str) else st["Action"])
+        }
+        assert "ec2:DescribeInstanceStatus" in actions
