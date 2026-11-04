@@ -140,17 +140,41 @@ def test_security_performance_artifact_shape_and_vs_spy_1y():
 
     result = mmd.collect_security_performance(bucket="b", run_date="2026-06-26", s3_client=s3)
 
-    assert result["status"] == "ok" and result["performance"] == 1
+    assert result["status"] == "ok" and result["performance"] == 2  # AAPL + the SPY index proxy
     art = _puts(s3)[f"{mmd.SECURITY_PERFORMANCE_PREFIX}latest.json"]
     assert art["schema_version"] == mmd.SECURITY_PERFORMANCE_SCHEMA_VERSION
     row = art["performance"]["AAPL"]
     for field in (
-        "period_returns", "ytd_pct", "ltm_pct", "volatility", "sharpe", "sortino",
+        "period_returns", "mtd_pct", "ytd_pct", "ltm_pct", "volatility", "sharpe", "sortino",
         "max_drawdown", "beta_vs_spy", "vs_spy_window", "vs_spy_1y", "n_bars", "history_from",
     ):
         assert field in row
     assert isinstance(row["period_returns"], dict)
     assert row["n_bars"] >= 260
+
+
+def test_security_performance_mtd_runs_from_prior_month_close():
+    from datetime import date as _d
+    series = [[_d(2026, 9, 29).isoformat(), 100.0], [_d(2026, 9, 30).isoformat(), 110.0],
+              [_d(2026, 10, 1).isoformat(), 121.0], [_d(2026, 10, 2).isoformat(), 132.0]]
+    out = mmd._compute_security_performance(series, spy_closes=None, as_of=_d(2026, 10, 2))
+    assert out["mtd_pct"] == round(132.0 / 110.0 - 1.0, 6)  # includes Oct 1's session
+
+
+def test_security_performance_mtd_none_without_prior_month():
+    from datetime import date as _d
+    series = [[_d(2026, 10, 1).isoformat(), 100.0], [_d(2026, 10, 2).isoformat(), 101.0]]
+    out = mmd._compute_security_performance(series, spy_closes=None, as_of=_d(2026, 10, 2))
+    assert out["mtd_pct"] is None
+
+
+def test_security_performance_covers_index_proxies():
+    hist = {"AAPL": _ramp(300), "SPY": _ramp(300, start=400.0, step=0.3), "DIA": _ramp(300, start=380.0)}
+    s3 = _technicals_s3(hist)
+    mmd.collect_security_performance(bucket="b", run_date="2026-06-26", s3_client=s3)
+    art = _puts(s3)[f"{mmd.SECURITY_PERFORMANCE_PREFIX}latest.json"]
+    assert {"DIA", "SPY"} <= set(art["performance"])
+    assert "mtd_pct" in art["performance"]["DIA"]
 
 
 def test_security_performance_omits_symbol_with_no_history():
