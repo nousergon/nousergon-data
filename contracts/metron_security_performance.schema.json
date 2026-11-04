@@ -46,6 +46,12 @@
               ]
             }
           },
+          "mtd_pct": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
           "ytd_pct": {
             "type": [
               "number",

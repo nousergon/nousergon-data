@@ -952,6 +952,8 @@ class TestIntraday:
                     "session_date": "2026-06-12", "prev_session_date": "2026-06-11"},
     }
     _INDEX_QUOTES = {
+        "DIA": {"last": 462.0, "open": 460.5, "prev_close": 460.1,
+                "session_date": "2026-06-12", "prev_session_date": "2026-06-11"},
         "SPY": {"last": 605.2, "open": 603.0, "prev_close": 602.4,
                 "session_date": "2026-06-12", "prev_session_date": "2026-06-11"},
         "ONEQ": {"last": 101.4, "open": 100.8, "prev_close": 100.5,
@@ -995,7 +997,7 @@ class TestIntraday:
             intraday_source=self._stub(self._QUOTES, self._INDEX_QUOTES, self._FUND_PROXY_QUOTES),
             now=self._RTH,
         )
-        assert result["status"] == "ok" and result["quotes"] == 2 and result["indices"] == 4
+        assert result["status"] == "ok" and result["quotes"] == 2 and result["indices"] == 5
         assert result["fund_proxies"] == len(mmd.FUND_PROXY_ETFS)
         # No close_history stubbed → zero ratings computable, but the artifact still
         # writes (an empty rating pass must not read as "never ran").
@@ -1030,7 +1032,7 @@ class TestIntraday:
         result = mmd.collect_intraday(
             bucket="b", s3_client=empty, intraday_source=self._stub(self._INDEX_QUOTES), now=self._RTH,
         )
-        assert result["status"] == "ok" and result["quotes"] == 0 and result["indices"] == 4
+        assert result["status"] == "ok" and result["quotes"] == 0 and result["indices"] == 5
         art = _puts(empty)["market_data/intraday/latest.json"]
         assert art["quotes"] == {}
         assert set(art["indices"]) == set(mmd.INDEX_PROXY_SYMBOLS)
@@ -1114,7 +1116,7 @@ class TestIntraday:
             bucket="b", s3_client=absent, intraday_source=self._stub(self._QUOTES, self._INDEX_QUOTES),
             now=self._RTH,
         )
-        assert r1["status"] == "ok" and r1["indices"] == 4
+        assert r1["status"] == "ok" and r1["indices"] == 5
         assert absent.put_object.called
         # Stale heartbeat (older than HEARTBEAT_FRESH_SECONDS) → still writes.
         stale = self._s3(heartbeat_offset_s=mmd.HEARTBEAT_FRESH_SECONDS + 60)
@@ -1193,7 +1195,7 @@ class TestIntraday:
             bucket="b", s3_client=s3, dry_run=True,
             intraday_source=self._stub(self._QUOTES, self._INDEX_QUOTES), now=self._RTH,
         )
-        assert result["status"] == "ok_dry_run" and result["quotes"] == 2 and result["indices"] == 4
+        assert result["status"] == "ok_dry_run" and result["quotes"] == 2 and result["indices"] == 5
         assert not s3.put_object.called
 
     def test_empty_fetch_refuses_to_overwrite_latest(self):
