@@ -674,7 +674,11 @@ def regrade(
 
         # Guard 4: the dead-column postflight is fatal on a rebuild.
         try:
-            compute.assert_snapshot_columns_live(features_df)
+            compute.assert_snapshot_columns_live(
+                features_df,
+                # Same grace, same day, as D31 graded it (alpha-engine-config-I13143).
+                ungraded=compute.unpublished_ungraded(frame_build, trading_day),
+            )
         except RuntimeError as exc:
             raise RegradeRefused(f"the rebuilt snapshot fails the dead-column postflight: {exc}") from exc
 
