@@ -22,11 +22,18 @@ CONTRACT (``schema_version: 1``):
       "date": "YYYY-MM-DD",
       "generated_at": "<ISO8601 UTC>",
       "sections": {
-        "portfolio": [{"ticker","title","source","published","excerpt","sentiment","url"}],
-        "macro":     [{"title","source","published","excerpt","url"}],
-        "tech":      [{"title","source","published","excerpt","url"}]
+        "portfolio": [{"id","ticker","title","source","published","excerpt","sentiment","url"}],
+        "macro":     [{"id","title","source","published","excerpt","url"}],
+        "tech":      [{"id","title","source","published","excerpt","url"}]
       }
     }
+
+Every item carries ``id``: 12 hex characters, unique within its section and
+stable for the same story on a re-run (see ``_stamp_ids``). Additive, so
+``schema_version`` stays 1. A reader that lists items one per row needs a key
+that is safe in a URL path; ``url`` is not unique (one story tagged with two
+tickers appears twice, and two headlines can share a source and a minute) and
+carries ``?``/``#``.
 
 Deterministic, no LLM, no API spend (topic_news is plain feedparser; the
 portfolio section is derived from already-fetched records).
@@ -34,6 +41,7 @@ portfolio section is derived from already-fetched records).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from datetime import date as Date
@@ -140,6 +148,28 @@ def _select_portfolio(
     return entries
 
 
+def _stamp_ids(section: str, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return copies of ``items`` each carrying a unique, stable ``id``.
+
+    The id hashes the section and the story's identifying fields (url, ticker,
+    published, title, source), so the same story keeps its id across re-runs
+    of the same day. Two items that hash alike (the feed repeated a story) get
+    ``-2``, ``-3``... in list order, so ids are unique within a section by
+    construction. Input dicts are never mutated.
+    """
+    seen: dict[str, int] = {}
+    out: list[dict[str, Any]] = []
+    for item in items:
+        basis = "\x1f".join(
+            [section] + [str(item.get(k, "")) for k in ("url", "ticker", "published", "title", "source")]
+        )
+        base = hashlib.sha1(basis.encode("utf-8")).hexdigest()[:12]
+        n = seen.get(base, 0) + 1
+        seen[base] = n
+        out.append({"id": base if n == 1 else f"{base}-{n}", **{k: v for k, v in item.items() if k != "id"}})
+    return out
+
+
 def build_digest(
     *,
     articles_df: pd.DataFrame,
@@ -160,9 +190,9 @@ def build_digest(
         "date": digest_date.isoformat(),
         "generated_at": _iso_now(),
         "sections": {
-            "portfolio": _select_portfolio(articles_df, cap=portfolio_cap),
-            "macro": list(topics.get("macro") or []),
-            "tech": list(topics.get("tech") or []),
+            "portfolio": _stamp_ids("portfolio", _select_portfolio(articles_df, cap=portfolio_cap)),
+            "macro": _stamp_ids("macro", list(topics.get("macro") or [])),
+            "tech": _stamp_ids("tech", list(topics.get("tech") or [])),
         },
     }
 

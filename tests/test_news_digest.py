@@ -8,6 +8,7 @@ S3 write (dated history object + full latest.json) round-trip.
 from __future__ import annotations
 
 import json
+import re
 from datetime import date, datetime, timezone
 from io import BytesIO
 
@@ -99,7 +100,7 @@ class TestBuildDigestContract:
         p = d["sections"]["portfolio"]
         assert len(p) == 1
         assert set(p[0].keys()) == {
-            "ticker", "title", "source", "published", "excerpt", "sentiment", "url",
+            "id", "ticker", "title", "source", "published", "excerpt", "sentiment", "url",
         }
         assert p[0]["ticker"] == "AAPL"
         assert p[0]["sentiment"] == pytest.approx(-0.12)
@@ -107,18 +108,49 @@ class TestBuildDigestContract:
     def test_macro_tech_sections_passthrough(self):
         df = _articles_df([_aggregated(fingerprint="a")])
         d = build_digest(articles_df=df, topics=_TOPICS, digest_date=date(2026, 5, 13))
-        assert d["sections"]["macro"] == _TOPICS["macro"]
-        assert d["sections"]["tech"] == _TOPICS["tech"]
+        for section in ("macro", "tech"):
+            got = [{k: v for k, v in e.items() if k != "id"} for e in d["sections"][section]]
+            assert got == _TOPICS[section]
         # Topic entries must NOT carry a ticker/sentiment field.
         assert set(d["sections"]["macro"][0].keys()) == {
-            "title", "source", "published", "excerpt", "url",
+            "id", "title", "source", "published", "excerpt", "url",
         }
+        # The caller's topic dicts are not mutated.
+        assert "id" not in _TOPICS["macro"][0]
 
     def test_multi_ticker_story_expands_per_ticker(self):
         df = _articles_df([_aggregated(fingerprint="a", tickers=("AAPL", "MSFT"))])
         d = build_digest(articles_df=df, topics={}, digest_date=date(2026, 5, 13))
         tickers = {e["ticker"] for e in d["sections"]["portfolio"]}
         assert tickers == {"AAPL", "MSFT"}
+
+
+class TestItemIds:
+    """Every item carries an ``id`` unique within its section, safe in a URL
+    path, and stable across re-runs (the console lists one row per item)."""
+
+    def test_ids_are_unique_even_when_stories_repeat(self):
+        same = {"title": "Same", "source": "CNBC", "published": "2026-05-13T12:00:00Z",
+                "excerpt": "x", "url": "https://x/a?b=1#c"}
+        topics = {"macro": [same, dict(same), dict(same, title="Other")], "tech": [same]}
+        df = _articles_df([_aggregated(fingerprint="a", tickers=("AAPL", "MSFT"))])
+        d = build_digest(articles_df=df, topics=topics, digest_date=date(2026, 5, 13))
+        for section, items in d["sections"].items():
+            ids = [e["id"] for e in items]
+            assert len(ids) == len(set(ids)), section
+            for i in ids:
+                assert re.fullmatch(r"[0-9a-f]{12}(-\d+)?", i), i
+        macro = [e["id"] for e in d["sections"]["macro"]]
+        assert macro[1] == f"{macro[0]}-2"
+
+    def test_ids_are_stable_across_runs_and_differ_by_section(self):
+        df = _articles_df([_aggregated(fingerprint="a")])
+        one = build_digest(articles_df=df, topics=_TOPICS, digest_date=date(2026, 5, 13))
+        two = build_digest(articles_df=df, topics=_TOPICS, digest_date=date(2026, 5, 13))
+        assert one["sections"] == two["sections"]
+        topics = {"macro": _TOPICS["macro"], "tech": _TOPICS["macro"]}
+        d = build_digest(articles_df=df, topics=topics, digest_date=date(2026, 5, 13))
+        assert d["sections"]["macro"][0]["id"] != d["sections"]["tech"][0]["id"]
 
 
 class TestPortfolioSelection:
@@ -230,7 +262,8 @@ class TestWriteReadDigest:
         latest = json.loads(s3._store[("alpha-engine-research", latest_key)])
         assert latest["schema_version"] == SCHEMA_VERSION
         assert "sections" in latest
-        assert latest["sections"]["macro"] == _TOPICS["macro"]
+        assert latest["sections"]["macro"] == digest["sections"]["macro"]
+        assert [e["title"] for e in latest["sections"]["macro"]] == [e["title"] for e in _TOPICS["macro"]]
         # Dated history object is byte-identical to latest.
         dated = json.loads(s3._store[("alpha-engine-research", key)])
         assert dated == latest
