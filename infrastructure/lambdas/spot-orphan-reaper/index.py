@@ -244,6 +244,57 @@ def _scan_spot_instances(ec2) -> list[dict]:
     return out
 
 
+# alpha-engine-config-I13194: a box that never boots. The 2026-11-03 Think
+# Tank box i-006e82c6bf815c1ed failed its EC2 INSTANCE status check from launch
+# (StatusCheckFailed_Instance=1 for its whole life, NetworkIn/Out=0 bytes, CPU
+# idle), so its user-data never ran: no launch record, no on-box watchdog, no
+# log, no completion marker, and nobody was told. Every on-box safety net lives
+# in the user-data, so a box that cannot boot has none of them; only this
+# reaper sees it, and only at its watchdog deadline (9000s + grace for Think
+# Tank), long after the run's day is lost.
+#
+# So a scanned box whose instance status check has been IMPAIRED for longer
+# than IMPAIRED_REAP_GRACE_SECONDS is ended early (reason ``impaired``), and a
+# WATCH_KINDS box without its completion marker gets the same Telegram ping as
+# an age-cap reap. Only boxes this reaper already scans are eligible; the
+# scan scope above (spot, or LaunchMarket=on-demand) is unchanged, so the
+# long-lived dashboard and executor boxes stay out of reach.
+#
+# Fail-safe direction: if DescribeInstanceStatus errors (including AccessDenied
+# before ``deploy.sh --apply-iam`` grants it), nothing is reaped early and every
+# box falls back to its deadline exactly as before. A box with no dated
+# ``ImpairedSince`` is never reaped early either: an undated impairment is a
+# guess.
+IMPAIRED_REAP_GRACE_SECONDS = int(os.environ.get("IMPAIRED_REAP_GRACE_SECONDS", "900"))
+_STATUS_BATCH = 100  # DescribeInstanceStatus accepts at most 100 InstanceIds
+
+
+def _impaired_since(ec2, instance_ids: list[str]) -> dict[str, datetime]:
+    """``{instance_id: ImpairedSince}`` for boxes whose instance status check
+    reports ``impaired``. Never raises: a failed call returns what it has."""
+    out: dict[str, datetime] = {}
+    for i in range(0, len(instance_ids), _STATUS_BATCH):
+        batch = instance_ids[i:i + _STATUS_BATCH]
+        try:
+            resp = ec2.describe_instance_status(InstanceIds=batch)
+        except Exception as exc:  # noqa: BLE001 — early reap is additive only
+            logger.warning(
+                "describe_instance_status failed (no impaired early reaps this run): %s", exc,
+            )
+            return out
+        for st in resp.get("InstanceStatuses", []) or []:
+            inst_status = st.get("InstanceStatus") or {}
+            if inst_status.get("Status") != "impaired":
+                continue
+            dated = [
+                d.get("ImpairedSince") for d in inst_status.get("Details", []) or []
+                if d.get("Status") == "failed" and isinstance(d.get("ImpairedSince"), datetime)
+            ]
+            if dated:
+                out[st["InstanceId"]] = min(dated)
+    return out
+
+
 # alpha-engine-config-I11569 / I11108 deliverable 4: once the weekly run that
 # launched a box has stopped, nothing uses the box again, but it stays up until
 # its 13h watchdog-deadline. Since config#2248 the box is dispatched INSIDE the
@@ -347,7 +398,9 @@ def _completion_marker_exists(s3, kind: WatchKind, watch_tags: dict[str, str]) -
         return False
 
 
-def _notify_incomplete_reap(kind: WatchKind, instance_id: str, watch_tags: dict[str, str]) -> None:
+def _notify_incomplete_reap(
+    kind: WatchKind, instance_id: str, watch_tags: dict[str, str], reason: str = "deadline",
+) -> None:
     """Best-effort Telegram ping — a WATCH_KINDS box reaped without its
     completion marker can mean its agent never finished. Reuses
     ``krepis.telegram.send_message`` directly (via the ``nousergon_lib.
@@ -368,6 +421,15 @@ def _notify_incomplete_reap(kind: WatchKind, instance_id: str, watch_tags: dict[
         f"s3://{WATCH_COMPLETION_BUCKET}/{key} before the orphan-reaper's "
         "fleet-wide age cap fired."
     )
+    if reason == "impaired":
+        # alpha-engine-config-I13194: the box never booted, so its run never
+        # started; say so rather than "may still be unrepaired".
+        text = (
+            f"🟠 {kind.label} box reaped: EC2 instance status check IMPAIRED, so it "
+            f"never ran ({context}, instance={instance_id}). No completion marker at "
+            f"s3://{WATCH_COMPLETION_BUCKET}/{key}; this run's output is missing "
+            "until it is re-dispatched."
+        )
     try:
         send_message(text, disable_notification=False)
     except Exception as exc:  # noqa: BLE001 — secondary observability only
@@ -451,6 +513,10 @@ def handler(event: dict, context) -> dict:
         scanned_by_market.get(MARKET_ON_DEMAND, 0), REAP_AFTER_SECONDS,
     )
 
+    impaired = _impaired_since(ec2, [inst["instance_id"] for inst in instances]) if instances else {}
+    impaired_grace = timedelta(seconds=IMPAIRED_REAP_GRACE_SECONDS)
+    impaired_reaps: list[str] = []
+
     orphans: list[dict] = []
     terminated: list[str] = []
     per_name_terminated: dict[str, int] = {}
@@ -482,7 +548,12 @@ def handler(event: dict, context) -> dict:
             effective_threshold = threshold
 
         reap_reason = "deadline"
-        if age <= effective_threshold:
+        impaired_since = impaired.get(inst["instance_id"])
+        if age <= effective_threshold and impaired_since is not None and (
+            now - impaired_since >= impaired_grace
+        ):
+            reap_reason = "impaired"
+        elif age <= effective_threshold:
             execution_id = inst.get("execution_id", "")
             if not _early_reap_candidate(execution_id):
                 continue
@@ -519,7 +590,14 @@ def handler(event: dict, context) -> dict:
             terminated.append(inst["instance_id"])
             # A deadline reap is the orphan the alarm exists for; a finished
             # run's box is the designed teardown and is counted separately.
-            series = per_name_terminated if reap_reason == "deadline" else per_name_finished
+            # An impaired box is a failure, not a teardown: it rides the orphan
+            # series with the deadline reaps.
+            series = (
+                per_name_terminated if reap_reason in ("deadline", "impaired")
+                else per_name_finished
+            )
+            if reap_reason == "impaired":
+                impaired_reaps.append(inst["instance_id"])
             series[inst["name"]] = series.get(inst["name"], 0) + 1
             terminated_by_market[inst["market"]] = terminated_by_market.get(inst["market"], 0) + 1
             logger.warning(
@@ -534,7 +612,9 @@ def handler(event: dict, context) -> dict:
             kind = _WATCH_KIND_BY_TAG_NAME.get(inst["name"])
             if kind is not None:
                 if not _completion_marker_exists(s3, kind, inst["watch_tags"]):
-                    _notify_incomplete_reap(kind, inst["instance_id"], inst["watch_tags"])
+                    _notify_incomplete_reap(
+                        kind, inst["instance_id"], inst["watch_tags"], reason=reap_reason,
+                    )
                     incomplete_reaps[kind.result_key].append(inst["instance_id"])
         except Exception as exc:
             logger.error(
@@ -556,5 +636,6 @@ def handler(event: dict, context) -> dict:
         "dry_run": DRY_RUN,
         "reap_after_seconds": REAP_AFTER_SECONDS,
         "orphan_detail": orphans,
+        "impaired_reaps": impaired_reaps,
         **incomplete_reaps,
     }
