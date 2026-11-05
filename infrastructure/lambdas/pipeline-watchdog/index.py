@@ -173,7 +173,7 @@ import json
 import logging
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -420,6 +420,87 @@ SILENCE_WINDOW_DAYS = 5
 # slot — still visible in the 5-day window on each of the next four firings —
 # does not re-page. 7 days > the window, so exactly one page per silent slot.
 SILENCE_DEDUP_WINDOW_MIN = 7 * 24 * 60
+
+
+# ── Checks retired or gated by the Crucible v2 switch (alpha-engine-config-I13255)
+#
+# The weekly checks (Saturday-SF liveness, the weekly slot of the silence
+# deadman) expect the v1 Saturday cron. Brian's 2026-10-28 ruling DISABLED it:
+# `alpha-engine-saturday` sits in nousergon-data infrastructure/
+# automation_pause.json `paused`. They read that declaration LIVE, the same way
+# `paused_alarms` entries are justified by `watches`: deploy.sh packages the
+# manifest next to this file, and deploy-pipeline-watchdog.yml redeploys on any
+# manifest change, so moving the cron back to `not_paused` re-arms both checks
+# on the next deploy with no edit here. An unreadable manifest gates NOTHING —
+# the checks run and page, they are never silenced on a file we could not read.
+#
+# v2's weekly is watched by the CloudWatch alarm
+# alpha-engine-pipeline-deadman-v2-weekly (CrucibleV2/JobExit Job=weekly,
+# armed in the same manifest), which this Lambda cannot read without a new
+# grant.
+WEEKLY_CRON_TRIGGER = "alpha-engine-saturday"
+AUTOMATION_PAUSE_FILENAME = "automation_pause.json"
+
+#: Liveness checks retired by declaration. The key is the ``sf_label``; the
+#: value is the skip reason the summary records. "EOD SF" watches
+#: ne-postclose-trading-pipeline, whose daily trigger was the v1 daemon's
+#: shutdown; Brian's 2026-11-01 ruling (alpha-engine-config-I13005) made the
+#: weekday preopen skip RunDaemon from 11-03 (`skip_run_daemon: true` in
+#: alpha-engine-orchestration.yaml's weekday schedule input), so the machine now
+#: runs only when alpha-engine-eod-backstop finds no snapshot. The daily
+#: post-close stays watched by the "EOD reconcile SF" liveness check below
+#: (ne-postclose-reconcile-pipeline, the half that still runs every trading
+#: evening) and by alpha-engine-eod-snapshot-existence-check, which pages when
+#: the day's trades/snapshots/{day}.json is missing. Lockstep:
+#: tests/test_handler.py fails while this map retires "EOD SF" and the weekday
+#: input no longer skips RunDaemon, so restoring the daemon restores the check
+#: in the same change. The prior-day failed-run check on the same machine is
+#: NOT retired: a backstop-started run that fails still pages.
+RETIRED_LIVENESS_CHECKS = {
+    "EOD SF": (
+        "retired with the Crucible v2 switch (alpha-engine-config-I13255): the "
+        "weekday preopen skips RunDaemon since 2026-11-03 (alpha-engine-config-"
+        "I13005), so ne-postclose-trading-pipeline runs only when "
+        "alpha-engine-eod-backstop finds no snapshot. The daily post-close is "
+        "watched by the EOD reconcile SF check and "
+        "alpha-engine-eod-snapshot-existence-check."
+    ),
+}
+
+
+def _automation_pause_path() -> Path:
+    """Deployed layout: flat next to index.py. In-repo: infrastructure/."""
+    here = Path(__file__).resolve().parent
+    flat = here / AUTOMATION_PAUSE_FILENAME
+    if flat.exists():
+        return flat
+    return here.parents[1] / AUTOMATION_PAUSE_FILENAME
+
+
+def _weekly_cron_paused_reason(path: Optional[Path] = None) -> Optional[str]:
+    """The declared reason the v1 weekly cron is off, or None if it is not.
+
+    None also when the manifest cannot be read or parsed: the weekly checks
+    then run exactly as before and page on silence (fail toward paging).
+    """
+    try:
+        manifest = json.loads((path or _automation_pause_path()).read_text())
+        paused = manifest.get("paused", {})
+        if WEEKLY_CRON_TRIGGER in paused.get("events_rules", {}) or (
+            WEEKLY_CRON_TRIGGER in manifest.get("pending", {})
+        ):
+            return (
+                f"{WEEKLY_CRON_TRIGGER} is declared paused in "
+                f"automation_pause.json (Brian's 2026-10-28 ruling; "
+                f"alpha-engine-config-I13255). v2's weekly is watched by "
+                f"alpha-engine-pipeline-deadman-v2-weekly."
+            )
+    except Exception as exc:  # noqa: BLE001 — fail toward checking, logged
+        logger.warning(
+            "automation_pause.json unreadable (%s: %s); weekly checks run ungated",
+            type(exc).__name__, exc,
+        )
+    return None
 
 
 @dataclass(frozen=True)
@@ -1914,6 +1995,7 @@ def _check_weekly_silence(
     now_utc: datetime,
     client: Optional[object] = None,
     ssm_client: Optional[object] = None,
+    weekly_paused_reason: Optional[str] = None,
 ) -> SilenceCheckResult:
     """Weekly-SF silence deadman: a day the DECLARED cadence says the pipeline
     should have run and no execution exists at all (alpha-engine-config#6738,
@@ -2004,6 +2086,15 @@ def _check_weekly_silence(
         is_trading_day,
         next_trading_day,
     )
+    if weekly_paused_reason:
+        # alpha-engine-config-I13255: the weekly slot expects the Saturday
+        # cron, which is declared paused. GATED_OFF (reported, never paged),
+        # the same verdict a cadence-gated exercise slot gets.
+        slots = [
+            replace(s, gated_off=True, note=f"weekly cron gated off: {weekly_paused_reason}")
+            if s.role == "weekly" else s
+            for s in slots
+        ]
     results = evaluate(slots, executions)
 
     critical = [r for r in results if r.classification == "CRITICAL"]
@@ -2078,6 +2169,8 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     is_trading_today = _is_trading_day_now(now_utc)
     is_sunday = now_utc.weekday() == 6  # Mon=0..Sun=6
 
+    weekly_paused_reason = _weekly_cron_paused_reason()
+
     weekday = _check_sf(
         sf_label="Weekday SF",
         sf_arn=WEEKDAY_SF_ARN,
@@ -2091,10 +2184,11 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     eod = _check_sf(
         sf_label="EOD SF",
         sf_arn=EOD_SF_ARN,
-        is_watch_day=is_trading_today,
-        skip_reason_if_not_watching=(
+        is_watch_day=is_trading_today and "EOD SF" not in RETIRED_LIVENESS_CHECKS,
+        skip_reason_if_not_watching=RETIRED_LIVENESS_CHECKS.get(
+            "EOD SF",
             "today is not a NYSE trading day (weekend / holiday) per "
-            "nousergon_lib.trading_calendar"
+            "nousergon_lib.trading_calendar",
         ),
         # Trading-day-aware: previous_trading_day-based, NOT a 24h calendar
         # window. Today's EOD fires ~20:00 UTC (after market close + daemon
@@ -2128,9 +2222,10 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         gate_noop_aware=True,
         sf_label="Saturday SF",
         sf_arn=SATURDAY_SF_ARN,
-        is_watch_day=is_sunday,
+        is_watch_day=is_sunday and not weekly_paused_reason,
         skip_reason_if_not_watching=(
-            f"today (weekday={now_utc.weekday()}) is not Sunday; Saturday SF "
+            weekly_paused_reason
+            or f"today (weekday={now_utc.weekday()}) is not Sunday; Saturday SF "
             "watch-day is Sunday so missed firings are 24+h overdue"
         ),
         window_seconds=WINDOW_SECONDS_WEEKLY,
@@ -2178,7 +2273,9 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     # its own slot derivation is the trading-calendar gate, so there is no
     # watch-day to skip on. Ordered last so that if it ever raises despite the
     # degraded path below, the five checks above have already published.
-    weekly_silence = _check_weekly_silence(now_utc=now_utc)
+    weekly_silence = _check_weekly_silence(
+        now_utc=now_utc, weekly_paused_reason=weekly_paused_reason
+    )
 
     summary = {
         "fired_at_utc": now_utc.isoformat(),
