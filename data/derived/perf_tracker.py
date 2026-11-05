@@ -97,6 +97,7 @@ import io
 import json
 import logging
 import math
+import statistics
 import sys
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -305,7 +306,12 @@ def parse_nav_csv(text: str) -> list[NavRow]:
 
 
 def parse_close_history(doc: Mapping[str, Any]) -> dict[date, float]:
-    """``close_history`` JSON (``closes: [[YYYY-MM-DD, close], ...]``)."""
+    """``close_history`` JSON (``closes: [[YYYY-MM-DD, close], ...]``).
+
+    Raises :class:`PerfInputError` when the document is not that shape at all
+    (not an object, or ``closes`` not a list); a bad row is skipped."""
+    if not isinstance(doc, Mapping) or not isinstance(doc.get("closes") or [], list):
+        raise PerfInputError(f"close_history is not {{closes: [...]}}: {type(doc).__name__}")
     out: dict[date, float] = {}
     for pair in doc.get("closes") or ():
         try:
@@ -323,6 +329,8 @@ def parse_personal_returns(doc: Mapping[str, Any]) -> list[PersonalRow]:
 
     Raises :class:`PerfInputError` on a schema it does not know (the caller
     treats the series as unavailable, never as zero)."""
+    if not isinstance(doc, Mapping) or not isinstance(doc.get("returns") or [], list):
+        raise PerfInputError(f"{PERSONAL_KEY} is not an object with a returns list")
     if doc.get("schema_version") != PERSONAL_SCHEMA_VERSION:
         raise PerfInputError(f"{PERSONAL_KEY} schema {doc.get('schema_version')!r}")
     out: dict[date, PersonalRow] = {}
@@ -499,11 +507,14 @@ def _mean(xs: Sequence[float]) -> float:
 
 
 def _stdev(xs: Sequence[float]) -> float | None:
-    """Sample standard deviation; None under two observations."""
+    """Sample standard deviation; None under two observations.
+
+    ``statistics.stdev`` sums exactly, so a constant series is exactly 0 (and
+    its ratio null) rather than a rounding residue like 1.7e-18 that divided
+    into a ~1e16 Sharpe (codex 885d390ad694c9c1)."""
     if len(xs) < 2:
         return None
-    m = _mean(xs)
-    return math.sqrt(sum((x - m) ** 2 for x in xs) / (len(xs) - 1))
+    return statistics.stdev(xs)
 
 
 def _ratio(num: float, den: float | None) -> float | None:
@@ -901,7 +912,13 @@ def _optional_inputs(s3: Any, bucket: str) -> tuple[dict[str, dict[date, float] 
     extra: dict[str, dict[date, float] | None] = {}
     for _, sym, _ in CLOSE_HISTORY_BENCHMARKS:
         doc = _get_optional_json(s3, bucket, CLOSE_HISTORY_KEY.format(symbol=sym))
-        extra[sym] = parse_close_history(doc) if doc is not None else None
+        extra[sym] = None
+        if doc is not None:
+            # An optional input never aborts the publish (codex 385d8cccc8e6d68a).
+            try:
+                extra[sym] = parse_close_history(doc)
+            except PerfInputError as e:
+                logger.warning("optional input %s unusable: %s", CLOSE_HISTORY_KEY.format(symbol=sym), e)
     personal: list[PersonalRow] | None = None
     doc = _get_optional_json(s3, bucket, PERSONAL_KEY)
     if doc is not None:

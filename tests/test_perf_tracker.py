@@ -721,3 +721,25 @@ def test_load_reads_the_optional_inputs_and_survives_their_absence():
     inc = window(full, "inception")["cells"]
     assert inc["vs_iwm"]["benchmark_pct"] is not None
     assert inc["vs_personal"]["benchmark_pct"] == pytest.approx((1.001 ** 39 - 1) * 100, abs=1e-3)
+
+
+def test_a_structurally_wrong_optional_input_is_unavailable_not_fatal():
+    # codex 385d8cccc8e6d68a: a list where an object belongs aborted the publish.
+    rows = ledger(SHORT)
+    closes = {"closes": [[d.isoformat(), 100.0 + i] for i, d in enumerate(SHORT)]}
+    doc = pt.load_and_build(FakeS3({
+        pt.NAV_KEY: nav_csv(rows).encode(),
+        pt.CLOSE_HISTORY_KEY.format(symbol="SPY"): json.dumps(closes).encode(),
+        pt.CLOSE_HISTORY_KEY.format(symbol="QQQ"): json.dumps(closes).encode(),
+        pt.CLOSE_HISTORY_KEY.format(symbol="IWM"): json.dumps([1, 2]).encode(),
+        pt.CLOSE_HISTORY_KEY.format(symbol="ONEQ"): json.dumps({"closes": 5}).encode(),
+        pt.PERSONAL_KEY: json.dumps(["not", "an", "object"]).encode(),
+    }), "bucket", now=NOW)
+    inc = window(doc, "inception")["cells"]
+    assert inc["vs_iwm"]["benchmark_pct"] is None and inc["vs_personal"]["benchmark_pct"] is None
+
+
+def test_a_constant_series_has_zero_stdev_and_no_ratio():
+    # codex 885d390ad694c9c1: rounding left 1.7e-18 and a ~1e16 Sharpe.
+    assert pt._stdev([0.0029] * 252) == 0.0  # the old sum-based mean left 4.3e-19
+    assert pt._ratio(0.0029, pt._stdev([0.0029] * 252)) is None
