@@ -77,6 +77,18 @@ EOD_ARN = index.EOD_SF_ARN
 
 
 @pytest.fixture(autouse=True)
+def _v1_cycle_declarations(request, monkeypatch):
+    """Run the pre-existing handler tests in the world they were written for:
+    nothing retired and the weekly cron live (alpha-engine-config-I13255). The
+    v2-switch declarations are tested explicitly below by tests marked
+    ``v2_switch``, which keep the module's real values."""
+    if request.node.get_closest_marker("v2_switch"):
+        return
+    monkeypatch.setattr(index, "RETIRED_LIVENESS_CHECKS", {})
+    monkeypatch.setattr(index, "_weekly_cron_paused_reason", lambda path=None: None)
+
+
+@pytest.fixture(autouse=True)
 def _reset_lib_mocks():
     """Reset the module-level MagicMocks between tests so call-counts +
     side_effects don't leak."""
@@ -2605,3 +2617,58 @@ def test_a_reconcile_started_after_midnight_utc_still_buckets_to_its_trading_day
     )
     counts = index._statuses_for_day(client, index.RECONCILE_SF_ARN, date(2026, 9, 29))
     assert counts == {"SUCCEEDED": 1}
+
+
+
+# ── Crucible v2 switch declarations (alpha-engine-config-I13255) ──────────
+
+_REPO = Path(__file__).resolve().parents[3]
+
+
+@pytest.mark.v2_switch
+def test_weekly_cron_paused_reason_reads_the_real_manifest():
+    """The in-repo manifest declares alpha-engine-saturday paused (2026-10-28
+    ruling), so the weekly checks are gated; the reason names the issue."""
+    assert "alpha-engine-saturday" in json.loads(
+        (_REPO / "infrastructure" / "automation_pause.json").read_text()
+    )["paused"]["events_rules"]
+    reason = index._weekly_cron_paused_reason()
+    assert reason and "alpha-engine-config-I13255" in reason
+
+
+@pytest.mark.v2_switch
+def test_weekly_cron_unpaused_or_unreadable_manifest_gates_nothing(tmp_path):
+    live = tmp_path / "live.json"
+    live.write_text(json.dumps({"paused": {"events_rules": {}}, "pending": {}}))
+    assert index._weekly_cron_paused_reason(live) is None
+    broken = tmp_path / "broken.json"
+    broken.write_text("{not json")
+    assert index._weekly_cron_paused_reason(broken) is None
+    assert index._weekly_cron_paused_reason(tmp_path / "missing.json") is None
+
+
+@pytest.mark.v2_switch
+def test_eod_sf_retirement_is_in_lockstep_with_the_weekday_skip_flag():
+    """Retiring the EOD SF liveness check is justified only while the weekday
+    preopen skips RunDaemon. Put the daemon back and this fails until the
+    retirement is removed in the same change."""
+    cfn = (_REPO / "infrastructure" / "cloudformation" / "alpha-engine-orchestration.yaml").read_text()
+    daemon_skipped = '\\"skip_run_daemon\\": true' in cfn
+    assert ("EOD SF" in index.RETIRED_LIVENESS_CHECKS) == daemon_skipped
+    assert daemon_skipped  # the 2026-11-01 ruling is in force on main
+
+
+@pytest.mark.v2_switch
+def test_weekly_silence_gates_the_weekly_slot_but_still_pages_exercise_slots():
+    now = datetime(2026, 8, 10, 14, 0, tzinfo=timezone.utc)  # Monday
+    sfn = MagicMock()
+    sfn.list_executions.return_value = {"executions": []}  # no nextToken: one page
+    ssm = MagicMock()
+    ssm.get_parameter.return_value = {"Parameter": {"Value": "daily"}}
+    result = index._check_weekly_silence(
+        now_utc=now, client=sfn, ssm_client=ssm,
+        weekly_paused_reason="alpha-engine-saturday is declared paused",
+    )
+    assert result.gated_off_slots and all(s.endswith(":weekly") for s in result.gated_off_slots)
+    assert not any(s.endswith(":weekly") for s in result.critical_slots)
+    assert any(s.endswith(":exercise") for s in result.critical_slots)

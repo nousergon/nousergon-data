@@ -139,6 +139,10 @@ cp "${SCRIPT_DIR}/../flow_doctor_telegram.py" "${PKG}/flow_doctor_telegram.py"
 # scheduled copy that can drift from the one an operator reruns by hand.
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 cp "${REPO_ROOT}/scripts/weekly_sf_silence_deadman.py" "${PKG}/weekly_sf_silence_deadman.py"
+# The automation-pause manifest (alpha-engine-config-I13255): the weekly checks
+# read whether alpha-engine-saturday is declared paused from THIS copy, so an
+# un-pause re-arms them on the next deploy (the workflow's paths include it).
+cp "${REPO_ROOT}/infrastructure/automation_pause.json" "${PKG}/automation_pause.json"
 ZIP="${PKG}/function.zip"
 (cd "${PKG}" && zip -qr "function.zip" . -x "function.zip")
 echo "Packaged ${ZIP} ($(wc -c < "${ZIP}") bytes)"

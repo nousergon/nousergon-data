@@ -40,6 +40,9 @@ on:
       # Lambda — the "merged fix that never went live" shape this whole
       # workflow was created to close, one level down.
       - 'scripts/weekly_sf_silence_deadman.py'
+      # The weekly checks gate on alpha-engine-saturday being declared paused
+      # here (alpha-engine-config-I13255); an un-pause must redeploy to re-arm.
+      - 'infrastructure/automation_pause.json'
   workflow_dispatch:
 
 concurrency:
