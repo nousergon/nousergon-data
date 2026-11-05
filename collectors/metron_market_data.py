@@ -2068,6 +2068,95 @@ def _log_absent_carry(carried: list[dict], dropped: list[dict], shrink: dict) ->
         )
 
 
+# ── Per-session coverage (alpha-engine-config-I7218) ──────────────────────────
+#
+# On 2026-07-21, 07-22 and 07-31 the consolidated artifact carried a close for only
+# 746-794 of ~957 series, and every forward-return grade anchored on those days
+# silently dropped 17-22% of its cross-section. The heal paths (I11553, I11556) make a
+# short session unlikely, but an unfilled hole still uploads. So the artifact states
+# its own per-date coverage, and a session well below its neighbours is recorded as
+# incomplete, by name, rather than being indistinguishable from a whole day.
+
+#: A session whose series count is below this fraction of the median count over the
+#: sessions immediately before it is recorded as incomplete.
+SESSION_COVERAGE_MIN_FRACTION = 0.95
+#: How many preceding sessions form that median.
+SESSION_COVERAGE_TRAILING_SESSIONS = 5
+#: How many sessions, ending at the run date, are graded. Older history is reported
+#: in ``coverage_by_date`` but not graded: listings and delistings over the multi-year
+#: window move the count for reasons that are not holes.
+SESSION_COVERAGE_GRADED_SESSIONS = 30
+
+
+def session_coverage(
+    series: dict[str, list[tuple[str, float]]],
+    trading_day: date,
+    *,
+    min_fraction: float = SESSION_COVERAGE_MIN_FRACTION,
+    trailing: int = SESSION_COVERAGE_TRAILING_SESSIONS,
+    graded: int = SESSION_COVERAGE_GRADED_SESSIONS,
+) -> tuple[dict[str, int], dict[str, dict]]:
+    """Per-date series counts, and the graded sessions that fall short of their neighbours.
+
+    Returns ``(coverage_by_date, incomplete_sessions)``. ``coverage_by_date`` maps every
+    date any series carries to the number of series with a close on it, so a consumer
+    can see a hole without recounting every series. ``incomplete_sessions`` maps each of
+    the last ``graded`` NYSE sessions ending at ``trading_day`` whose count is below
+    ``min_fraction`` of the median over its ``trailing`` preceding sessions to
+    ``{tickers, trailing_median, floor}``. A session no series carries counts as 0, so
+    a wholly missing day is caught too. Non-sessions (holidays, weekends) are counted
+    but never graded: a foreign listing trading on a US holiday is not a hole.
+    """
+    from statistics import median
+
+    from nousergon_lib.dates import is_trading_day, previous_trading_day
+
+    counts: dict[str, int] = {}
+    for points in series.values():
+        for day in {str(d)[:10] for d, _c in points}:
+            counts[day] = counts.get(day, 0) + 1
+    coverage_by_date = dict(sorted(counts.items()))
+    if not counts:
+        return coverage_by_date, {}
+
+    anchor = trading_day if is_trading_day(trading_day) else previous_trading_day(trading_day)
+    sessions = [anchor]
+    while len(sessions) < graded + trailing:
+        sessions.append(previous_trading_day(sessions[-1]))
+    sessions = [d.isoformat() for d in reversed(sessions)]  # oldest first
+    first_bar = min(counts)
+
+    incomplete: dict[str, dict] = {}
+    for i in range(trailing, len(sessions)):
+        window = sessions[i - trailing:i]
+        if window[0] < first_bar:
+            continue  # the artifact does not reach back far enough to form the median
+        day = sessions[i]
+        trailing_median = median(counts.get(d, 0) for d in window)
+        floor = min_fraction * trailing_median
+        have = counts.get(day, 0)
+        if have < floor:
+            incomplete[day] = {
+                "tickers": have, "trailing_median": trailing_median, "floor": round(floor, 2),
+            }
+    return coverage_by_date, incomplete
+
+
+def _log_incomplete_sessions(incomplete: dict[str, dict]) -> None:
+    """One ERROR line naming every incomplete session (alpha-engine-config-I7218)."""
+    if incomplete:
+        logger.error(
+            "[metron_market_data] close_history INCOMPLETE SESSIONS: %d session(s) carry fewer "
+            "than %.0f%% of the series their trailing %d-session median carries; recorded in "
+            "`incomplete_sessions` (alpha-engine-config-I7218): %s",
+            len(incomplete), 100 * SESSION_COVERAGE_MIN_FRACTION,
+            SESSION_COVERAGE_TRAILING_SESSIONS,
+            ", ".join(
+                f"{d}={v['tickers']}/{v['trailing_median']:g}" for d, v in sorted(incomplete.items())
+            ),
+        )
+
+
 def collect_history(
     *, bucket: str = DEFAULT_BUCKET, run_date: str | None = None, dry_run: bool = False,
     s3_client: Any = None,
@@ -2117,6 +2206,13 @@ def collect_history(
     When the source answered fewer than ``1 - SERIES_SHRINK_FAIL_FRACTION`` of the
     previously published series, the carried artifact is still published but the unit
     returns ``status: "error"`` (:func:`series_shrink_verdict`).
+
+    Per-session coverage (alpha-engine-config-I7218): the consolidated artifact carries
+    ``coverage_by_date`` (series count per date) and ``incomplete_sessions`` (each of the
+    last ``SESSION_COVERAGE_GRADED_SESSIONS`` sessions below
+    ``SESSION_COVERAGE_MIN_FRACTION`` of its trailing median), logged at ERROR. An
+    incomplete session is recorded, not refused: the artifact is still the best estimate
+    to publish, and the unit's status is unchanged (:func:`session_coverage`).
 
     Idempotent (full-series overwrite each run). Injectable sources/S3 for tests."""
     from datetime import date as _date
@@ -2172,7 +2268,11 @@ def collect_history(
         for c in absent_carried
     }
     carried_marks = {c["symbol"]: c["last_date"] for c in absent_carried}
+    # alpha-engine-config-I7218: measured on what will be published, after every carry.
+    coverage_by_date, incomplete_sessions = session_coverage(closes, trading_day)
+    _log_incomplete_sessions(incomplete_sessions)
     carry_result = {
+        "incomplete_sessions": sorted(incomplete_sessions),
         "carry_base": carry_base, "carried_bars": len(carried), "carry_refused": len(refused),
         "carried_series": len(absent_carried), "dropped_series": len(absent_dropped),
         "series_shrink": shrink,
@@ -2225,6 +2325,10 @@ def collect_history(
             # run's source omitted it, with its last bar date. Always present ({} when none),
             # so a reader never has to tell "none carried" from "not reported".
             "carried_series": carried_marks,
+            # alpha-engine-config-I7218: series count per date, and each graded session
+            # short of its trailing median. Both always present ({} when none).
+            "coverage_by_date": coverage_by_date,
+            "incomplete_sessions": incomplete_sessions,
         })
     except Exception as e:  # fail loud to the phase registry
         logger.error("[metron_market_data] history write failed: %s", e)
