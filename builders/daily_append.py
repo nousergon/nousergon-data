@@ -990,6 +990,7 @@ def _scan_universe_and_emit_freshness_receipt(
     max_stale_trading_days: int = UNIVERSE_FRESHNESS_MAX_STALE_TRADING_DAYS,
     expected_tickers: list[str] | None = None,
     run_date: str | None = None,
+    eod_unsettled_proxies: frozenset[str] = frozenset(),
 ) -> dict:
     """Producer-side post-write validation: every universe symbol's
     last-row date must be within ``max_stale_trading_days`` NYSE sessions
@@ -1207,6 +1208,34 @@ def _scan_universe_and_emit_freshness_receipt(
         (sym, d) for sym, (d, _) in proxy_ages.items()
         if universe_head is not None and d < universe_head
     )
+    # EOD unsettled-bar carve-out (alpha-engine-config-I13143, 2026-11-04):
+    # the post-market run's quality gate blocked XLF's session row as
+    # intrabar_inconsistent (Close=59.2000 above High=59.1950), the documented
+    # EOD provider artifact that next morning's MorningEnrich overwrite heals.
+    # This check then failed the whole EOD collection on that same expected
+    # artifact, on the spot attempt and on the on-demand retry alike. A proxy
+    # is exempt ONLY when the caller says THIS run blocked its row for that
+    # reason alone (``eod_unsettled_proxies``, EOD path only) AND it is
+    # exactly one session behind the head. A proxy never requested, two
+    # sessions behind, or blocked for any other anomaly still raises.
+    proxies_eod_unsettled = sorted(
+        (sym, d) for sym, d in proxies_lagging
+        if sym in eod_unsettled_proxies
+        and trading_days_stale(
+            pd.Timestamp(d).date(), universe_head,
+        ) == 1
+    )
+    if proxies_eod_unsettled:
+        log.warning(
+            "Universe-freshness scan: %d DECLARED benchmark proxy(ies) one session "
+            "behind the universe head %s because this EOD run's quality gate "
+            "blocked their unsettled bar (intrabar_inconsistent); MorningEnrich "
+            "overwrites them, and a second missed session raises: %s "
+            "(alpha-engine-config-I13143)",
+            len(proxies_eod_unsettled), universe_head,
+            ", ".join(f"{sym}(last={d})" for sym, d in proxies_eod_unsettled),
+        )
+        proxies_lagging = [p_ for p_ in proxies_lagging if p_ not in proxies_eod_unsettled]
     if proxies_lagging:
         raise UniverseFreshnessViolation(
             f"Universe-freshness scan: {len(proxies_lagging)} DECLARED benchmark "
@@ -1252,6 +1281,9 @@ def _scan_universe_and_emit_freshness_receipt(
         "declared_proxies_scanned": len(proxy_ages),
         "declared_proxies_missing": proxies_absent,
         "declared_proxies_lagging": [],
+        "declared_proxies_eod_unsettled": [
+            {"symbol": sym, "last_date": d} for sym, d in proxies_eod_unsettled
+        ],
         "stalest_symbol": stalest[0],
         "stalest_last_date": stalest[1],
         "stalest_age_trading_days": stalest[2],
@@ -3474,10 +3506,23 @@ def _daily_append_impl(
         # run_date=date_str also drives the strict run_date-exact
         # feature_store/_universe_close_freshness.json sentinel
         # (config#3237) eod-precondition-probe reads.
+        # alpha-engine-config-I13143: a declared proxy whose row THIS EOD run
+        # blocked for intrabar_inconsistent alone is the expected unsettled
+        # artifact the carve-out above already accepts for every stock.
+        _blocked_types_by_ticker: dict[str, set[str]] = {}
+        for _tkr, _atype in quality_blocked_details:
+            _blocked_types_by_ticker.setdefault(_tkr.lstrip("^"), set()).add(_atype)
+        eod_unsettled_proxies = frozenset(
+            _tkr for _tkr, _types in _blocked_types_by_ticker.items()
+            if skip_if_exists
+            and _types == {ANOMALY_INTRABAR_INCONSISTENT}
+            and _tkr in UNIVERSE_BENCHMARK_PROXIES
+        )
         receipt = _scan_universe_and_emit_freshness_receipt(
             s3, bucket, universe_lib,
             expected_tickers=expected_tickers,
             run_date=date_str,
+            eod_unsettled_proxies=eod_unsettled_proxies,
         )
         result["universe_freshness_receipt"] = {
             "n_symbols_checked": receipt["n_symbols_checked"],
