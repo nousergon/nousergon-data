@@ -318,3 +318,59 @@ def test_freshness_scan_passes_and_reports_coverage_when_all_proxies_present():
     assert receipt["declared_proxies_present"] == len(UNIVERSE_BENCHMARK_PROXIES)
     assert receipt["declared_proxies_scanned"] == len(UNIVERSE_BENCHMARK_PROXIES)
     assert receipt["declared_proxies_missing"] == []
+
+
+# ── D. EOD unsettled-bar carve-out (alpha-engine-config-I13143) ─────────────
+
+
+def _scan_with_lag(lag_date, eod_unsettled):
+    from builders import daily_append as da
+
+    dates = {s: "2026-11-04" for s in sorted(UNIVERSE_BENCHMARK_PROXIES) + ["AAPL", "MSFT"]}
+    dates["XLF"] = lag_date
+    return da._scan_universe_and_emit_freshness_receipt(
+        MagicMock(), "alpha-engine-research", _stub_universe_lib_dates(dates),
+        max_stale_trading_days=99,
+        eod_unsettled_proxies=frozenset(eod_unsettled),
+    )
+
+
+def test_eod_unsettled_proxy_one_session_behind_passes_and_is_recorded():
+    """THE 2026-11-04 production state: the EOD quality gate blocked XLF's
+    session row (Close=59.2000 above High=59.1950), so XLF ended on 11-03 while
+    the universe head was 11-04, and the scan failed the whole EOD collection."""
+    receipt = _scan_with_lag("2026-11-03", {"XLF"})
+    assert receipt["declared_proxies_lagging"] == []
+    assert receipt["declared_proxies_eod_unsettled"] == [
+        {"symbol": "XLF", "last_date": "2026-11-03"},
+    ]
+
+
+def test_eod_unsettled_proxy_two_sessions_behind_still_raises():
+    from builders.daily_append import UniverseFreshnessViolation
+
+    with pytest.raises(UniverseFreshnessViolation) as exc:
+        _scan_with_lag("2026-11-02", {"XLF"})
+    assert "XLF(last=2026-11-02)" in str(exc.value)
+
+
+def test_lagging_proxy_not_blocked_this_run_still_raises():
+    from builders.daily_append import UniverseFreshnessViolation
+
+    with pytest.raises(UniverseFreshnessViolation) as exc:
+        _scan_with_lag("2026-11-03", {"XLK"})
+    assert "XLF(last=2026-11-03)" in str(exc.value)
+
+
+def test_caller_passes_only_intrabar_only_blocks_on_the_eod_path():
+    """The call site derives the exempt set from THIS run's blocks: EOD path
+    (skip_if_exists) only, declared proxies only, intrabar_inconsistent alone."""
+    import inspect
+
+    from builders import daily_append as da
+
+    src = inspect.getsource(da._daily_append_impl)
+    assert "eod_unsettled_proxies=eod_unsettled_proxies" in src
+    assert "if skip_if_exists" in src
+    assert "_types == {ANOMALY_INTRABAR_INCONSISTENT}" in src
+    assert "_tkr in UNIVERSE_BENCHMARK_PROXIES" in src
