@@ -237,3 +237,25 @@ def test_repo_mode_reports_unregistered_surfaces_in_the_other_repo(tmp_path):
         "requirements-numpy-1.txt",
     }, got
 
+
+
+@pytest.mark.parametrize("spec", ["==26.0.2", ">=28,<29", "~=27.1", ">26.5,<26.6"])
+def test_a_narrow_spec_admitting_26_or_later_is_seen(spec):
+    # codex c66464c8ae44aa09: none of the fixed probes sat inside these.
+    assert c.admits_from(SpecifierSet(spec), "26")
+
+
+def test_a_narrow_spec_below_the_major_still_does_not_admit():
+    assert not c.admits_from(SpecifierSet("==25.0.2"), "26")
+    assert not c.admits_from(SpecifierSet(">=17,<26"), "26")
+
+
+@pytest.mark.parametrize("line", ["pip install 'numpy==1.26.4'", "pip install numpy~=1.26.0",
+                                  "python -m pip install 'numpy>=1.24,<1.27'"])
+def test_an_exact_numpy_1_pin_forces_numpy_below_2(line):
+    # codex 190311c09401d4d6: only the literal 'numpy<2' was recognised.
+    assert c.forces_numpy_below_2(line)
+
+
+def test_a_numpy_spec_admitting_2_does_not_force_below_2():
+    assert not c.forces_numpy_below_2("pip install 'numpy>=1.24'")

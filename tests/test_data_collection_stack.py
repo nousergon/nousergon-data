@@ -987,3 +987,23 @@ def test_lint_holds_rules_to_the_schedule_contract(stack, monkeypatch):
     assert stack.rule_pause_problems(
         [{"name": "x-rule", "declared_state": "ENABLED"}], {"not_paused": {}}
     ) == ["rule x-rule: declared ENABLED but not in automation_pause.json not_paused"]
+
+
+def test_check_live_reads_the_resolved_targets_region(stack, monkeypatch):
+    # codex 7b153118c1d38fac: the clients took no region, so check-live measured
+    # the caller's default region instead of the target's.
+    import sys
+    import types
+
+    seen: dict[str, dict] = {}
+
+    def client(name, **kw):
+        seen[name] = kw
+        return _S3()  # live_findings then fails on it; measured=false, exit 2
+
+    monkeypatch.setitem(sys.modules, "boto3", types.SimpleNamespace(client=client))
+    target = {**stack.env_target("prod"), "region": "eu-west-1"}
+    monkeypatch.setattr(stack, "env_target", lambda *a, **k: target)
+    stack.main(["check-live", "--no-publish"])
+    assert seen["cloudformation"] == {"region_name": "eu-west-1"}
+    assert seen["scheduler"] == {"region_name": "eu-west-1"}
