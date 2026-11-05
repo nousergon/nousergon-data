@@ -40,7 +40,20 @@
 #                 equal `pyarrow_ignore`; with `group`, pyarrow and numpy must
 #                 sit in that dedicated group so a held bump holds nothing else.
 #
-# `repo` omitted means this repository.
+# Libraries ([libraries.<name>]) are installed INTO several venvs that declare
+# different specs, so they cannot equal any one of them. A library declares
+# its own `pyarrow` and `numpy` ranges plus the `consumers` (venvs) it is
+# installed into, and the rule is COMPATIBILITY: its pyarrow range must contain
+# every consumer's (narrower or disjoint fails), and its numpy range must admit
+# NumPy 1.26.4 for a consumer forcing numpy<2 and every NumPy 2.x otherwise.
+# Its surfaces:
+#   library       its pyproject: every pyarrow/numpy spec must equal the
+#                 library's declared range.
+#   lock          its own dev/CI lock: the pyarrow pin must lie in the library
+#                 range, and a pin >= the threshold must not sit beside NumPy 1.
+#   dependabot    as above.
+#
+# `repo` omitted means this repository (for a library surface: the library's repo).
 #
 # Other repos check THEIR registered surfaces on their own pull requests with
 #   python3 scripts/check_pyarrow_numpy_constraint.py --repo <repo> --root <checkout>
@@ -265,7 +278,7 @@ pyarrow_ignore = []
 
 # ---------------------------------------------------------------------------
 [venvs.executor]
-about = "crucible-executor: the executor's deployed venv, pip-compiled from requirements.in. Its pyproject.toml (pyarrow>=25.0.1, numpy<3) is not registered yet: it disagrees with requirements.in and is tracked on alpha-engine-config-I13002."
+about = "crucible-executor: the executor's deployed venv, pip-compiled from requirements.in, plus pyproject.toml (the `pip install -e .` dev/test install, held in lockstep with requirements.in by that repo's tests/test_requirements_lockstep.py)."
 pyarrow = "~=25.0"
 numpy_below_2 = false
 
@@ -278,6 +291,11 @@ kind = "requirements"
 repo = "crucible-executor"
 path = "requirements.txt"
 kind = "lock"
+
+[[venvs.executor.surfaces]]
+repo = "crucible-executor"
+path = "pyproject.toml"
+kind = "requirements"
 
 # ---------------------------------------------------------------------------
 [venvs.aec-ci-tools]
@@ -297,6 +315,29 @@ kind = "bootstrap"
 
 [[venvs.aec-ci-tools.surfaces]]
 repo = "alpha-engine-config"
+path = ".github/dependabot.yml"
+kind = "dependabot"
+pyarrow_ignore = []
+
+# ===========================================================================
+# Libraries: compatible with every consumer, never equal to one of them.
+
+[libraries.nousergon-lib]
+about = "nousergon-lib, installed from git into every crucible/data venv below. Its pyarrow/numpy live in optional extras ([quant*], [rag], parquet extras). The dashboard venv forces numpy<2 while data needs pyarrow >= 26, so a numpy>=2 floor or a pyarrow>=26 floor here would make one consumer uninstallable."
+repo = "nousergon-lib"
+pyarrow = ">=14.0"
+numpy = ">=1.24"
+consumers = ["data", "data-trading", "daily-news", "dashboard", "research", "crucible", "predictor", "backtester", "executor"]
+
+[[libraries.nousergon-lib.surfaces]]
+path = "pyproject.toml"
+kind = "library"
+
+[[libraries.nousergon-lib.surfaces]]
+path = "uv.lock"
+kind = "lock"
+
+[[libraries.nousergon-lib.surfaces]]
 path = ".github/dependabot.yml"
 kind = "dependabot"
 pyarrow_ignore = []

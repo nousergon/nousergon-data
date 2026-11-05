@@ -84,6 +84,12 @@ behind the max-drawdown figure. Definitions travel in ``definitions.risk``.
 The block inherits the window's estimate reasons; turnover stays null until a
 trade-level input is read.
 
+Growth (alpha-engine-config-I12798): ``growth_pct`` holds, per series
+(``portfolio``, ``spy``, ``qqq``, ``oneq``, ``iwm``), the cumulative return at
+every NAV row since inception, chained over exactly the inception window's
+intervals, so its last point is that window's cell; ``growth_reasons`` carries
+each series' estimate reasons. The console overlays them as lines.
+
 Determinism: the same inputs and ``now`` give the same bytes. The CLI logs
 counts, dates and keys only, never a value (this repository and its run logs
 are public).
@@ -97,8 +103,10 @@ import io
 import json
 import logging
 import math
+import statistics
 import sys
 from collections.abc import Iterable, Mapping, Sequence
+import dataclasses
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from itertools import pairwise
@@ -222,6 +230,11 @@ DEFINITIONS = {
     "published yet (no trade-level input).",
     "underwater_pct": "since inception, each NAV row's flow-adjusted wealth index as % below "
     "its running peak (0 at a new high)",
+    "growth_pct": "since inception, the cumulative return at each NAV row in %: portfolio "
+    "(time-weighted, flow-adjusted) and each benchmark's total return, chained over the same "
+    "intervals as the inception window; 0 at the first row; an interval that could not be "
+    "measured makes that series null from there on. growth_reasons names each series' "
+    "estimate reasons (the inception window's)",
     "status": "ok | insufficient_history | estimated (a missing or non-authoritative input; "
     "reasons name it)",
 }
@@ -279,6 +292,10 @@ def parse_nav_csv(text: str) -> list[NavRow]:
     if missing:
         raise PerfInputError(f"{NAV_KEY} lacks column(s) {sorted(missing)}")
     by_day: dict[date, NavRow] = {}
+    # Ex-dividends on rows dropped for want of a NAV: the next surviving row's
+    # interval spans that day, so its total return must carry them
+    # (codex f454f5ba2e5f7f52; $500 -> $5 div -> $495 read -1%, not 0%).
+    dropped_divs: dict[date, tuple[float, float]] = {}
     for raw in reader:
         try:
             day = date.fromisoformat((raw.get("date") or "").strip()[:10])
@@ -286,6 +303,10 @@ def parse_nav_csv(text: str) -> list[NavRow]:
             continue
         nav = _float_or_none(raw.get("portfolio_nav"))
         if nav is None or nav <= 0:
+            dropped_divs[day] = (
+                _float_or_none(raw.get("spy_dividend_per_share")) or 0.0,
+                _float_or_none(raw.get("qqq_dividend_per_share")) or 0.0,
+            )
             continue
         spy = _float_or_none(raw.get("spy_close"))
         qqq = _float_or_none(raw.get("qqq_close"))
@@ -301,11 +322,27 @@ def parse_nav_csv(text: str) -> list[NavRow]:
         )
     if not by_day:
         raise PerfInputError(f"{NAV_KEY} has no row with a positive NAV")
-    return [by_day[d] for d in sorted(by_day)]
+    kept = sorted(by_day)
+    for day, (spy_div, qqq_div) in dropped_divs.items():
+        if day in by_day or not (spy_div or qqq_div):
+            continue
+        nxt = next((d for d in kept if d > day), None)
+        if nxt is None or day < kept[0]:
+            continue  # before the first or after the last surviving row: no interval
+        row = by_day[nxt]
+        by_day[nxt] = dataclasses.replace(
+            row, spy_dividend=row.spy_dividend + spy_div, qqq_dividend=row.qqq_dividend + qqq_div,
+        )
+    return [by_day[d] for d in kept]
 
 
 def parse_close_history(doc: Mapping[str, Any]) -> dict[date, float]:
-    """``close_history`` JSON (``closes: [[YYYY-MM-DD, close], ...]``)."""
+    """``close_history`` JSON (``closes: [[YYYY-MM-DD, close], ...]``).
+
+    Raises :class:`PerfInputError` when the document is not that shape at all
+    (not an object, or ``closes`` not a list); a bad row is skipped."""
+    if not isinstance(doc, Mapping) or not isinstance(doc.get("closes") or [], list):
+        raise PerfInputError(f"close_history is not {{closes: [...]}}: {type(doc).__name__}")
     out: dict[date, float] = {}
     for pair in doc.get("closes") or ():
         try:
@@ -323,6 +360,8 @@ def parse_personal_returns(doc: Mapping[str, Any]) -> list[PersonalRow]:
 
     Raises :class:`PerfInputError` on a schema it does not know (the caller
     treats the series as unavailable, never as zero)."""
+    if not isinstance(doc, Mapping) or not isinstance(doc.get("returns") or [], list):
+        raise PerfInputError(f"{PERSONAL_KEY} is not an object with a returns list")
     if doc.get("schema_version") != PERSONAL_SCHEMA_VERSION:
         raise PerfInputError(f"{PERSONAL_KEY} schema {doc.get('schema_version')!r}")
     out: dict[date, PersonalRow] = {}
@@ -499,11 +538,14 @@ def _mean(xs: Sequence[float]) -> float:
 
 
 def _stdev(xs: Sequence[float]) -> float | None:
-    """Sample standard deviation; None under two observations."""
+    """Sample standard deviation; None under two observations.
+
+    ``statistics.stdev`` sums exactly, so a constant series is exactly 0 (and
+    its ratio null) rather than a rounding residue like 1.7e-18 that divided
+    into a ~1e16 Sharpe (codex 885d390ad694c9c1)."""
     if len(xs) < 2:
         return None
-    m = _mean(xs)
-    return math.sqrt(sum((x - m) ** 2 for x in xs) / (len(xs) - 1))
+    return statistics.stdev(xs)
 
 
 def _ratio(num: float, den: float | None) -> float | None:
@@ -594,6 +636,23 @@ class _Leg:
     value: float | None
     reasons: tuple[str, ...]
     daily: tuple[float, ...]
+    #: One growth factor per interval of the window, aligned with its NAV
+    #: rows; ``None`` where the interval could not be measured.
+    factors: tuple[float | None, ...] = ()
+
+
+def _growth(days: Sequence[date], factors: Sequence[float | None]) -> dict[str, float | None]:
+    """The cumulative return at each NAV row since the first, in percent.
+
+    ``days`` has one more entry than ``factors`` (the base row reads 0). An
+    unmeasured interval makes every later point ``None``: a chain with a hole
+    in it is not a return, and the gap is never bridged."""
+    out: dict[str, float | None] = {days[0].isoformat(): 0.0} if days else {}
+    total: float | None = 1.0
+    for day, f in zip(days[1:], factors, strict=True):
+        total = None if total is None or f is None else total * f
+        out[day.isoformat()] = None if total is None else _pct(total - 1.0)
+    return out
 
 
 def _chain(factors: Iterable[float | None]) -> float | None:
@@ -698,10 +757,10 @@ def build(
                     if not exact
                 )
         return (
-            _Leg(_chain(p_f), tuple(p_reasons), tuple(f - 1.0 for f in p_f)),
+            _Leg(_chain(p_f), tuple(p_reasons), tuple(f - 1.0 for f in p_f), tuple(p_f)),
             _Leg(_chain(s_f), tuple(dict.fromkeys(s_reasons)),
-                 tuple(f - 1.0 for f in s_f if f is not None)),
-            _Leg(_chain(q_f), tuple(dict.fromkeys(q_reasons)), ()),
+                 tuple(f - 1.0 for f in s_f if f is not None), tuple(s_f)),
+            _Leg(_chain(q_f), tuple(dict.fromkeys(q_reasons)), (), tuple(q_f)),
         )
 
     def history_leg(sym: str, base: date, end: date) -> _Leg:
@@ -723,13 +782,15 @@ def build(
                 for r, exact in ((prev, a_exact), (cur, b_exact))
                 if not exact
             )
-        return _Leg(_chain(factors), tuple(dict.fromkeys(reasons)), ())
+        return _Leg(_chain(factors), tuple(dict.fromkeys(reasons)), (), tuple(factors))
 
     def status(value: float | None, reasons: Sequence[str]) -> str:
         return STATUS_ESTIMATED if reasons or value is None else STATUS_OK
 
     windows_out = []
     underwater: dict[str, float | None] = {}
+    growth: dict[str, dict[str, float | None]] = {}
+    growth_reasons: dict[str, list[str]] = {}
     counts = dict.fromkeys(STATUSES, 0)
     for wid, label in WINDOWS:
         base, end, partial, insufficient = window_bounds(wid, days)
@@ -770,7 +831,8 @@ def build(
             }
 
         vs_spy, vs_qqq = versus(spy), versus(qqq)
-        vs_extra = {cell: versus(history_leg(sym, base, end)) for cell, sym, _ in CLOSE_HISTORY_BENCHMARKS}
+        extra_legs = {sym: history_leg(sym, base, end) for _, sym, _ in CLOSE_HISTORY_BENCHMARKS}
+        vs_extra = {cell: versus(extra_legs[sym]) for cell, sym, _ in CLOSE_HISTORY_BENCHMARKS}
         p_value, p_reasons = personal_leg(personal, base, end)
         vs_personal = versus(_Leg(p_value, p_reasons, ()))
         beta = _beta(port.daily, spy.daily) if len(spy.daily) == len(port.daily) else None
@@ -817,6 +879,23 @@ def build(
             underwater[rows[lo].day.isoformat()] = 0.0
             for i, dd in enumerate(_drawdowns(port.daily), start=lo + 1):
                 underwater[rows[i].day.isoformat()] = _pct(dd)
+            # Growth since inception, Crucible beside each index, over the
+            # same intervals the inception cells chain (alpha-engine-config-
+            # I12798): the console overlays them as lines. Each series keeps
+            # its leg's reasons, so an estimated line says so.
+            span = days[lo:hi + 1]
+            legs_by_series = {"portfolio": port, "spy": spy, "qqq": qqq,
+                              **{sym.lower(): extra_legs[sym] for _, sym, _ in CLOSE_HISTORY_BENCHMARKS}}
+            growth = {
+                # An unreadable index has no factors at all: every point is
+                # null, never a flat zero line.
+                name: (_growth(span, leg.factors) if len(leg.factors) == len(span) - 1
+                       else dict.fromkeys((d.isoformat() for d in span), None))
+                for name, leg in legs_by_series.items()
+            }
+            growth_reasons = {
+                name: list(dict.fromkeys(leg.reasons)) for name, leg in legs_by_series.items()
+            }
 
     inception, last = days[0], days[-1]
     return {
@@ -862,6 +941,8 @@ def build(
         },
         "windows": windows_out,
         "underwater_pct": underwater,
+        "growth_pct": growth,
+        "growth_reasons": growth_reasons,
         "status_counts": counts,
     }
 
@@ -901,7 +982,13 @@ def _optional_inputs(s3: Any, bucket: str) -> tuple[dict[str, dict[date, float] 
     extra: dict[str, dict[date, float] | None] = {}
     for _, sym, _ in CLOSE_HISTORY_BENCHMARKS:
         doc = _get_optional_json(s3, bucket, CLOSE_HISTORY_KEY.format(symbol=sym))
-        extra[sym] = parse_close_history(doc) if doc is not None else None
+        extra[sym] = None
+        if doc is not None:
+            # An optional input never aborts the publish (codex 385d8cccc8e6d68a).
+            try:
+                extra[sym] = parse_close_history(doc)
+            except PerfInputError as e:
+                logger.warning("optional input %s unusable: %s", CLOSE_HISTORY_KEY.format(symbol=sym), e)
     personal: list[PersonalRow] | None = None
     doc = _get_optional_json(s3, bucket, PERSONAL_KEY)
     if doc is not None:

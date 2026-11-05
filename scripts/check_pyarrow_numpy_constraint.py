@@ -39,6 +39,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
+from packaging.version import InvalidVersion, Version
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CONSTRAINT_FILE = REPO_ROOT / "constraints" / "pyarrow-numpy.toml"
@@ -46,6 +47,11 @@ THIS_REPO = "nousergon-data"
 ORG = "nousergon"
 
 KINDS = ("requirements", "lock", "bootstrap", "dependabot")
+#: Surface kinds a ``[libraries.*]`` entry may register.
+LIBRARY_KINDS = ("library", "lock", "dependabot")
+#: The final NumPy 1.x release: what a venv's forced ``numpy<2`` resolves to.
+NUMPY_1_FINAL = "1.26.4"
+NUMPY_2_PROBES = ("2.0.0", "2.4.6", "2.5.4", "2.99.0")
 #: Dependabot ecosystems that bump Python requirements.
 _PY_ECOSYSTEMS = ("pip", "uv")
 
@@ -59,11 +65,13 @@ _PYPROJECT_ITEM = re.compile(
 _LOCK_LINE = re.compile(r"^\s*pyarrow\s*==\s*([0-9][^\s;#\\]*)", re.IGNORECASE)
 #: A uv.lock package table: ``name = "pyarrow"`` followed by its ``version = "X"``.
 _UV_LOCK_PKG = re.compile(r'^name\s*=\s*"pyarrow"\s*\nversion\s*=\s*"([^"]+)"', re.IGNORECASE | re.MULTILINE)
+_UV_LOCK_NUMPY = re.compile(r'^name\s*=\s*"numpy"\s*\nversion\s*=\s*"([^"]+)"', re.IGNORECASE | re.MULTILINE)
 #: A non-comment line that pip-installs numpy with an upper bound of 2.
 _NUMPY_BELOW_2 = re.compile(r"numpy\s*<\s*2(?![0-9.])")
 #: A non-comment line that pip-installs numpy or pyarrow by name.
 #: A pyarrow requirement written inline on a pip-install line: ``pip install 'pyarrow>=17'``.
 _INLINE_PYARROW = re.compile(r"""(?<![\w.-])pyarrow(?:\[[^\]]*\])?\s*((?:[<>=!~]=?\s*[0-9][^\s'",;]*\s*,?\s*)+)""", re.IGNORECASE)
+_INLINE_NUMPY = re.compile(r"""(?<![\w.-])numpy(?:\[[^\]]*\])?\s*((?:[<>=!~]=?\s*[0-9][^\s'",;]*\s*,?\s*)+)""", re.IGNORECASE)
 _PY_DEPENDABOT = re.compile(r"package-ecosystem:\s*[\"']?(?:pip|uv)\b")
 _PIP_INSTALL_PAIR = re.compile(r"\binstall\b.*\b(numpy|pyarrow)\b", re.IGNORECASE)
 
@@ -76,10 +84,12 @@ class Surface:
     kind: str
     pyarrow_ignore: tuple[str, ...] | None = None
     group: str | None = None
+    library: str | None = None
 
     @property
     def label(self) -> str:
-        return f"{self.repo}:{self.path} [{self.kind}, venv {self.venv}]"
+        owner = f"library {self.library}" if self.library else f"venv {self.venv}"
+        return f"{self.repo}:{self.path} [{self.kind}, {owner}]"
 
 
 @dataclass(frozen=True)
@@ -111,14 +121,187 @@ def load(path: Path = CONSTRAINT_FILE) -> tuple[str, dict[str, Venv], list[Surfa
     return threshold, venvs, surfaces
 
 
+@dataclass(frozen=True)
+class Library:
+    """A library installed INTO several venvs (``[libraries.<name>]``).
+
+    It cannot equal one venv's spec, because its consumers declare different
+    ones (the ``dashboard`` venv forces ``numpy<2``; ``data`` needs pyarrow
+    >= 26). So its rule is compatibility: its declared range must CONTAIN each
+    consuming venv's, so installing it never narrows, or breaks, a venv.
+    """
+
+    name: str
+    repo: str
+    pyarrow: SpecifierSet
+    numpy: SpecifierSet
+    consumers: tuple[str, ...]
+
+
+def load_libraries(path: Path = CONSTRAINT_FILE) -> tuple[dict[str, Library], list[Surface]]:
+    data = tomllib.loads(path.read_text())
+    libs: dict[str, Library] = {}
+    surfaces: list[Surface] = []
+    for name, body in data.get("libraries", {}).items():
+        repo = body.get("repo", THIS_REPO)
+        libs[name] = Library(
+            name, repo, SpecifierSet(body["pyarrow"]), SpecifierSet(body["numpy"]), tuple(body["consumers"])
+        )
+        for s in body.get("surfaces", []):
+            ignore = s.get("pyarrow_ignore")
+            surfaces.append(
+                Surface(
+                    venv=f"library {name}",
+                    repo=s.get("repo", repo),
+                    path=s["path"],
+                    kind=s["kind"],
+                    pyarrow_ignore=None if ignore is None else tuple(ignore),
+                    group=s.get("group"),
+                    library=name,
+                )
+            )
+    return libs, surfaces
+
+
+def _grid(*specs: SpecifierSet) -> list[str]:
+    """Probe versions around every bound the specs name, plus a coarse major grid."""
+    out = {f"{m}.0.0" for m in range(41)} | {"999.0.0"}
+    for spec in specs:
+        for s in spec:
+            try:
+                v = Version(s.version.removesuffix(".*"))
+            except InvalidVersion:
+                continue
+            ma, mi, pa = (*v.release, 0, 0)[:3]
+            out |= {f"{ma}.{mi}.{pa}", f"{ma}.{mi}.{pa + 1}", f"{ma}.{mi + 1}.0", f"{ma + 1}.0.0"}
+            if pa:
+                out.add(f"{ma}.{mi}.{pa - 1}")
+            if mi:
+                out.add(f"{ma}.{mi - 1}.99")
+            if ma:
+                out |= {f"{ma - 1}.0.0", f"{ma - 1}.99.0"}
+    return sorted(out, key=Version)
+
+
+def relation(library: SpecifierSet, venv: SpecifierSet) -> str:
+    """``contains`` when every release ``venv`` admits, ``library`` admits too;
+    ``narrow`` when they overlap but the library excludes part of the venv's
+    range; ``disjoint`` when the library admits nothing the venv does."""
+    inside = [p for p in _grid(library, venv) if venv.contains(p)]
+    hits = [p for p in inside if library.contains(p)]
+    if len(hits) == len(inside):
+        return "contains"
+    return "narrow" if hits else "disjoint"
+
+
+def check_library_rule(lib: Library, venvs: dict[str, Venv]) -> list[str]:
+    """The compatibility rule: the library's declared pyarrow range must contain
+    each consumer's, and its numpy range must admit the NumPy line each consumer
+    resolves (the final 1.x under a forced ``numpy<2``, every 2.x otherwise)."""
+    where = f"library {lib.name}"
+    out: list[str] = []
+    if not lib.consumers:
+        out.append(f"{where}: names no consuming venv")
+    for name in lib.consumers:
+        venv = venvs.get(name)
+        if venv is None:
+            out.append(f"{where}: consumer {name!r} is not a declared venv")
+            continue
+        rel = relation(lib.pyarrow, venv.pyarrow)
+        if rel == "disjoint":
+            out.append(
+                f"{where}: pyarrow{lib.pyarrow} is DISJOINT from consumer venv {name}'s "
+                f"pyarrow{venv.pyarrow}; that venv cannot install it"
+            )
+        elif rel == "narrow":
+            out.append(
+                f"{where}: pyarrow{lib.pyarrow} is narrower than consumer venv {name}'s "
+                f"pyarrow{venv.pyarrow}; a library must admit every release its consumers do"
+            )
+        if venv.numpy_below_2:
+            if not lib.numpy.contains(NUMPY_1_FINAL):
+                kind = "excludes every NumPy 1.x" if not admits_numpy_1(lib.numpy) else "is too narrow"
+                out.append(
+                    f"{where}: numpy{lib.numpy} {kind}, but consumer venv {name} forces numpy<2 "
+                    f"(resolves {NUMPY_1_FINAL})"
+                )
+        else:
+            missing = [v for v in NUMPY_2_PROBES if not lib.numpy.contains(v)]
+            if missing:
+                kind = "excludes NumPy 2" if len(missing) == len(NUMPY_2_PROBES) else "is too narrow"
+                out.append(
+                    f"{where}: numpy{lib.numpy} {kind} (refuses {', '.join(missing)}), but consumer "
+                    f"venv {name} resolves NumPy 2"
+                )
+    return out
+
+
+def check_library_surface(surface: Surface, text: str, lib: Library, threshold: str) -> list[str]:
+    """A library's own files carry its declared ranges exactly, as a venv's do."""
+    where = surface.label
+    out: list[str] = []
+    if surface.kind == "library":
+        specs = requirement_specs(surface.path, text)
+        if not specs["pyarrow"]:
+            out.append(f"{where}: declares no pyarrow; the library's pyarrow{lib.pyarrow} must be declared here")
+        for dep, want in (("pyarrow", lib.pyarrow), ("numpy", lib.numpy)):
+            for raw in specs[dep]:
+                try:
+                    ok = SpecifierSet(raw) == want
+                except InvalidSpecifier:
+                    out.append(f"{where}: unparseable {dep} spec {raw!r}")
+                    continue
+                if not ok:
+                    out.append(
+                        f"{where}: {dep}{raw or ' (unbounded)'} disagrees with the declared library "
+                        f"{dep}{want} (constraints/pyarrow-numpy.toml)"
+                    )
+    elif surface.kind == "lock":
+        pins = lock_pins(surface.path, text)
+        if len(pins) != 1:
+            out.append(f"{where}: expected exactly one `pyarrow==` pin, found {len(pins)}")
+        for pin in pins:
+            if not lib.pyarrow.contains(pin):
+                out.append(f"{where}: locks pyarrow=={pin}, outside the declared library pyarrow{lib.pyarrow}")
+            elif Version(pin).major >= int(threshold):
+                for np_pin in _UV_LOCK_NUMPY.findall(text):
+                    if Version(np_pin).major < 2:
+                        out.append(f"{where}: locks pyarrow=={pin} beside numpy=={np_pin}, which it refuses to import under")
+    elif surface.kind == "dependabot":
+        out.extend(_check_dependabot(surface, text))
+    else:
+        out.append(f"{where}: unknown library kind {surface.kind!r}; expected one of {LIBRARY_KINDS}")
+    return out
+
+
 def _probes(major: str) -> list[str]:
     n = int(major)
     return [f"{n}.0.0", f"{n}.0.1", f"{n}.1.0", f"{n + 1}.0.0", f"{n + 4}.0.0", "999.0.0"]
 
 
+def _spec_probes(spec: SpecifierSet) -> list[str]:
+    """Versions the spec itself names, and one just past each: a narrow spec
+    (``==26.0.2``, ``>=28,<29``) contains none of the fixed probes
+    (codex c66464c8ae44aa09)."""
+    out: list[str] = []
+    for item in spec:
+        v = item.version.replace(".*", ".0")
+        out += [v, f"{v}.1"]
+    return out
+
+
 def admits_from(spec: SpecifierSet, major: str) -> bool:
     """True when ``spec`` admits some release at or above ``major``."""
-    return any(spec.contains(v) for v in _probes(major))
+    floor = Version(f"{int(major)}.0.0")
+    candidates = _probes(major) + _spec_probes(spec)
+    return any(_at_least(v, floor) and spec.contains(v) for v in candidates)
+
+
+def _at_least(v: str, floor: Version) -> bool:
+    try:
+        return Version(v) >= floor
+    except InvalidVersion:
+        return False
 
 
 def admits_numpy_1(spec: SpecifierSet) -> bool:
@@ -166,10 +349,21 @@ def inline_pyarrow_specs(text: str) -> list[str]:
 
 
 def forces_numpy_below_2(text: str) -> bool:
-    return any(
-        "install" in ln and "pip" in ln.lower() and _NUMPY_BELOW_2.search(ln)
-        for ln in _code_lines(text)
-    )
+    """A pip-install line whose numpy spec admits no 2.x: ``numpy<2``, and
+    also an exact 1.x pin such as ``numpy==1.26.4`` (codex 190311c09401d4d6)."""
+    for ln in _code_lines(text):
+        if not ("install" in ln and "pip" in ln.lower()):
+            continue
+        if _NUMPY_BELOW_2.search(ln):
+            return True
+        for m in _INLINE_NUMPY.finditer(ln):
+            try:
+                spec = SpecifierSet(m.group(1).strip().rstrip(",").replace(" ", ""))
+            except InvalidSpecifier:
+                continue
+            if not any(spec.contains(v) for v in ("2.0.0", "2.1.0", "2.99.0", "3.0.0")):
+                return True
+    return False
 
 
 def check_surface(surface: Surface, text: str, venv: Venv, threshold: str) -> list[str]:
@@ -323,11 +517,14 @@ def run(
     local checkout at ``root`` -- a consuming repo's pull-request head.
     """
     threshold, venvs, surfaces = load(constraint_file)
+    libs, lib_surfaces = load_libraries(constraint_file)
     findings: list[str] = []
     for venv in venvs.values():
         findings.extend(check_venv_rule(venv, threshold))
-    for s in surfaces:
-        if s.venv not in venvs:
+    for lib in libs.values():
+        findings.extend(check_library_rule(lib, venvs))
+    for s in surfaces + lib_surfaces:
+        if s.library is None and s.venv not in venvs:
             findings.append(f"{s.label}: unknown venv")
             continue
         if only_repo is not None:
@@ -343,7 +540,10 @@ def run(
         if text is None:
             findings.append(f"{s.label}: registered but not readable (moved or deleted? update the TOML)")
             continue
-        findings.extend(check_surface(s, text, venvs[s.venv], threshold))
+        if s.library is not None:
+            findings.extend(check_library_surface(s, text, libs[s.library], threshold))
+        else:
+            findings.extend(check_surface(s, text, venvs[s.venv], threshold))
     return findings
 
 
@@ -378,6 +578,7 @@ def unregistered_local_surfaces(
     """Files in ``repo`` (checked out at ``root``) that declare or pip-install pyarrow/numpy
     and are not in the TOML."""
     _, _, surfaces = load(constraint_file)
+    surfaces = surfaces + load_libraries(constraint_file)[1]
     registered = {s.path for s in surfaces if s.repo == repo}
     excluded_files = _EXCLUDED_FILES if repo == THIS_REPO else set()
     out: list[str] = []

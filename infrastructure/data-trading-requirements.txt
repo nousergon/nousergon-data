@@ -37,11 +37,11 @@
 #   - no exact `==` pins.
 # The entries below are copied from requirements.txt; see that file for why
 # each floor or cap is where it is.
-boto3>=1.43.123
+boto3>=1.43.124
 pandas>=2.0
 openpyxl>=3.1.5
 pyarrow>=25.0.1,<26
-yfinance>=1.7.0
+yfinance>=1.8.0
 requests>=2.34.2
 pyyaml>=6.0.3
 setuptools>=84.2.1
