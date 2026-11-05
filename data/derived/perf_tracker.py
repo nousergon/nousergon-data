@@ -100,6 +100,7 @@ import math
 import statistics
 import sys
 from collections.abc import Iterable, Mapping, Sequence
+import dataclasses
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from itertools import pairwise
@@ -280,6 +281,10 @@ def parse_nav_csv(text: str) -> list[NavRow]:
     if missing:
         raise PerfInputError(f"{NAV_KEY} lacks column(s) {sorted(missing)}")
     by_day: dict[date, NavRow] = {}
+    # Ex-dividends on rows dropped for want of a NAV: the next surviving row's
+    # interval spans that day, so its total return must carry them
+    # (codex f454f5ba2e5f7f52; $500 -> $5 div -> $495 read -1%, not 0%).
+    dropped_divs: dict[date, tuple[float, float]] = {}
     for raw in reader:
         try:
             day = date.fromisoformat((raw.get("date") or "").strip()[:10])
@@ -287,6 +292,10 @@ def parse_nav_csv(text: str) -> list[NavRow]:
             continue
         nav = _float_or_none(raw.get("portfolio_nav"))
         if nav is None or nav <= 0:
+            dropped_divs[day] = (
+                _float_or_none(raw.get("spy_dividend_per_share")) or 0.0,
+                _float_or_none(raw.get("qqq_dividend_per_share")) or 0.0,
+            )
             continue
         spy = _float_or_none(raw.get("spy_close"))
         qqq = _float_or_none(raw.get("qqq_close"))
@@ -302,7 +311,18 @@ def parse_nav_csv(text: str) -> list[NavRow]:
         )
     if not by_day:
         raise PerfInputError(f"{NAV_KEY} has no row with a positive NAV")
-    return [by_day[d] for d in sorted(by_day)]
+    kept = sorted(by_day)
+    for day, (spy_div, qqq_div) in dropped_divs.items():
+        if day in by_day or not (spy_div or qqq_div):
+            continue
+        nxt = next((d for d in kept if d > day), None)
+        if nxt is None or day < kept[0]:
+            continue  # before the first or after the last surviving row: no interval
+        row = by_day[nxt]
+        by_day[nxt] = dataclasses.replace(
+            row, spy_dividend=row.spy_dividend + spy_div, qqq_dividend=row.qqq_dividend + qqq_div,
+        )
+    return [by_day[d] for d in kept]
 
 
 def parse_close_history(doc: Mapping[str, Any]) -> dict[date, float]:
