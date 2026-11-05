@@ -759,3 +759,61 @@ def test_a_dividend_on_a_day_with_no_nav_carries_to_the_next_row():
     last = rows[-1]
     assert last.qqq_dividend == 5.0
     assert (last.qqq_close + last.qqq_dividend) / rows[0].qqq_close == pytest.approx(1.0)
+
+
+# ── growth since inception (alpha-engine-config-I12798): the console's overlay ──
+
+
+def test_growth_series_end_on_the_inception_cells_and_start_at_zero():
+    oneq = history(SHORT, 40.0, 0.0003)
+    iwm = history(SHORT, 200.0, -0.0001)
+    doc = build_full(ledger(SHORT), extra={"ONEQ": oneq, "IWM": iwm})
+    g = doc["growth_pct"]
+    assert set(g) == {"portfolio", "spy", "qqq", "oneq", "iwm"}
+    cells = window(doc, "inception")["cells"]
+    last = SHORT[-1].isoformat()
+    for name in g:
+        assert list(g[name]) == [d.isoformat() for d in SHORT]
+        assert g[name][SHORT[0].isoformat()] == 0.0
+    assert g["portfolio"][last] == cells["absolute"]["return_pct"]
+    assert g["spy"][last] == cells["vs_spy"]["benchmark_pct"]
+    assert g["qqq"][last] == cells["vs_qqq"]["benchmark_pct"]
+    assert g["oneq"][last] == cells["vs_oneq"]["benchmark_pct"]
+    assert g["iwm"][last] == cells["vs_iwm"]["benchmark_pct"]
+    # Compounded, not summed: the tenth row of a +0.1%/day portfolio.
+    assert g["portfolio"][SHORT[10].isoformat()] == pytest.approx((1.001 ** 10 - 1) * 100, abs=1e-4)
+    assert "oneq_not_polygon_settled" in doc["growth_reasons"]["oneq"]
+    assert doc["growth_reasons"]["portfolio"] == cells["absolute"]["reasons"]
+    assert "growth_pct" in doc["definitions"]
+
+
+def test_a_deposit_is_not_growth(monkeypatch):
+    monkeypatch.setattr(pt, "FLOWS_JOURNALED_FROM", SHORT[0])
+    rows = ledger(SHORT, port_step=0.0)
+    mid = 20
+    rows = [(d, nav + (500.0 if i >= mid else 0.0), *rest) for i, (d, nav, *rest) in enumerate(rows)]
+    doc = build(rows, flows=[pt.Flow(SHORT[mid], 500.0)],
+                summary={"entries_read": 1, "transfer_entries": 1})
+    assert set(doc["growth_pct"]["portfolio"].values()) == {0.0}
+
+
+def test_an_unmeasured_interval_nulls_the_series_from_there_and_an_unreadable_one_entirely():
+    days = SHORT
+    # Ten weekdays with no QQQ close: longer than the close lookback, so the
+    # interval into days[15] cannot be measured from any close.
+    qqq = {d: v for d, v in history(days).items() if not days[5] < d <= days[15]}
+    g = build(ledger(days), qqq_hist=qqq)["growth_pct"]["qqq"]
+    assert g[days[0].isoformat()] == 0.0
+    assert all(g[d.isoformat()] is not None for d in days[:6])
+    first_hole = next(d for d in days if g[d.isoformat()] is None)
+    assert days[5] < first_hole <= days[15]
+    # Never bridged: once the chain has a hole, every later point is null.
+    assert all(g[d.isoformat()] is None for d in days if d >= first_hole)
+    doc = build_full(ledger(days), extra={"ONEQ": None})
+    assert all(v is None for v in doc["growth_pct"]["oneq"].values())
+    assert doc["growth_reasons"]["oneq"] == ["oneq_close_history_unreadable"]
+
+
+def test_growth_follows_as_of():
+    doc = build(ledger(SHORT), as_of=SHORT[9])
+    assert list(doc["growth_pct"]["portfolio"]) == [d.isoformat() for d in SHORT[:10]]
