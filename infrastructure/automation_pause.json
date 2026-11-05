@@ -281,7 +281,7 @@
       "reason": "ExecutionsSucceeded deadman on ne-preopen-trading-pipeline - one of the three pipelines the 2026-08-07 ruling explicitly KEPT. Silencing this would silence a kept pipeline."
     },
     "alpha-engine-pipeline-deadman-postclose-trading": {
-      "reason": "ExecutionsSucceeded deadman on ne-postclose-trading-pipeline - kept by the same ruling."
+      "reason": "ExecutionsSucceeded deadman on the daily post-close - kept by the same ruling. REPOINTED 2026-11-05 (alpha-engine-config-I13255; nous-ergon-ops alarm file, same name, metric, threshold and backstop topic): its dimension moves from ne-postclose-trading-pipeline to ne-postclose-reconcile-pipeline. The 2026-11-01 ruling (alpha-engine-config-I13005) made the weekday preopen skip RunDaemon, whose shutdown was the trading machine's daily trigger, so that machine now runs only when alpha-engine-eod-backstop finds no snapshot and its 7-day success count is zero by design (ALARM since 2026-11-04 21:52Z). The reconcile machine is the post-close half that still runs every trading evening (alpha-engine-eod-reconcile-trigger, in not_paused) and had no deadman of its own. Stays ARMED: it watches a live trigger."
     },
     "alpha-engine-preflight-sweep-no-run": {
       "reason": "daily run-completed floor for the preflight sweep; running."
