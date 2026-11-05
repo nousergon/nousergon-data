@@ -719,6 +719,27 @@ def _count_executions_in_window(
     )
 
 
+#: alpha-engine-config-I13257: flow-doctor >= 0.19.7 moves a sender's own
+#: ``Resolution:`` line into the Telegram footer in place of "none tracked
+#: yet". Message substring -> the tracked item that resolves it, first match
+#: wins; no match leaves the default. Only durable arcs belong here, never a
+#: one-day incident (the nightly sweep files those).
+ALERT_RESOLUTIONS = (
+    ("EOD SF has not executed", "aec#13255 (v1 post-close is backstop-only since the v2 switch; this check retires)"),
+    ("ne-weekly-freshness-pipeline SILENCE", "aec#13255 (the v1 Saturday cron is declared paused; the weekly slot gates off)"),
+    ("Saturday SF has not executed", "aec#13255 (the v1 Saturday cron is declared paused; this check gates off)"),
+)
+
+
+def _with_resolution(message: str) -> str:
+    if any(line.startswith("Resolution:") for line in message.splitlines()):
+        return message
+    for needle, resolution in ALERT_RESOLUTIONS:
+        if needle in message:
+            return f"{message}\nResolution: {resolution}"
+    return message
+
+
 def _publish_watchdog_alert(
     message: str,
     *,
@@ -735,6 +756,7 @@ def _publish_watchdog_alert(
     topic or Telegram channel. Returns a compact ``alert_detail`` string for
     the caller's ``CheckResult``.
     """
+    message = _with_resolution(message)
     result = alerts.publish(
         message=message,
         severity=severity,
