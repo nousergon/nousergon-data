@@ -97,8 +97,10 @@ import io
 import json
 import logging
 import math
+import statistics
 import sys
 from collections.abc import Iterable, Mapping, Sequence
+import dataclasses
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from itertools import pairwise
@@ -279,6 +281,10 @@ def parse_nav_csv(text: str) -> list[NavRow]:
     if missing:
         raise PerfInputError(f"{NAV_KEY} lacks column(s) {sorted(missing)}")
     by_day: dict[date, NavRow] = {}
+    # Ex-dividends on rows dropped for want of a NAV: the next surviving row's
+    # interval spans that day, so its total return must carry them
+    # (codex f454f5ba2e5f7f52; $500 -> $5 div -> $495 read -1%, not 0%).
+    dropped_divs: dict[date, tuple[float, float]] = {}
     for raw in reader:
         try:
             day = date.fromisoformat((raw.get("date") or "").strip()[:10])
@@ -286,6 +292,10 @@ def parse_nav_csv(text: str) -> list[NavRow]:
             continue
         nav = _float_or_none(raw.get("portfolio_nav"))
         if nav is None or nav <= 0:
+            dropped_divs[day] = (
+                _float_or_none(raw.get("spy_dividend_per_share")) or 0.0,
+                _float_or_none(raw.get("qqq_dividend_per_share")) or 0.0,
+            )
             continue
         spy = _float_or_none(raw.get("spy_close"))
         qqq = _float_or_none(raw.get("qqq_close"))
@@ -301,11 +311,27 @@ def parse_nav_csv(text: str) -> list[NavRow]:
         )
     if not by_day:
         raise PerfInputError(f"{NAV_KEY} has no row with a positive NAV")
-    return [by_day[d] for d in sorted(by_day)]
+    kept = sorted(by_day)
+    for day, (spy_div, qqq_div) in dropped_divs.items():
+        if day in by_day or not (spy_div or qqq_div):
+            continue
+        nxt = next((d for d in kept if d > day), None)
+        if nxt is None or day < kept[0]:
+            continue  # before the first or after the last surviving row: no interval
+        row = by_day[nxt]
+        by_day[nxt] = dataclasses.replace(
+            row, spy_dividend=row.spy_dividend + spy_div, qqq_dividend=row.qqq_dividend + qqq_div,
+        )
+    return [by_day[d] for d in kept]
 
 
 def parse_close_history(doc: Mapping[str, Any]) -> dict[date, float]:
-    """``close_history`` JSON (``closes: [[YYYY-MM-DD, close], ...]``)."""
+    """``close_history`` JSON (``closes: [[YYYY-MM-DD, close], ...]``).
+
+    Raises :class:`PerfInputError` when the document is not that shape at all
+    (not an object, or ``closes`` not a list); a bad row is skipped."""
+    if not isinstance(doc, Mapping) or not isinstance(doc.get("closes") or [], list):
+        raise PerfInputError(f"close_history is not {{closes: [...]}}: {type(doc).__name__}")
     out: dict[date, float] = {}
     for pair in doc.get("closes") or ():
         try:
@@ -323,6 +349,8 @@ def parse_personal_returns(doc: Mapping[str, Any]) -> list[PersonalRow]:
 
     Raises :class:`PerfInputError` on a schema it does not know (the caller
     treats the series as unavailable, never as zero)."""
+    if not isinstance(doc, Mapping) or not isinstance(doc.get("returns") or [], list):
+        raise PerfInputError(f"{PERSONAL_KEY} is not an object with a returns list")
     if doc.get("schema_version") != PERSONAL_SCHEMA_VERSION:
         raise PerfInputError(f"{PERSONAL_KEY} schema {doc.get('schema_version')!r}")
     out: dict[date, PersonalRow] = {}
@@ -499,11 +527,14 @@ def _mean(xs: Sequence[float]) -> float:
 
 
 def _stdev(xs: Sequence[float]) -> float | None:
-    """Sample standard deviation; None under two observations."""
+    """Sample standard deviation; None under two observations.
+
+    ``statistics.stdev`` sums exactly, so a constant series is exactly 0 (and
+    its ratio null) rather than a rounding residue like 1.7e-18 that divided
+    into a ~1e16 Sharpe (codex 885d390ad694c9c1)."""
     if len(xs) < 2:
         return None
-    m = _mean(xs)
-    return math.sqrt(sum((x - m) ** 2 for x in xs) / (len(xs) - 1))
+    return statistics.stdev(xs)
 
 
 def _ratio(num: float, den: float | None) -> float | None:
@@ -901,7 +932,13 @@ def _optional_inputs(s3: Any, bucket: str) -> tuple[dict[str, dict[date, float] 
     extra: dict[str, dict[date, float] | None] = {}
     for _, sym, _ in CLOSE_HISTORY_BENCHMARKS:
         doc = _get_optional_json(s3, bucket, CLOSE_HISTORY_KEY.format(symbol=sym))
-        extra[sym] = parse_close_history(doc) if doc is not None else None
+        extra[sym] = None
+        if doc is not None:
+            # An optional input never aborts the publish (codex 385d8cccc8e6d68a).
+            try:
+                extra[sym] = parse_close_history(doc)
+            except PerfInputError as e:
+                logger.warning("optional input %s unusable: %s", CLOSE_HISTORY_KEY.format(symbol=sym), e)
     personal: list[PersonalRow] | None = None
     doc = _get_optional_json(s3, bucket, PERSONAL_KEY)
     if doc is not None:

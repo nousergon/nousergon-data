@@ -39,6 +39,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
+from packaging.version import InvalidVersion, Version
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CONSTRAINT_FILE = REPO_ROOT / "constraints" / "pyarrow-numpy.toml"
@@ -64,6 +65,7 @@ _NUMPY_BELOW_2 = re.compile(r"numpy\s*<\s*2(?![0-9.])")
 #: A non-comment line that pip-installs numpy or pyarrow by name.
 #: A pyarrow requirement written inline on a pip-install line: ``pip install 'pyarrow>=17'``.
 _INLINE_PYARROW = re.compile(r"""(?<![\w.-])pyarrow(?:\[[^\]]*\])?\s*((?:[<>=!~]=?\s*[0-9][^\s'",;]*\s*,?\s*)+)""", re.IGNORECASE)
+_INLINE_NUMPY = re.compile(r"""(?<![\w.-])numpy(?:\[[^\]]*\])?\s*((?:[<>=!~]=?\s*[0-9][^\s'",;]*\s*,?\s*)+)""", re.IGNORECASE)
 _PY_DEPENDABOT = re.compile(r"package-ecosystem:\s*[\"']?(?:pip|uv)\b")
 _PIP_INSTALL_PAIR = re.compile(r"\binstall\b.*\b(numpy|pyarrow)\b", re.IGNORECASE)
 
@@ -116,9 +118,29 @@ def _probes(major: str) -> list[str]:
     return [f"{n}.0.0", f"{n}.0.1", f"{n}.1.0", f"{n + 1}.0.0", f"{n + 4}.0.0", "999.0.0"]
 
 
+def _spec_probes(spec: SpecifierSet) -> list[str]:
+    """Versions the spec itself names, and one just past each: a narrow spec
+    (``==26.0.2``, ``>=28,<29``) contains none of the fixed probes
+    (codex c66464c8ae44aa09)."""
+    out: list[str] = []
+    for item in spec:
+        v = item.version.replace(".*", ".0")
+        out += [v, f"{v}.1"]
+    return out
+
+
 def admits_from(spec: SpecifierSet, major: str) -> bool:
     """True when ``spec`` admits some release at or above ``major``."""
-    return any(spec.contains(v) for v in _probes(major))
+    floor = Version(f"{int(major)}.0.0")
+    candidates = _probes(major) + _spec_probes(spec)
+    return any(_at_least(v, floor) and spec.contains(v) for v in candidates)
+
+
+def _at_least(v: str, floor: Version) -> bool:
+    try:
+        return Version(v) >= floor
+    except InvalidVersion:
+        return False
 
 
 def admits_numpy_1(spec: SpecifierSet) -> bool:
@@ -166,10 +188,21 @@ def inline_pyarrow_specs(text: str) -> list[str]:
 
 
 def forces_numpy_below_2(text: str) -> bool:
-    return any(
-        "install" in ln and "pip" in ln.lower() and _NUMPY_BELOW_2.search(ln)
-        for ln in _code_lines(text)
-    )
+    """A pip-install line whose numpy spec admits no 2.x: ``numpy<2``, and
+    also an exact 1.x pin such as ``numpy==1.26.4`` (codex 190311c09401d4d6)."""
+    for ln in _code_lines(text):
+        if not ("install" in ln and "pip" in ln.lower()):
+            continue
+        if _NUMPY_BELOW_2.search(ln):
+            return True
+        for m in _INLINE_NUMPY.finditer(ln):
+            try:
+                spec = SpecifierSet(m.group(1).strip().rstrip(",").replace(" ", ""))
+            except InvalidSpecifier:
+                continue
+            if not any(spec.contains(v) for v in ("2.0.0", "2.1.0", "2.99.0", "3.0.0")):
+                return True
+    return False
 
 
 def check_surface(surface: Surface, text: str, venv: Venv, threshold: str) -> list[str]:
