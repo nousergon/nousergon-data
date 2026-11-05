@@ -253,6 +253,11 @@ class ReconcileRecord:
     # (``explain_close_by_declared``). ``None`` when there are not two dates.
     step_date: str | None = None
     pre_step_max_rel_dev: float | None = None
+    # The largest move of the residual AFTER its step, relative to the level it
+    # stepped to (codex finding 647df950aaefd1ca). A share distribution's step
+    # is flat after it as well as before; a later unrelated jump inside the
+    # row's bound is not the event's.
+    post_step_max_rel_dev: float | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -270,6 +275,7 @@ class ReconcileRecord:
             "pre_window_best_effort": self.n_common_excluded > 0,
             "step_date": self.step_date,
             "pre_step_max_rel_dev": self.pre_step_max_rel_dev,
+            "post_step_max_rel_dev": self.post_step_max_rel_dev,
         }
 
 
@@ -1121,28 +1127,35 @@ def _nearest_action(date: pd.Timestamp, actions: list, window_days: int) -> obje
 
 def _residual_step(
     a: np.ndarray, b: np.ndarray, rel_dev: np.ndarray, dates: pd.Index,
-) -> tuple[str | None, float | None]:
+) -> tuple[str | None, float | None, float | None]:
     """Locate the residual's step (alpha-engine-config-I13034).
 
     ``a`` and ``b`` are the anchor-rebased new and reference series on the
     in-window dates, ``rel_dev`` their per-date relative deviation. The step is
     the date of the largest single-date move in ``log(a / b)``; the second value
-    is the largest ``rel_dev`` strictly before it. A date whose ratio is not
-    finite contributes no move. Returns ``(None, None)`` with fewer than two
+    is the largest ``rel_dev`` strictly before it, the third the largest
+    relative move of ``a / b`` from its level on the step date at or after it
+    (codex finding 647df950aaefd1ca). A date whose ratio is not finite
+    contributes no move. Returns ``(None, None, None)`` with fewer than two
     dates or no finite move."""
     if len(a) < 2:
-        return None, None
+        return None, None, None
     with np.errstate(divide="ignore", invalid="ignore"):
         log_ratio = np.log(a / b)
     moves = np.abs(np.diff(log_ratio))
     moves = np.where(np.isfinite(moves), moves, -1.0)
     pos = int(np.argmax(moves))
     if moves[pos] < 0.0:
-        return None, None
+        return None, None, None
     step_pos = pos + 1
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = a / b
+        post = np.abs(ratio[step_pos:] / ratio[step_pos] - 1.0)
+    post = np.where(np.isfinite(post), post, 0.0)
     return (
         pd.Timestamp(dates[step_pos]).strftime("%Y-%m-%d"),
         float(np.max(rel_dev[:step_pos])),
+        float(np.max(post)),
     )
 
 
@@ -1279,8 +1292,14 @@ def reconcile_total_return(
     worst_pos = int(np.argmax(rel_dev))
     max_rel_dev = float(rel_dev[worst_pos])
     max_dev_date = pd.Timestamp(in_window[worst_pos]).strftime("%Y-%m-%d")
-    step_date, pre_step_max_rel_dev = _residual_step(a, b, rel_dev, in_window)
-    step_fields = dict(step_date=step_date, pre_step_max_rel_dev=pre_step_max_rel_dev)
+    step_date, pre_step_max_rel_dev, post_step_max_rel_dev = _residual_step(
+        a, b, rel_dev, in_window,
+    )
+    step_fields = dict(
+        step_date=step_date,
+        pre_step_max_rel_dev=pre_step_max_rel_dev,
+        post_step_max_rel_dev=post_step_max_rel_dev,
+    )
 
     all_actions = list(split_actions or []) + list(dividend_actions or [])
     near = _nearest_action(
@@ -1629,14 +1648,16 @@ def _declared_step_refusal(
 ) -> str | None:
     """Why ``d`` does NOT explain ``r``'s residual, or ``None`` when the residual
     is the declared event's: one step inside the event window with a residual
-    within ``rel_tol`` before it (alpha-engine-config-I13034). A declared row
+    within ``rel_tol`` before it (alpha-engine-config-I13034) and within
+    ``rel_tol`` of its stepped level after it (codex finding 647df950aaefd1ca). A declared row
     that covers the size of a residual says nothing about WHERE it starts; an
     unrelated missing split or bad close inside the bound would otherwise pass."""
     window = declared_event_window(d)
     if window is None:
         return (f"the row's date {d.event_when} is year-only, so it cannot place "
                 f"the residual's step")
-    if r.step_date is None or r.pre_step_max_rel_dev is None:
+    if (r.step_date is None or r.pre_step_max_rel_dev is None
+            or r.post_step_max_rel_dev is None):
         return "the residual's step could not be located"
     step = pd.Timestamp(r.step_date).normalize()
     lo, hi = window
@@ -1646,6 +1667,9 @@ def _declared_step_refusal(
     if not np.isfinite(r.pre_step_max_rel_dev) or r.pre_step_max_rel_dev > rel_tol:
         return (f"the residual is not flat before its step at {r.step_date} "
                 f"({r.pre_step_max_rel_dev:.4%} > {rel_tol:.2%})")
+    if not np.isfinite(r.post_step_max_rel_dev) or r.post_step_max_rel_dev > rel_tol:
+        return (f"the residual moves again after its step at {r.step_date} "
+                f"({r.post_step_max_rel_dev:.4%} > {rel_tol:.2%} from the stepped level)")
     return None
 
 
@@ -1719,6 +1743,7 @@ def explain_close_by_declared(
             "expires": d.expires,
             "step_date": r.step_date,
             "pre_step_max_rel_dev": r.pre_step_max_rel_dev,
+            "post_step_max_rel_dev": r.post_step_max_rel_dev,
         })
     return out, explained_rows
 

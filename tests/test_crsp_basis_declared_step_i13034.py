@@ -99,6 +99,29 @@ def test_a_residual_that_is_not_flat_before_the_event_is_not_explained():
     assert "not flat before its step at 2026-03-16" in out.explanation
 
 
+def test_an_unrelated_move_after_the_declared_step_is_not_explained():
+    # codex finding 647df950aaefd1ca: the declared step is the largest move and
+    # flat before it, but a later 20% jump (an unrelated missing split or bad
+    # close) sits inside the 0.6 bound. It is not the event's residual.
+    idx = _idx()
+    ref = _stepped(idx, "2026-03-16")
+    ref[idx >= pd.Timestamp("2026-03-23")] = 240.0
+    rec = _close_record(ref)
+    assert rec.step_date == "2026-03-16" and rec.pre_step_max_rel_dev == pytest.approx(0.0)
+    assert rec.post_step_max_rel_dev > TOL
+    out, rows = _explain(rec, _row(when="2026-03-16"))
+    assert not out.explained and rows == []
+    assert "moves again after its step at 2026-03-16" in out.explanation
+
+
+def test_drift_within_tolerance_after_the_step_is_still_flat():
+    idx = _idx()
+    ref = _stepped(idx, "2026-03-16")
+    ref[idx >= pd.Timestamp("2026-03-23")] = 202.0  # 1% < 2% tolerance
+    out, _ = _explain(_close_record(ref), _row(when="2026-03-16"))
+    assert out.explained
+
+
 def test_drift_within_tolerance_before_the_step_is_still_flat():
     idx = _idx()
     ref = _stepped(idx, "2026-03-16")

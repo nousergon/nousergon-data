@@ -107,15 +107,57 @@ def open_hold(
 ) -> dict | None:
     """Open a hold for an unexplained split-like break.
 
-    Returns the written body, or None when an active hold already exists (the
-    earliest open break is the one the clear check must see restated, so it is
-    never overwritten). A cleared hold is replaced: the name broke again.
+    Returns the written body, or None when no new hold was opened:
+
+    * an active hold already exists. Its first break is never overwritten, and
+      a further unexplained break on another date is appended to
+      ``additional_breaks``, so the auto-clear check must see EVERY held break
+      restated before it releases the name (a restated first break with a
+      later one still printed is not a clean series);
+    * the stored hold was cleared by an operator for this same ``break_date``.
+      Replaying ``daily_append`` for that date re-detects the move the
+      operator already judged genuine; reopening it would undo the clearance.
+
+    Any other cleared hold is replaced: the name broke again.
     """
     existing = read_hold(s3, bucket, ticker)
     if existing is not None and existing.get("status") == STATUS_ACTIVE:
+        held_dates = {existing.get("break_date")} | {
+            b.get("break_date") for b in existing.get("additional_breaks", []) or []
+        }
+        if break_date not in held_dates:
+            body = dict(existing)
+            body["additional_breaks"] = list(existing.get("additional_breaks", []) or []) + [{
+                "break_date": break_date,
+                "prior_date": prior_date,
+                "prior_close": round(float(prior_close), 6),
+                "break_close": round(float(break_close), 6),
+                "ratio": round(float(ratio), 6),
+                "recorded_utc": _now_utc(),
+            }]
+            _put(s3, bucket, body)
+            log.error(
+                "ticker_holds: %s already held since %s (break %s); recorded the "
+                "further unexplained break on %s (ratio %.4f) - the hold clears "
+                "only once every held break is restated",
+                ticker, existing.get("opened_utc"), existing.get("break_date"),
+                break_date, ratio,
+            )
+        else:
+            log.warning(
+                "ticker_holds: %s already held since %s (break %s) - keeping that hold",
+                ticker, existing.get("opened_utc"), existing.get("break_date"),
+            )
+        return None
+    if (
+        existing is not None
+        and existing.get("status") == STATUS_CLEARED
+        and existing.get("break_date") == break_date
+        and not str(existing.get("cleared_by", "")).startswith("auto:")
+    ):
         log.warning(
-            "ticker_holds: %s already held since %s (break %s) - keeping that hold",
-            ticker, existing.get("opened_utc"), existing.get("break_date"),
+            "ticker_holds: %s break %s was cleared by %s (%s) - not reopening it on a replay",
+            ticker, break_date, existing.get("cleared_by"), existing.get("clear_reason"),
         )
         return None
     body = {
@@ -149,17 +191,33 @@ def open_hold(
 
 
 def break_restated(hold: dict, hist: pd.DataFrame, soft_ratio: float) -> tuple[bool, float | None]:
-    """Whether the stored series no longer prints the held break.
+    """Whether the stored series no longer prints any held break.
 
-    ``(True, ratio)`` only on positive evidence: a stored close for
-    ``break_date`` and a stored close before it whose ratio is inside
-    ``(1/soft_ratio, soft_ratio)``. A missing row is not evidence.
+    ``(True, ratio)`` only on positive evidence for EVERY held break (the
+    first ``break_date`` and each of ``additional_breaks``): a stored close for
+    that date and a stored close before it whose ratio is inside
+    ``(1/soft_ratio, soft_ratio)``. A missing row is not evidence. ``ratio`` is
+    the first break's current ratio.
     """
     if hist is None or hist.empty or "Close" not in hist.columns:
         return False, None
+    first_ok, first_ratio = _one_break_restated(hold.get("break_date"), hist, soft_ratio)
+    if not first_ok:
+        return False, first_ratio
+    for extra in hold.get("additional_breaks", []) or []:
+        if not isinstance(extra, dict) or not _one_break_restated(
+            extra.get("break_date"), hist, soft_ratio
+        )[0]:
+            return False, first_ratio
+    return True, first_ratio
+
+
+def _one_break_restated(break_date, hist: pd.DataFrame, soft_ratio: float) -> tuple[bool, float | None]:
     try:
-        break_ts = pd.Timestamp(hold["break_date"]).normalize()
+        break_ts = pd.Timestamp(break_date).normalize()
     except Exception:  # noqa: BLE001 - malformed hold, never auto-clear it
+        return False, None
+    if pd.isna(break_ts):
         return False, None
     closes = hist["Close"].dropna()
     if break_ts not in closes.index:
