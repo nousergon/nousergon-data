@@ -739,8 +739,11 @@ def main(argv: list[str]) -> int:
         findings: list[str] = []
         error: str | None = None
         try:
+            # The resolved target's region (empty for prod: the caller's own)
+            # (codex 7b153118c1d38fac).
+            region = {"region_name": target["region"]} if target.get("region") else {}
             findings = live_findings(
-                boto3.client("cloudformation"), boto3.client("scheduler"), target
+                boto3.client("cloudformation", **region), boto3.client("scheduler", **region), target
             )
         except Exception as exc:  # noqa: BLE001 — published as measured:false, exit 2
             error = f"{type(exc).__name__}: {exc}"

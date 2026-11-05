@@ -721,3 +721,41 @@ def test_load_reads_the_optional_inputs_and_survives_their_absence():
     inc = window(full, "inception")["cells"]
     assert inc["vs_iwm"]["benchmark_pct"] is not None
     assert inc["vs_personal"]["benchmark_pct"] == pytest.approx((1.001 ** 39 - 1) * 100, abs=1e-3)
+
+
+def test_a_structurally_wrong_optional_input_is_unavailable_not_fatal():
+    # codex 385d8cccc8e6d68a: a list where an object belongs aborted the publish.
+    rows = ledger(SHORT)
+    closes = {"closes": [[d.isoformat(), 100.0 + i] for i, d in enumerate(SHORT)]}
+    doc = pt.load_and_build(FakeS3({
+        pt.NAV_KEY: nav_csv(rows).encode(),
+        pt.CLOSE_HISTORY_KEY.format(symbol="SPY"): json.dumps(closes).encode(),
+        pt.CLOSE_HISTORY_KEY.format(symbol="QQQ"): json.dumps(closes).encode(),
+        pt.CLOSE_HISTORY_KEY.format(symbol="IWM"): json.dumps([1, 2]).encode(),
+        pt.CLOSE_HISTORY_KEY.format(symbol="ONEQ"): json.dumps({"closes": 5}).encode(),
+        pt.PERSONAL_KEY: json.dumps(["not", "an", "object"]).encode(),
+    }), "bucket", now=NOW)
+    inc = window(doc, "inception")["cells"]
+    assert inc["vs_iwm"]["benchmark_pct"] is None and inc["vs_personal"]["benchmark_pct"] is None
+
+
+def test_a_constant_series_has_zero_stdev_and_no_ratio():
+    # codex 885d390ad694c9c1: rounding left 1.7e-18 and a ~1e16 Sharpe.
+    assert pt._stdev([0.0029] * 252) == 0.0  # the old sum-based mean left 4.3e-19
+    assert pt._ratio(0.0029, pt._stdev([0.0029] * 252)) is None
+
+def test_a_dividend_on_a_day_with_no_nav_carries_to_the_next_row():
+    # codex f454f5ba2e5f7f52: QQQ $500 -> $5 ex-div on a NAV-less day -> $495
+    # read -1% instead of 0%.
+    text = (
+        "date,portfolio_nav,spy_close,spy_dividend_per_share,spy_return_pct,nav_basis,"
+        "qqq_close,qqq_dividend_per_share\n"
+        "2026-10-01,1000,100,0,,settled_close,500,0\n"
+        "2026-10-02,,100,0,,settled_close,497,5\n"
+        "2026-10-05,1000,100,0,,settled_close,495,0\n"
+    )
+    rows = pt.parse_nav_csv(text)
+    assert [r.day.isoformat() for r in rows] == ["2026-10-01", "2026-10-05"]
+    last = rows[-1]
+    assert last.qqq_dividend == 5.0
+    assert (last.qqq_close + last.qqq_dividend) / rows[0].qqq_close == pytest.approx(1.0)

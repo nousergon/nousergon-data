@@ -36,6 +36,7 @@ def _rec(ticker="X", dev=0.4, status="out_of_tol", explained=False):
         max_dev_date="2026-03-20", explained=explained,
         explanation="CLOSE axis: OUT-OF-TOL",
         step_date="2026-03-10", pre_step_max_rel_dev=0.0,
+        post_step_max_rel_dev=0.0,
     )
 
 
