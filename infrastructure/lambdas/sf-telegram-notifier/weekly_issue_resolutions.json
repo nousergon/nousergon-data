@@ -2,6 +2,7 @@
   "schema": "weekly-issue-resolutions-1",
   "_doc": "Seed registry for weekly_run_report.py: maps a weekly-report bullet key (fnmatch pattern, first match wins) to the tracked item that resolves it. The live overlay is s3://alpha-engine-research/ops/daily-summaries/weekly-issue-resolutions.json, kept current by the nightly sweep; it wins over this file. Every entry names a real issue; a bullet with no entry renders 'none tracked yet' and the nightly sweep files one with alternatives and a recommendation (Brian 2026-10-24).",
   "entries": [
+    {"match": "terminal:ne-postclose-trading-pipeline:*", "ref": "alpha-engine-config#13255", "plan": "v1 post-close runs only as the snapshot backstop since the v2 switch; its checks move to the reconcile machine"},
     {"match": "skip:skip_parity*", "ref": "alpha-engine-config#7309", "plan": "re-enable pit_parity on the weekly SF in phase 3"},
     {"match": "skip:skip_pit_parity_*", "ref": "alpha-engine-config#7309", "plan": "re-enable pit_parity on the weekly SF in phase 3"},
     {"match": "skip:skip_data_phase2", "ref": "alpha-engine-config#12271", "plan": "by design since the data cutover (the collector runs it); stop grading it here"},
