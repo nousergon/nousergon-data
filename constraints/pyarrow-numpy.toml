@@ -265,7 +265,7 @@ pyarrow_ignore = []
 
 # ---------------------------------------------------------------------------
 [venvs.executor]
-about = "crucible-executor: the executor's deployed venv, pip-compiled from requirements.in. Its pyproject.toml (pyarrow>=25.0.1, numpy<3) is not registered yet: it disagrees with requirements.in and is tracked on alpha-engine-config-I13002."
+about = "crucible-executor: the executor's deployed venv, pip-compiled from requirements.in, plus pyproject.toml (the `pip install -e .` dev/test install, held in lockstep with requirements.in by that repo's tests/test_requirements_lockstep.py)."
 pyarrow = "~=25.0"
 numpy_below_2 = false
 
@@ -278,6 +278,11 @@ kind = "requirements"
 repo = "crucible-executor"
 path = "requirements.txt"
 kind = "lock"
+
+[[venvs.executor.surfaces]]
+repo = "crucible-executor"
+path = "pyproject.toml"
+kind = "requirements"
 
 # ---------------------------------------------------------------------------
 [venvs.aec-ci-tools]
