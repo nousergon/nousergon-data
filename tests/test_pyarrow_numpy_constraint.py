@@ -259,3 +259,95 @@ def test_an_exact_numpy_1_pin_forces_numpy_below_2(line):
 
 def test_a_numpy_spec_admitting_2_does_not_force_below_2():
     assert not c.forces_numpy_below_2("pip install 'numpy>=1.24'")
+
+
+# --- libraries: compatible with every consuming venv, not equal to one ------
+
+
+def _lib(pyarrow: str, numpy: str = ">=1.24", consumers=("v",)) -> c.Library:
+    return c.Library("lib", "other", SpecifierSet(pyarrow), SpecifierSet(numpy), tuple(consumers))
+
+
+def test_declared_libraries_are_compatible_with_every_consumer():
+    _, venvs, _ = c.load()
+    libs, surfaces = c.load_libraries()
+    assert "nousergon-lib" in libs
+    for lib in libs.values():
+        assert c.check_library_rule(lib, venvs) == []
+    assert {s.kind for s in surfaces} <= set(c.LIBRARY_KINDS)
+
+
+@pytest.mark.parametrize(
+    ("lib_spec", "venv_spec", "want"),
+    [
+        (">=14.0", ">=26", "contains"),
+        (">=14.0", ">=25.0.1,<26", "contains"),
+        (">=14.0", "~=25.0", "contains"),
+        (">=25.0.1", ">=25.0.1", "contains"),
+        (">=26", ">=25.0.1", "narrow"),  # too narrow: excludes 25.x the venv admits
+        ("<26", ">=25.0.1", "narrow"),
+        ("~=25.0", ">=17", "narrow"),
+        (">=26", ">=25.0.1,<26", "disjoint"),  # disjoint: the venv cannot install it
+        ("<20", "~=25.0", "disjoint"),
+    ],
+)
+def test_library_range_relation(lib_spec, venv_spec, want):
+    assert c.relation(SpecifierSet(lib_spec), SpecifierSet(venv_spec)) == want
+
+
+def test_compatible_library_spans_numpy_1_and_2_consumers():
+    venvs = {"data": _venv(">=26", name="data"), "dash": _venv(">=25.0.1,<26", True, "dash")}
+    assert c.check_library_rule(_lib(">=14.0", consumers=("data", "dash")), venvs) == []
+
+
+def test_too_narrow_library_is_refused():
+    venvs = {"v": _venv(">=25.0.1")}
+    out = c.check_library_rule(_lib(">=26"), venvs)
+    assert len(out) == 1 and "narrower than consumer venv v" in out[0], out
+
+
+def test_disjoint_library_is_refused():
+    venvs = {"dash": _venv(">=25.0.1,<26", True, "dash")}
+    out = c.check_library_rule(_lib(">=26", consumers=("dash",)), venvs)
+    assert any("DISJOINT" in f for f in out), out
+
+
+def test_library_numpy_2_floor_breaks_a_numpy_below_2_consumer():
+    # R's case: pinning the library to the data venv's numpy>=2 strands dashboard.
+    venvs = {"dash": _venv(">=25.0.1,<26", True, "dash"), "data": _venv(">=26", name="data")}
+    out = c.check_library_rule(_lib(">=14.0", ">=2", ("dash", "data")), venvs)
+    assert len(out) == 1 and "excludes every NumPy 1.x" in out[0] and "dash" in out[0], out
+    out = c.check_library_rule(_lib(">=14.0", "<2", ("dash", "data")), venvs)
+    assert len(out) == 1 and "excludes NumPy 2" in out[0] and "data" in out[0], out
+
+
+def test_library_with_unknown_consumer_is_refused():
+    assert any("not a declared venv" in f for f in c.check_library_rule(_lib(">=14"), {}))
+
+
+def _lib_toml(tmp_path: Path, lib_pyarrow: str = ">=14.0") -> Path:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    t = tmp_path / "decl.toml"
+    t.write_text(
+        'schema = 1\n[rule]\npyarrow_needs_numpy2_from = "26"\n'
+        '[venvs.x]\npyarrow = "~=25.0"\nnumpy_below_2 = true\n'
+        f'[libraries.lib]\nrepo = "other"\npyarrow = "{lib_pyarrow}"\nnumpy = ">=1.24"\nconsumers = ["x"]\n'
+        '[[libraries.lib.surfaces]]\npath = "pyproject.toml"\nkind = "library"\n'
+        '[[libraries.lib.surfaces]]\npath = "uv.lock"\nkind = "lock"\n'
+    )
+    return t
+
+
+def test_repo_mode_checks_a_library_checkout(tmp_path):
+    decl = _lib_toml(tmp_path / "d")
+    pyproject = '[project.optional-dependencies]\nq = ["numpy>=1.24"]\nr = ["pyarrow>=14.0", "numpy>=1.24"]\n'
+    root = _other_repo(tmp_path / "r", {"pyproject.toml": pyproject, "uv.lock": _UV_LOCK.format(v="25.0.1")})
+    assert c.run(remote=False, constraint_file=decl, only_repo="other", root=root) == []
+    assert c.unregistered_local_surfaces(decl, repo="other", root=root) == []
+    # A tightening to one venv's numpy>=2 on the library's own PR is refused there.
+    (root / "pyproject.toml").write_text(pyproject.replace("numpy>=1.24", "numpy>=2"))
+    out = c.run(remote=False, constraint_file=decl, only_repo="other", root=root)
+    assert any("disagrees with the declared library numpy" in f for f in out), out
+    # A declaration narrowed past a consumer fails without reading any repo.
+    out = c.run(remote=False, constraint_file=_lib_toml(tmp_path / "d2", ">=26"))
+    assert any("DISJOINT" in f for f in out), out
