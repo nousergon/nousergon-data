@@ -928,3 +928,29 @@ class TestWeeklyIssueReport:
         assert "*Issues" not in sent["text"]
         assert "*Director:*" not in sent["text"]
         assert sent["severity"] == "info"
+
+
+# ── alpha-engine-config-I13257: terminal Resolution line ──────────────────
+
+
+def test_terminal_resolution_uses_the_seed_when_the_overlay_is_unreadable(monkeypatch):
+    def _no_s3(*_a, **_k):
+        raise RuntimeError("no overlay in tests")
+
+    monkeypatch.setattr(index.boto3, "client", _no_s3)
+    line = index.terminal_resolution_line("ne-postclose-trading-pipeline", "FAILED")
+    assert line and line.startswith("Resolution: aec#13255")
+    assert index.terminal_resolution_line("ne-preopen-trading-pipeline", "FAILED") is None
+
+
+def test_terminal_resolution_overlay_wins_over_the_seed(monkeypatch):
+    import io
+
+    overlay = {"entries": [{"match": "terminal:ne-postclose-trading-pipeline:FAILED",
+                            "ref": "alpha-engine-config#99999", "plan": "overlay"}]}
+    s3 = MagicMock()
+    s3.get_object.return_value = {"Body": io.BytesIO(json.dumps(overlay).encode())}
+    monkeypatch.setattr(index.boto3, "client", lambda *a, **k: s3)
+    assert index.terminal_resolution_line(
+        "ne-postclose-trading-pipeline", "FAILED"
+    ) == "Resolution: aec#99999 (overlay)"

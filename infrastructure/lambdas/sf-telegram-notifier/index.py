@@ -14,6 +14,7 @@ The existing SNS → email path is unaffected.
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import logging
 import os
@@ -39,6 +40,11 @@ from weekly_run_report import (
     format_report_lines,
     overall_auto_fix_line,
     report_needs_triage,
+    RESOLUTIONS_S3_KEY,
+    S3_BUCKET,
+    load_bundled_resolutions,
+    md_escape,
+    parse_resolutions,
 )
 from nousergon_lib.flow_doctor_fleet import (
     FleetTelegramTopic,
@@ -454,6 +460,12 @@ def _build_message(
     ):
         full_cause = detailed_failure_cause or _failure_cause_from(describe_resp)
         lines.append(classify_failure(full_cause).auto_fix_line)
+    if status in ("FAILED", "TIMED_OUT", "ABORTED") and not any(
+        line.startswith("Resolution:") for line in lines
+    ):
+        resolution = terminal_resolution_line(sm_name, status)
+        if resolution:
+            lines.append(resolution)
 
     lines.append(f"Execution: {exec_name}")
     silent = False
@@ -465,6 +477,39 @@ def _build_message(
     if is_partial:
         silent = True
     return "\n".join(lines), silent, hollow_suspect, is_partial, needs_triage
+
+
+_REPO_SHORT = {"alpha-engine-config": "aec", "nousergon-data": "data", "nous-ergon-ops": "ops"}
+
+
+def terminal_resolution_line(sm_name: str, status: str) -> str | None:
+    """``Resolution: <issue> <plan>`` for a terminal alert, or None.
+
+    alpha-engine-config-I13257: flow-doctor >= 0.19.7 moves a sender's own
+    ``Resolution:`` line into the footer in place of "none tracked yet". The
+    key is ``terminal:<state machine>:<status>``, matched (fnmatch, first wins)
+    against the same registry the weekly report reads: the S3 overlay the
+    nightly sweep keeps current, then the bundled seed. No match, no line: the
+    footer's default stands, and a number is never invented.
+    """
+    key = f"terminal:{sm_name}:{status}"
+    resolutions: dict = {}
+    try:
+        body = boto3.client("s3", region_name=REGION).get_object(
+            Bucket=S3_BUCKET, Key=RESOLUTIONS_S3_KEY
+        )["Body"].read()
+        resolutions = dict(parse_resolutions(json.loads(body)))
+    except Exception as exc:  # noqa: BLE001 — overlay is optional; seed below
+        logger.info("resolution overlay unread (%s); using the bundled seed", type(exc).__name__)
+    for pattern, res in load_bundled_resolutions().items():
+        resolutions.setdefault(pattern, res)
+    for pattern, res in resolutions.items():
+        if fnmatch.fnmatchcase(key, pattern):
+            repo, _, num = res.ref.partition("#")
+            label = f"{_REPO_SHORT.get(repo, repo)}#{num}"
+            plan = f" ({md_escape(res.plan)})" if res.plan else ""
+            return f"Resolution: {label}{plan}"
+    return None
 
 
 def handler(event: dict, context) -> dict:  # noqa: ARG001
