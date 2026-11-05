@@ -97,6 +97,44 @@ def test_open_hold_keeps_the_earliest_active_break():
     assert s3.body("CTVA")["break_date"] == "2026-10-01"
 
 
+def test_a_second_break_while_held_is_recorded_and_blocks_the_clear():
+    # codex finding e8e8075271b229f4: the second unexplained break used to be
+    # dropped, so restating only the first cleared the name with 10-02 broken.
+    s3 = _FakeS3()
+    _open_ctva(s3)
+    assert th.open_hold(
+        s3, "b", ticker="CTVA", break_date="2026-10-02", prior_date="2026-10-01",
+        prior_close=12.57, break_close=4.0, ratio=4.0 / 12.57,
+    ) is None
+    hold = s3.body("CTVA")
+    assert hold["break_date"] == "2026-10-01"
+    assert [b["break_date"] for b in hold["additional_breaks"]] == ["2026-10-02"]
+    # first break restated, second still printed: stays held
+    first_only = _hist({"2026-09-30": 11.65, "2026-10-01": 12.57, "2026-10-02": 4.0})
+    assert th.break_restated(hold, first_only, _SPLICE_GUARD_SOFT_RATIO)[0] is False
+    both = _hist({"2026-09-30": 3.71, "2026-10-01": 4.0, "2026-10-02": 4.0})
+    assert th.break_restated(hold, both, _SPLICE_GUARD_SOFT_RATIO)[0] is True
+    # a replay of either held date adds nothing
+    th.open_hold(s3, "b", ticker="CTVA", break_date="2026-10-02", prior_date="2026-10-01",
+                 prior_close=12.57, break_close=4.0, ratio=4.0 / 12.57)
+    assert len(s3.body("CTVA")["additional_breaks"]) == 1
+
+
+def test_replaying_an_operator_cleared_break_does_not_reopen_it():
+    # codex finding cc4830570da0c52d
+    s3 = _FakeS3()
+    th.clear_hold(s3, "b", _open_ctva(s3), reason="genuine spin-off", cleared_by="operator")
+    assert _open_ctva(s3) is None
+    assert s3.body("CTVA")["status"] == "cleared"
+
+
+def test_an_auto_cleared_break_that_prints_again_reopens():
+    s3 = _FakeS3()
+    th.clear_hold(s3, "b", _open_ctva(s3), reason="restated", cleared_by="auto:builders.daily_append")
+    assert _open_ctva(s3) is not None
+    assert s3.body("CTVA")["status"] == "active"
+
+
 def test_a_cleared_hold_is_replaced_when_the_name_breaks_again():
     s3 = _FakeS3()
     th.clear_hold(s3, "b", _open_ctva(s3), reason="x", cleared_by="operator")
