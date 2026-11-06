@@ -10,6 +10,13 @@ Migration arc: config#1742 (fleet Telegram consolidation T2). Falls back to
 (local tests / init failure).
 
 The existing SNS → email path is unaffected.
+
+ONE MESSAGE A DAY (observability-policy §7.2b, Brian 2026-11-06): the chat
+gets one pipelines message per day, success or failure, sent on the day's
+closing terminal (`_DAY_CLOSERS`). RUNNING, preflight and every other
+terminal send nothing to the chat; they stay on the alert bus and the
+console. A failure inside trading hours is caught as a critical by the
+Crucible v2 watchdogs, not here.
 """
 
 from __future__ import annotations
@@ -512,13 +519,105 @@ def terminal_resolution_line(sm_name: str, status: str) -> str | None:
     return None
 
 
+#: The terminal that closes a pipeline day: the weekday post-close reconcile,
+#: and the Saturday weekly run. Only these send to the chat (§7.2b class 4).
+_DAY_CLOSERS: frozenset[str] = frozenset({
+    "ne-postclose-reconcile-pipeline",
+    "ne-weekly-freshness-pipeline",
+})
+#: The pipelines a day's message counts. The groom dispatch SF is backlog
+#: plumbing, not a pipeline Brian reads about.
+_DAY_PIPELINES: tuple[str, ...] = tuple(n for n in _SF_LABELS if n != "alpha-engine-groom-dispatch")
+_DAY_WINDOW_S = 20 * 3600
+_PIPELINES_URL = "https://console.nousergon.ai/component"
+
+
+def _day_outcomes(sm_arn: str, *, sf_client, now_s: float) -> list[tuple[str, str]]:
+    """``[(label, status)]`` for each pipeline's latest run in the last 20 h.
+
+    Pipelines with no run in the window are left out, not counted as failed:
+    a weekday has no weekly run and a Saturday has no trading runs. A list
+    call that fails is reported as ``UNREADABLE`` so the day never reads as
+    cleaner than it was."""
+    prefix = sm_arn.rsplit(":", 1)[0]
+    out: list[tuple[str, str]] = []
+    for name in _DAY_PIPELINES:
+        try:
+            resp = sf_client.list_executions(stateMachineArn=f"{prefix}:{name}", maxResults=10)
+        except Exception as exc:  # noqa: BLE001 — one unreadable machine must not drop the day
+            logger.warning("list_executions %s failed: %s", name, type(exc).__name__)
+            out.append((_SF_LABELS[name], "UNREADABLE"))
+            continue
+        runs = [
+            e for e in resp.get("executions", [])
+            if now_s - _epoch_s(e.get("startDate")) <= _DAY_WINDOW_S
+            and not str(e.get("name", "")).startswith(("offcycle-shell", "preflight"))
+        ]
+        if runs:
+            latest = max(runs, key=lambda e: _epoch_s(e.get("startDate")))
+            out.append((_SF_LABELS[name], str(latest.get("status", "UNKNOWN"))))
+    return out
+
+
+def _epoch_s(value) -> float:
+    if isinstance(value, datetime):
+        return value.timestamp()
+    if isinstance(value, (int, float)):
+        return value / 1000 if value > 1e11 else float(value)
+    return 0.0
+
+
+def day_message(run_date: str | None, outcomes: list[tuple[str, str]]) -> str:
+    """The one pipelines message for the day. Pure."""
+    day = run_date or "today"
+    ok = [label for label, status in outcomes if status == "SUCCEEDED"]
+    bad = [f"{label} ({status.lower()})" for label, status in outcomes if status != "SUCCEEDED"]
+    if not bad:
+        head = f"✅ Pipelines {day}: all {len(ok)} succeeded."
+    else:
+        head = (f"\U0001f534 Pipelines {day}: {len(ok)} of {len(outcomes)} succeeded. "
+                f"Failed: {', '.join(bad)}. Tonight's sweep fixes them; nothing for you.")
+    return f"{head}\n{_PIPELINES_URL}"
+
+
 def handler(event: dict, context) -> dict:  # noqa: ARG001
     detail = event.get("detail") or {}
     status = detail.get("status", "UNKNOWN")
     sm_name = (detail.get("stateMachineArn") or "").rsplit(":", 1)[-1]
     logger.info("SF status change: sf=%s status=%s", sm_name, status)
 
-    text, silent, hollow_suspect, is_partial, needs_triage = _build_message(detail)
+    # §7.2b: only the day's closing terminal reaches the chat.
+    describe_resp = _describe_execution(detail.get("executionArn", "")) if status != "RUNNING" else None
+    closes_day = (
+        status in _TERMINAL_STATUSES
+        and sm_name in _DAY_CLOSERS
+        and not _is_preflight_execution(describe_resp)
+        and not _is_partial_execution(detail.get("stateMachineArn", ""), describe_resp)[0]
+    )
+    if not closes_day:
+        logger.info("not the day's closing terminal: no chat message (sf=%s status=%s)", sm_name, status)
+        if status in ("FAILED", "TIMED_OUT", "ABORTED"):
+            # Recorded for /page/incidents and the nightly sweep; never the chat.
+            from krepis.fleet_events import emit_alert_event
+            emit_alert_event(
+                origin="sf-telegram-notifier", body=f"{_label_for_arn(detail.get('stateMachineArn', ''))} — {status}: {detail.get('name', '')}",
+                severity_raw="warning", source="flow-doctor:sf-telegram-notifier",
+                dedup_key=_dedup_key(detail), delivery_tier="tracked-only",
+                alert_class="sf_completion_telegram",
+            )
+        return {"status": status, "state_machine": sm_name,
+                "execution": detail.get("name", ""), "telegram_sent": False,
+                "silent": True, "hollow_suspect": False}
+    run_date = parse_run_date_from_input((describe_resp or {}).get("input")) or \
+        parse_run_date_from_execution_name(detail.get("name", ""))
+    outcomes = _day_outcomes(
+        detail.get("stateMachineArn", ""),
+        sf_client=boto3.client("stepfunctions", region_name=REGION),
+        now_s=datetime.now(timezone.utc).timestamp(),
+    )
+    text = day_message(run_date, outcomes)
+    silent, hollow_suspect, is_partial = False, False, False
+    needs_triage = any(st != "SUCCEEDED" for _, st in outcomes)
     ok = notify_via_flow_doctor(
         text,
         silent=silent,
@@ -530,7 +629,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001
             else "warning" if (hollow_suspect or needs_triage) and status == "SUCCEEDED"
             else _severity_for_status(status)
         ),
-        dedup_key=_dedup_key(detail),
+        dedup_key=f"{_FLOW_NAME}:day:{sm_name}:{run_date or detail.get('name', '')}",
         flow_name=_FLOW_NAME,
         topics=PIPELINE_OBSERVER_TELEGRAM_TOPICS,
         db_basename=_DB_BASENAME,
