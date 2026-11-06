@@ -32,6 +32,18 @@ WHAT ONE MANIFEST COVERS:
       and for re-striking marks.
     * ``declared``: reviewed in-repo actions the vendor does not publish
       (``corporate_actions/declared.py``), such as spin-offs.
+    * ``delistings``: every stock ticker Polygon delisted in the window (cash
+      takeover, merger, exchange delisting, or a symbol retired by a rename),
+      dated by the New York date of ``delisted_utc``
+      (alpha-engine-config-I13312). Unlike the lists above, a failed delisting
+      query does NOT withhold the manifest: the scan is written with
+      ``delistings: []``, ``delistings_complete: false`` and the exception
+      class in ``delistings_error`` (the full text is in the log), so the
+      dividend and split checks keep their source.
+      ``delistings_complete: true`` is the only state in which an empty list
+      means "nothing was delisted". The query is newer than the others and its
+      paging depends on a vendor sort order it verifies as it reads, so it is
+      held apart until it has a live record.
 
     Tickers are Polygon symbols (``BRK.B``). Mapping to broker symbols is the
     reader's job.
@@ -114,6 +126,19 @@ def _declared_in_window(start: str, end: str) -> list[dict]:
     return rows
 
 
+def _delistings(client, start: str, end: str) -> tuple[list[dict], bool, str | None]:
+    """``(rows, complete, error)``; never raises (see ``delistings`` above)."""
+    try:
+        return client.get_all_delistings_between(start, end), True, None
+    except Exception as exc:  # noqa: BLE001 - recorded in the manifest and logged
+        logger.error("corporate-action scan: delisting query %s..%s FAILED: %s",
+                     start, end, exc, exc_info=True)
+        # Only the exception CLASS goes into the manifest: the message can carry
+        # request details, and the manifest is hashed and shared. The log line
+        # above has the full text.
+        return [], False, type(exc).__name__
+
+
 def build_scan(client, day: str, *, start: str | None = None) -> dict:
     """Query Polygon for ``day``'s window. Raises on ANY query failure."""
     day = _as_date(day).isoformat()
@@ -121,6 +146,7 @@ def build_scan(client, day: str, *, start: str | None = None) -> dict:
     splits = client.get_all_splits_between(start, day)
     paid = client.get_all_dividends_between(start, day, date_field="pay_date")
     ex = client.get_all_dividends_between(start, day, date_field="ex_dividend_date")
+    delistings, delistings_complete, delistings_error = _delistings(client, start, day)
     body = {
         "schema": SCHEMA,
         "trading_day": day,
@@ -132,7 +158,11 @@ def build_scan(client, day: str, *, start: str | None = None) -> dict:
         "dividends_paid": paid,
         "dividends_ex": ex,
         "declared": _declared_in_window(start, day),
+        "delistings": delistings,
+        "delistings_complete": delistings_complete,
     }
+    if delistings_error is not None:
+        body["delistings_error"] = delistings_error
     canonical = json.dumps(body, sort_keys=True, separators=(",", ":"), default=str)
     body["content_sha256"] = hashlib.sha256(canonical.encode()).hexdigest()
     body["generated_at"] = datetime.now(timezone.utc).isoformat()
@@ -165,6 +195,8 @@ def run(day: str, *, bucket: str = DEFAULT_BUCKET, client=None, s3=None,
         "dividends_paid": len(scan["dividends_paid"]),
         "dividends_ex": len(scan["dividends_ex"]),
         "declared": len(scan["declared"]),
+        "delistings": len(scan["delistings"]),
+        "delistings_complete": scan["delistings_complete"],
         "content_sha256": scan["content_sha256"],
     }
     if dry_run:
