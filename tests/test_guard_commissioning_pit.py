@@ -500,7 +500,10 @@ def test_the_guard_call_sites_are_what_the_model_calls():
     impl = inspect.getsource(da._daily_append_impl)
     assert re.search(
         r"receipt = _scan_universe_and_emit_freshness_receipt\(\s*s3, bucket, universe_lib,\s*"
-        r"expected_tickers=expected_tickers,\s*run_date=date_str,\s*\)",
+        r"expected_tickers=expected_tickers,\s*run_date=date_str,\s*"
+        # alpha-engine-config-I13143: the EOD unsettled-proxy set; empty (the
+        # modelled default above) unless THIS run quality-blocked a proxy row.
+        r"eod_unsettled_proxies=eod_unsettled_proxies,\s*\)",
         impl,
     ), "daily_append's freshness-scan call site changed"
     bf = inspect.getsource(backfill_mod.backfill)
