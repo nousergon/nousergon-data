@@ -94,8 +94,56 @@ jobs:
           deploy_status: ${{ job.status == 'success' && 'success' || 'failure' }}
           deploy_workflow: deploy-data-spot-dispatcher.yml
 
+  # Staging (alpha-engine-config-I13187, S-18 follow-up): the same code into the
+  # staging account. Assumes staging's github-actions-lambda-deploy, whose trust
+  # names this workflow on nousergon-data main (nous-ergon-ops-PR2108). The
+  # account comes from the fleet registry (nousergon_lib.env), never a literal,
+  # and is masked in this public log. deploy.sh's staging mode creates no IAM.
+  deploy-staging:
+    name: Deploy data-spot-dispatcher Lambda to staging (code-only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout data repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: alpha-engine-data
+
+      - name: Set up Python 3.12 (match Lambda runtime)
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+
+      - name: Resolve the staging target from the registry
+        id: target
+        working-directory: alpha-engine-data
+        run: |
+          set -euo pipefail
+          python3 -m pip install -q "$(grep -E '^nousergon-lib' infrastructure/lambdas/data-spot-dispatcher/requirements.txt)"
+          target=$(python3 infrastructure/data_collection_env_params.py target --env staging)
+          account=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["account"])' "$target")
+          region=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["region"])' "$target")
+          [[ "$account" =~ ^[0-9]{12}$ ]] || { echo "::error::staging account did not resolve"; exit 1; }
+          echo "::add-mask::$account"
+          echo "account=$account" >> "$GITHUB_OUTPUT"
+          echo "region=$region" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials via OIDC (staging)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6
+        with:
+          role-to-assume: arn:aws:iam::${{ steps.target.outputs.account }}:role/github-actions-lambda-deploy
+          aws-region: ${{ steps.target.outputs.region }}
+
+      - name: Deploy data-spot-dispatcher to staging (no --bootstrap, no IAM)
+        working-directory: alpha-engine-data
+        env:
+          NE_ENV: staging
+          ACCOUNT_ID_STAGING: ${{ steps.target.outputs.account }}
+          AWS_REGION: ${{ steps.target.outputs.region }}
+        run: bash infrastructure/lambdas/data-spot-dispatcher/deploy.sh
+
   notify-main-failure:
-    needs: [deploy]
+    needs: [deploy, deploy-staging]
     if: ${{ always() && github.ref == 'refs/heads/main' && (failure() || (contains(needs.*.result, 'cancelled') && !cancelled())) }}
     uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@5a434a599a4fba3e6201db43d6453c3ecffbba29 # main
     secrets: inherit

@@ -38,6 +38,7 @@
 #   bash infrastructure/lambdas/data-spot-dispatcher/deploy.sh             # update code + env only (CI auto-deploy path)
 #   bash infrastructure/lambdas/data-spot-dispatcher/deploy.sh --bootstrap # operator-only: create/update the execution role + create the Lambda
 #   bash infrastructure/lambdas/data-spot-dispatcher/deploy.sh --apply-iam # re-apply iam-policy.json only (no bootstrap side effects, config#2825)
+#   NE_ENV=staging ACCOUNT_ID_STAGING=<registry> bash .../deploy.sh  # staging: create-if-absent + code + env, never IAM (I13187)
 #   bash infrastructure/lambdas/data-spot-dispatcher/deploy.sh --dry-run   # show actions, do not apply
 #
 # alpha-engine-config-I11227: iam-policy.json's `ec2:RunInstances` grant was
@@ -75,6 +76,25 @@ ACCOUNT_ID="${ACCOUNT_ID:-711398986525}"
 # handler reads (index.py: DISPATCH_ENABLED); every other DATA_SPOT_* knob uses
 # the handler's in-code default, so they are intentionally NOT set here.
 PROD_ENV='Variables={LOG_LEVEL=INFO,DATA_SPOT_DISPATCH_ENABLED=true}'
+FN_ENV="${PROD_ENV}"
+
+# ── Staging mode (alpha-engine-config-I13187, S-18 follow-up) ───────────────
+# NE_ENV=staging deploys the SAME code to the staging account. It never runs
+# --bootstrap or --apply-iam: the execution role, box role, instance profile,
+# security group and key pair are codified in nous-ergon-ops
+# (infrastructure/tofu/staging, nous-ergon-ops-PR2108) and applied there. It
+# creates the function when absent, with that role. Its environment is the
+# registry's dispatcher_environment('staging') (store + run-log bucket) plus
+# the four launch values the dispatcher has no default for outside prod
+# (index.py::_per_env): subnets (the default-for-az subnets) and the security
+# group id (by name) are resolved here with the two Describe calls the staging
+# deploy role holds; the key pair and instance profile are names. The box
+# clones alpha-engine-config with an App token it mints itself
+# (DATA_SPOT_GH_CREDENTIAL=app, option (a)): staging has no fleet PAT.
+DEPLOY_ENV="${NE_ENV:-prod}"
+STAGING_SG_NAME="alpha-engine-data-spot"
+STAGING_KEY_NAME="alpha-engine-data-spot"
+STAGING_PROFILE="nousergon-data-collection-box-profile"
 
 # Timeout must cover the handler's worst case: launch a spot (RunInstances +
 # state poll, tens of seconds; longer on the on-demand fallback after capacity
@@ -109,6 +129,42 @@ done
 
 # shellcheck source=infrastructure/lambdas/_shared/deploy_run.sh
 source "${SCRIPT_DIR}/../_shared/deploy_run.sh"
+
+if [ "${DEPLOY_ENV}" != "prod" ]; then
+  if [ "${DEPLOY_ENV}" != "staging" ]; then
+    echo "ERROR: NE_ENV=${DEPLOY_ENV} is not prod or staging" >&2; exit 2
+  fi
+  if $BOOTSTRAP || $APPLY_IAM; then
+    echo "ERROR: --bootstrap/--apply-iam are prod-only; staging IAM is codified in nous-ergon-ops infrastructure/tofu/staging" >&2
+    exit 2
+  fi
+  [ -n "${ACCOUNT_ID_STAGING:-}" ] || { echo "ERROR: ACCOUNT_ID_STAGING is unset (resolve it from the registry)" >&2; exit 2; }
+  ACCOUNT_ID="${ACCOUNT_ID_STAGING}"
+  STAGING_SUBNETS=$(aws ec2 describe-subnets --region "${REGION}" \
+    --filters Name=default-for-az,Values=true \
+    --query 'Subnets[].SubnetId' --output text | tr -s '\t ' ',')
+  [ -n "${STAGING_SUBNETS}" ] && [ "${STAGING_SUBNETS}" != "None" ] \
+    || { echo "ERROR: no default-for-az subnets in the staging account" >&2; exit 2; }
+  STAGING_SG=$(aws ec2 describe-security-groups --region "${REGION}" \
+    --filters "Name=group-name,Values=${STAGING_SG_NAME}" \
+    --query 'SecurityGroups[0].GroupId' --output text)
+  [[ "${STAGING_SG}" == sg-* ]] \
+    || { echo "ERROR: security group ${STAGING_SG_NAME} not found in staging (apply nous-ergon-ops-PR2108 first)" >&2; exit 2; }
+  # JSON, not shorthand: the subnet list carries commas.
+  FN_ENV=$(python3 - "${SCRIPT_DIR}/../../data_collection_env_params.py" <<PY
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("p", sys.argv[1]); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+v = {"LOG_LEVEL": "INFO", "DATA_SPOT_DISPATCH_ENABLED": "true"}
+v.update(m.dispatcher_environment("staging"))
+assert v["NE_ENV"] == "staging", v
+v.update({"DATA_SPOT_SUBNETS": "${STAGING_SUBNETS}", "DATA_SPOT_SECURITY_GROUP": "${STAGING_SG}",
+          "DATA_SPOT_KEY_NAME": "${STAGING_KEY_NAME}", "DATA_SPOT_IAM_PROFILE": "${STAGING_PROFILE}",
+          "DATA_SPOT_GH_CREDENTIAL": "app", "DATA_SPOT_GH_APP_SSM_PREFIX": "/nous-ergon/github_app/"})
+print(json.dumps({"Variables": v}, sort_keys=True))
+PY
+)
+  echo "Staging environment: ${FN_ENV}"
+fi
 
 # ----- Preflight handler unit tests (shared gate — config#2381) -------------
 # These tests existed beside index.py and this deploy.sh never ran them, so
@@ -238,6 +294,26 @@ fi
 # 404 (set -e aborts) — deliberately: a flagless run cannot silently "succeed"
 # when the function was never created. Run --bootstrap first.
 
+if [ "${DEPLOY_ENV}" = "staging" ] \
+  && ! aws lambda get-function --function-name "${FUNCTION_NAME}" --region "${REGION}" \
+       --query 'Configuration.FunctionName' --output text >/dev/null 2>&1; then
+  echo "Creating Lambda in staging: ${FUNCTION_NAME} (role ${ROLE_NAME}, codified in nous-ergon-ops)"
+  run aws lambda create-function \
+    --function-name "${FUNCTION_NAME}" \
+    --runtime python3.12 \
+    --role "arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}" \
+    --handler index.handler \
+    --zip-file "fileb://${ZIP}" \
+    --timeout "${FN_TIMEOUT}" \
+    --memory-size "${FN_MEMORY}" \
+    --environment "${FN_ENV}" \
+    --region "${REGION}" \
+    --query 'FunctionArn' --output text
+  if ! $DRY_RUN; then
+    aws lambda wait function-active-v2 --function-name "${FUNCTION_NAME}" --region "${REGION}"
+  fi
+fi
+
 echo "Updating Lambda function code: ${FUNCTION_NAME}"
 run aws lambda update-function-code \
   --function-name "${FUNCTION_NAME}" \
@@ -263,7 +339,7 @@ echo "✓ Code deployed."
 echo "Converging Lambda environment..."
 run aws lambda update-function-configuration \
   --function-name "${FUNCTION_NAME}" \
-  --environment "${PROD_ENV}" \
+  --environment "${FN_ENV}" \
   --timeout "${FN_TIMEOUT}" \
   --memory-size "${FN_MEMORY}" \
   --region "${REGION}" \
@@ -273,7 +349,7 @@ if ! $DRY_RUN; then
     --function-name "${FUNCTION_NAME}" \
     --region "${REGION}"
 fi
-echo "✓ Env converged: ${PROD_ENV}"
+echo "✓ Env converged: ${FN_ENV}"
 
 echo ""
 echo "Done. Next (operator): re-run the affected pipeline once to validate end to"

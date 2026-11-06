@@ -63,7 +63,14 @@ DEFERRED_CONSUMER = "deploy-scheduled-groom-dispatcher.yml"
 #: to survive that form, or the first public-safe workflow silently drops out of
 #: every count in this module — which is exactly what `data-report.yml` did
 #: before this pattern was widened.
-_ACCOUNT = r"(?:\d+|\$\{\{\s*vars\.[A-Za-z0-9_]+\s*\}\})"
+#: A third form since alpha-engine-config-I13187: a STEP OUTPUT holding an
+#: account the fleet registry resolved (`nousergon_lib.env`, e.g. staging's in
+#: deploy-data-spot-dispatcher.yml), which is never a literal and never a repo
+#: variable because it names another account.
+_ACCOUNT = (
+    r"(?:\d+|\$\{\{\s*vars\.[A-Za-z0-9_]+\s*\}\}"
+    r"|\$\{\{\s*steps\.[A-Za-z0-9_-]+\.outputs\.[A-Za-z0-9_]+\s*\}\})"
+)
 _ARN = rf"arn:aws:iam::{_ACCOUNT}:role/[A-Za-z0-9+=,.@_-]+"
 
 _ROLE_TO_ASSUME = re.compile(

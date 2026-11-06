@@ -305,6 +305,9 @@ DISPATCHER_PER_ENV = {
     "DATA_SPOT_SECURITY_GROUP",
     "DATA_SPOT_KEY_NAME",
     "DATA_SPOT_IAM_PROFILE",
+    # alpha-engine-config-I13187: how the box authenticates its config clone
+    # (prod `pat`; staging sets `app`, deploy.sh's staging mode).
+    "DATA_SPOT_GH_CREDENTIAL",
 }
 
 

@@ -107,15 +107,6 @@ DECLARED: dict[str, tuple[str, str]] = {
 #: gap is deleted here in the PR that closes it. ``None`` = declared, no probe.
 RUNTIME_GAPS: tuple[tuple[str, str, tuple[str, str, bool] | None], ...] = (
     (
-        "dispatcher-deploy",
-        "deploy-data-spot-dispatcher.yml deploys the prod account only; no staging dispatcher exists for the "
-        "staging state machines to invoke. Its staging deploy must set dispatcher_environment('staging') plus "
-        "DATA_SPOT_SUBNETS / _SECURITY_GROUP / _KEY_NAME / _IAM_PROFILE from staging launch resources that do "
-        "not exist yet (staging tofu); the dispatcher refuses to import outside prod without them, and outside "
-        "prod it prefixes `export NE_ENV=<env>; ` on every box command so the box scopes its universe (I12506).",
-        ("infrastructure/lambdas/data-spot-dispatcher/deploy.sh", "NE_ENV", False),
-    ),
-    (
         "replay-inputs",
         "S-18 acceptance is a green light run on REPLAYED vendor inputs; the collection workloads have no "
         "replay input mode and would call live vendors.",
@@ -162,7 +153,8 @@ def dispatcher_environment(env_name: str | None = None, *, registry: Path | None
     its own crucible bucket). Prod's values are the dispatcher's in-code prod
     defaults (pinned equal by the tests), so prod's deploy sets none of them.
     The launch values (subnets, security group, key pair, box profile) are
-    account resources the registry does not carry; see ``dispatcher-deploy``.
+    account resources the registry does not carry; the dispatcher's staging
+    deploy resolves them (deploy.sh, ``NE_ENV=staging``, alpha-engine-config-I13187).
     """
     e = _resolve(env_name, registry)
     if e.name not in DEFINITION_BUCKET_ROLE:
