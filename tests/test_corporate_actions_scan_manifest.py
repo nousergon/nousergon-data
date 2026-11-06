@@ -38,6 +38,12 @@ class FakeClient:
         return [{"ticker": "KO", "cash_amount": 0.51, "currency": "USD",
                  date_field: end, "record_date": "2026-10-01"}]
 
+    def get_all_delistings_between(self, start, end):
+        self.calls.append(("delistings", start, end))
+        if self.fail_on == "delistings":
+            raise RuntimeError("polygon 400 after retries")
+        return [{"ticker": "ACQD", "delisted_date": end}]
+
 
 class FakeS3:
     def __init__(self):
@@ -63,7 +69,10 @@ def test_a_complete_scan_is_written_with_every_query(monkeypatch):
     assert body["schema"] == sm.SCHEMA and body["complete"] is True
     assert (body["window_start"], body["window_end"]) == ("2026-10-24", "2026-10-26")
     assert len(body["splits"]) == len(body["dividends_paid"]) == len(body["dividends_ex"]) == 1
-    assert {c[0] for c in client.calls} == {"splits", "pay_date", "ex_dividend_date"}
+    assert {c[0] for c in client.calls} == {
+        "splits", "pay_date", "ex_dividend_date", "delistings"}
+    assert body["delistings"] == [{"ticker": "ACQD", "delisted_date": "2026-10-26"}]
+    assert body["delistings_complete"] is True and "delistings_error" not in body
     assert len(body["content_sha256"]) == 64
 
 
@@ -172,3 +181,71 @@ def test_strict_dividends_query_raises_on_forbidden(monkeypatch):
         client.get_all_dividends_between("2026-10-22", "2026-10-22")
     with pytest.raises(ValueError):
         client.get_all_dividends_between("2026-10-22", "2026-10-22", date_field="nope")
+
+
+def test_a_failed_delisting_query_still_writes_the_scan_but_says_so(monkeypatch):
+    # I13312: the delisting query is held apart, so its failure never takes the
+    # dividend and split lists away from the reconciler.
+    monkeypatch.setattr(sm, "window_start", lambda d: "2026-11-05")
+    s3 = FakeS3()
+    out = sm.run("2026-11-05", bucket="b", client=FakeClient(fail_on="delistings"), s3=s3)
+    assert out["status"] == "ok" and out["delistings_complete"] is False
+    body = s3.objects[("b", out["key"])]
+    assert body["complete"] is True and len(body["splits"]) == 1
+    assert body["delistings"] == [] and body["delistings_complete"] is False
+    assert "polygon 400" in body["delistings_error"]
+
+
+def _client_with_pages(monkeypatch, pages):
+    client = PolygonClient.__new__(PolygonClient)
+    calls = []
+
+    def fake_get(path, params=None):
+        calls.append((path, dict(params or {})))
+        return pages[len(calls) - 1]
+
+    monkeypatch.setattr(client, "_get", fake_get, raising=False)
+    return client, calls
+
+
+def test_delistings_query_keeps_the_window_and_stops_past_its_start(monkeypatch):
+    pages = [
+        {"results": [
+            {"ticker": "LATER", "delisted_utc": "2026-11-07T05:00:00Z"},
+            {"ticker": "ACQD", "delisted_utc": "2026-11-06T03:30:00Z"},  # 11-05 in New York
+            {"ticker": "NOSTAMP"},
+            {"ticker": "GONE", "delisted_utc": "2026-11-05T05:00:00Z"}],
+         "next_url": "https://api.polygon.io/v3/reference/tickers?cursor=p2&apiKey=SECRET"},
+        {"results": [
+            {"ticker": "OLDCO", "delisted_utc": "2026-11-04T05:00:00Z"},
+            {"ticker": "OLDER", "delisted_utc": "2026-11-01T05:00:00Z"}],
+         "next_url": "https://api.polygon.io/v3/reference/tickers?cursor=p3&apiKey=SECRET"},
+    ]
+    client, calls = _client_with_pages(monkeypatch, pages)
+    rows = client.get_all_delistings_between("2026-11-05", "2026-11-05")
+    assert [(r["ticker"], r["delisted_date"]) for r in rows] == [
+        ("ACQD", "2026-11-05"), ("GONE", "2026-11-05")]
+    assert len(calls) == 2  # stopped on the page that reached past the start
+    assert calls[0][1]["active"] == "false" and calls[0][1]["sort"] == "delisted_utc"
+    assert calls[0][1]["order"] == "desc"
+    assert calls[1][1] == {"cursor": "p2"}  # apiKey never re-sent from next_url
+
+
+def test_delistings_query_refuses_rows_out_of_order(monkeypatch):
+    pages = [{"results": [
+        {"ticker": "A", "delisted_utc": "2026-11-05T05:00:00Z"},
+        {"ticker": "B", "delisted_utc": "2026-11-06T05:00:00Z"}]}]
+    client, _ = _client_with_pages(monkeypatch, pages)
+    with pytest.raises(RuntimeError, match="descending"):
+        client.get_all_delistings_between("2026-11-01", "2026-11-06")
+
+
+def test_delistings_query_raises_on_forbidden(monkeypatch):
+    client = PolygonClient.__new__(PolygonClient)
+
+    def fake_get(path, params=None):
+        raise PolygonForbiddenError("403")
+
+    monkeypatch.setattr(client, "_get", fake_get, raising=False)
+    with pytest.raises(PolygonForbiddenError):
+        client.get_all_delistings_between("2026-11-05", "2026-11-05")
