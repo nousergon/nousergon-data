@@ -120,11 +120,18 @@ guards:
     state: present
     note: "PriceBar (sources/contract.py:106)"
   pit:
-    state: absent
+    state: present
+    code:
+      - "dates.py::refuse_bars_after"
+    evaluates: "if not after.any():"
     note: >-
-        no code halts or refuses on this class for this unit (audit §4.1). The guard is
-        phase-2 work; the clause is UNMET until it exists and is commissioned by an
-        induced fault (P-19).
+        Fetch-boundary point-in-time refusal (alpha-engine-config-I10794, ruling (a)):
+        collectors/prices.py::_refresh_stale reads every vendor frame through
+        dates.py::clip_to_trading_day, which calls refuse_bars_after, so a bar dated
+        after the run's as-of date raises FutureBarRefused with a PIT_FUTURE_BAR finding
+        and the run files `failed`; nothing is trimmed. The short-fetch retry re-raises
+        the refusal instead of discarding the attempt (alpha-engine-config-I12676).
+        Commissioned by tests/test_guard_commissioning_pit.py's D03 case.
   vendor_fallback:
     state: absent
     note: >-
