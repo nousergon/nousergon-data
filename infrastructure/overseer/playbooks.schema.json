@@ -447,7 +447,18 @@
               "tracked-only",
               "dynamic"
             ],
-            "description": "alpha-engine-config-I6751 Phase 1 (subsumes I6293). The DELIVERY tier, decided by actionability, not by the severity string. `page` = broken now, email + Telegram buzz. `notify-silent` = degraded/suboptimal or a lifecycle notice \u2014 Telegram silent, no email. `tracked-only` = hygiene/conformance/drift \u2014 zero notification; the drain's disposition issue IS the remediation path (observability-policy.md 7.4). `dynamic` = resolved per emission from the runtime severity (critical->page, error->notify-silent, warning/info->tracked-only), for rows whose `severities` is [dynamic] or whose seriousness genuinely varies with the observed facts (7.1: derived where derivable). Suppression is a DELIVERY decision only: every tier still emits its full signal set, its console state and its bus event (7.2a)."
+            "description": "alpha-engine-config-I6751 Phase 1 (subsumes I6293). The DELIVERY tier, decided by actionability, not by the severity string. `page` = broken now, email + Telegram buzz. `notify-silent` = degraded/suboptimal or a lifecycle notice \u2014 Telegram silent, no email. `tracked-only` = hygiene/conformance/drift \u2014 zero notification; the drain's disposition issue IS the remediation path (observability-policy.md 7.4). `dynamic` = resolved per emission from the runtime severity (critical/alarm->page, error/warning/info->tracked-only (krepis, \u00a77.2b)), for rows whose `severities` is [dynamic] or whose seriousness genuinely varies with the observed facts (7.1: derived where derivable). Suppression is a DELIVERY decision only: every tier still emits its full signal set, its console state and its bus event (7.2a)."
+          },
+          "chat": {
+            "enum": [
+              "action",
+              "critical",
+              "order-book",
+              "pipelines",
+              "critical-only",
+              "none"
+            ],
+            "description": "observability-policy.md \u00a77.2b (Brian, 2026-11-06): the chat carries four classes only. `action` = only Brian can do it, sent once when it opens (tier page). `critical` = money, the trading path or a production outage the automation cannot fix in time, once per cause (tier page). `order-book` / `pipelines` = the two daily digests (tier notify-silent). `critical-only` = a dynamic row that reaches the chat only at critical/alarm severity. `none` = never the chat: recorded, listed on /page/incidents, drained by the nightly sweep (tier tracked-only)."
           },
           "page_after_consecutive": {
             "type": "integer",

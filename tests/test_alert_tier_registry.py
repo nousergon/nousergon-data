@@ -86,21 +86,46 @@ def test_dynamic_tier_is_only_used_where_severity_is_a_runtime_fact(rows):
     )
 
 
-def test_no_critical_only_class_is_routed_to_tracked_only(rows):
-    """A class that can ONLY fire at critical/alarm is not hygiene.
+#: observability-policy.md §7.2b (Brian, 2026-11-06): the chat carries four
+#: classes only, and the class decides the tier. A row's tier that disagrees
+#: with its chat class is the drift this table exists to catch.
+CHAT_TIER = {
+    "action": {"page"},
+    "critical": {"page"},
+    "order-book": {"notify-silent"},
+    "pipelines": {"notify-silent"},
+    "critical-only": {"dynamic"},
+    "none": {"tracked-only"},
+}
 
-    This is the assertion that stops the tier field from becoming a mute
-    switch. A genuinely-broken condition may be held by
-    `page_after_consecutive`, never by a tier declaration.
+
+def test_every_alert_class_declares_its_chat_class_and_the_tier_follows(rows):
+    """§7.2b: every row says which of the four chat classes it is, or `none`.
+
+    This replaces the 2026-09 guard that refused a critical-only class at
+    tracked-only. Severity no longer decides whether a message reaches the
+    chat; the chat class does, and it is declared per row where review sees it.
+    A critical that only the nightly sweep needs is `chat: none`, by name.
+    The one exception is the email-digest row, which is not a chat sender.
     """
-    offenders = [
-        r["class"] for r in rows
-        if r["tier"] == "tracked-only"
-        and set(r["severities"]) <= {"critical", "alarm"}
+    missing = [r["class"] for r in rows if "chat" not in r]
+    assert missing == [], f"rows with no chat class: {missing}"
+    wrong = [
+        (r["class"], r["chat"], r["tier"]) for r in rows
+        if r["class"] != "fleet_email_digests"
+        and r["tier"] not in CHAT_TIER.get(r["chat"], set())
     ]
-    assert offenders == [], (
-        f"critical-only classes declared tracked-only: {offenders}"
-    )
+    assert wrong == [], f"tier disagrees with chat class: {wrong}"
+
+
+def test_the_daily_digests_are_the_only_scheduled_chat_messages(rows):
+    """§7.2b: one order-book row and the pipelines rows are the only
+    notify-silent (non-email) rows; anything else there is a chat message
+    outside the four classes."""
+    silent = sorted(r["class"] for r in rows
+                    if r["tier"] == "notify-silent" and r["class"] != "fleet_email_digests")
+    assert silent == sorted(["crucible_v2_morning_report",
+                             "data_collection_daily_report", "sf_completion_telegram"])
 
 
 def test_page_after_consecutive_is_a_positive_integer(rows):
