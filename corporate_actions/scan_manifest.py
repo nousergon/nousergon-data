@@ -37,8 +37,9 @@ WHAT ONE MANIFEST COVERS:
       dated by the New York date of ``delisted_utc``
       (alpha-engine-config-I13312). Unlike the lists above, a failed delisting
       query does NOT withhold the manifest: the scan is written with
-      ``delistings: []``, ``delistings_complete: false`` and the error in
-      ``delistings_error``, so the dividend and split checks keep their source.
+      ``delistings: []``, ``delistings_complete: false`` and the exception
+      class in ``delistings_error`` (the full text is in the log), so the
+      dividend and split checks keep their source.
       ``delistings_complete: true`` is the only state in which an empty list
       means "nothing was delisted". The query is newer than the others and its
       paging depends on a vendor sort order it verifies as it reads, so it is
@@ -132,9 +133,10 @@ def _delistings(client, start: str, end: str) -> tuple[list[dict], bool, str | N
     except Exception as exc:  # noqa: BLE001 - recorded in the manifest and logged
         logger.error("corporate-action scan: delisting query %s..%s FAILED: %s",
                      start, end, exc, exc_info=True)
-        from polygon_client import _scrub_api_key
-
-        return [], False, _scrub_api_key(f"{type(exc).__name__}: {exc}")
+        # Only the exception CLASS goes into the manifest: the message can carry
+        # request details, and the manifest is hashed and shared. The log line
+        # above has the full text.
+        return [], False, type(exc).__name__
 
 
 def build_scan(client, day: str, *, start: str | None = None) -> dict:

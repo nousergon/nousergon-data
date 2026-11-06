@@ -193,7 +193,7 @@ def test_a_failed_delisting_query_still_writes_the_scan_but_says_so(monkeypatch)
     body = s3.objects[("b", out["key"])]
     assert body["complete"] is True and len(body["splits"]) == 1
     assert body["delistings"] == [] and body["delistings_complete"] is False
-    assert "polygon 400" in body["delistings_error"]
+    assert body["delistings_error"] == "RuntimeError"  # class only, never the message
 
 
 def _client_with_pages(monkeypatch, pages):
