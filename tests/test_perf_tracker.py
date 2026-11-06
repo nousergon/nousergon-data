@@ -817,3 +817,169 @@ def test_an_unmeasured_interval_nulls_the_series_from_there_and_an_unreadable_on
 def test_growth_follows_as_of():
     doc = build(ledger(SHORT), as_of=SHORT[9])
     assert list(doc["growth_pct"]["portfolio"]) == [d.isoformat() for d in SHORT[:10]]
+
+
+# ── alpha-engine-config-I12806: the v2 ledger proves flow-free intervals ───
+
+
+V2_DAYS = weekdays(date(2026, 11, 2), 4)  # Mon..Thu; base of WTD is the prior Friday
+V2_ALL = weekdays(date(2026, 10, 26), 9)  # Mon 10-26 .. Thu 11-05
+SHARES = {"AAA": 10, "BBB": 5}
+
+
+def v2_nav_csv(days, *, cash_cents=None, shares=None):
+    """The eod_pnl columns plus the IB cash and the positions snapshot."""
+    buf = io.StringIO()
+    buf.write("date,portfolio_nav,spy_close,spy_dividend_per_share,spy_return_pct,nav_basis,"
+              "total_cash,positions_snapshot\n")
+    nav, spy, prev = 1000.0, 100.0, None
+    for i, d in enumerate(days):
+        if i:
+            nav *= 1.001
+            spy *= 1.0005
+        pct = "" if prev is None else spy / prev * 100 - 100
+        cash = (cash_cents or {}).get(d, 50_000_00)
+        snap = json.dumps({t: {"shares": q, "market_value": 1.0}
+                           for t, q in (shares or {}).get(d, SHARES).items()})
+        snap = '"' + snap.replace('"', '""') + '"'
+        buf.write(f"{d.isoformat()},{nav},{spy},0.0,{pct},settled_close,{cash / 100:.2f},{snap}\n")
+        prev = spy
+    return buf.getvalue()
+
+
+def recon(day, *, cash=50_000_00, ledger_cash=None, positions=None, ties=True, breaks=(),
+          missing=(), schema="ledger_reconciliation.v1"):
+    pos = dict(SHARES if positions is None else positions)
+    return {
+        "schema_version": schema,
+        "trading_day": day.isoformat(),
+        "broker_cash_cents": cash,
+        "ledger_cash_cents": cash if ledger_cash is None else ledger_cash,
+        "broker_positions": pos,
+        "ledger_positions": dict(pos),
+        "breaks": list(breaks),
+        "checks": {"roll_forward": {"ties": ties}, "completeness": {"missing": list(missing)}},
+    }
+
+
+def journal(day, kinds=("fill", "commission", "interest_accrual", "cash_rounding")):
+    return {"schema_version": "ledger_journal.v1", "trading_day": day.isoformat(),
+            "entries": [{"kind": k} for k in kinds]}
+
+
+def v2_build(csv_text, ledger_days, days):
+    return pt.build(
+        pt.parse_nav_csv(csv_text), [], {"entries_read": 0, "transfer_entries": 0},
+        history(days, 100.0, 0.0005), history(days), now=NOW, ledger_days=ledger_days,
+    )
+
+
+def clean_ledger(days):
+    return {d: pt.parse_v2_ledger_day(d, recon(d), journal(d)) for d in days}
+
+
+def test_nav_parse_reads_ib_cash_in_exact_cents_and_the_share_counts():
+    row = pt.parse_nav_csv(v2_nav_csv(V2_ALL[:2], cash_cents={V2_ALL[1]: 496_823_06}))[1]
+    assert row.cash_cents == 496_823_06
+    assert dict(row.shares) == SHARES
+
+
+def test_a_v2_ledger_proven_interval_drops_the_flows_reason_and_only_there():
+    # Ledger records from Mon 11-02 on: the Day window (Wed->Thu) is proven,
+    # WTD's first interval (Fri 10-30 -> Mon 11-02) has no base record.
+    doc = v2_build(v2_nav_csv(V2_ALL), clean_ledger(V2_DAYS), V2_ALL)
+    day = window(doc, "day")
+    assert day["cells"]["absolute"]["status"] == pt.STATUS_OK
+    assert day["cells"]["absolute"]["reasons"] == []
+    assert day["cells"]["vs_spy"]["status"] == pt.STATUS_OK
+    wtd = window(doc, "wtd")["cells"]["absolute"]
+    assert wtd["status"] == pt.STATUS_ESTIMATED
+    assert wtd["reasons"] == [pt.REASON_FLOWS]
+    assert doc["inputs"]["flows"]["v2_ledger"]["flow_free_intervals"] == 3
+    assert doc["inputs"]["flows"]["v2_ledger"]["days_read"] == 4
+
+
+def _day_cell(ledger_days, csv_text=None):
+    doc = v2_build(csv_text or v2_nav_csv(V2_ALL), ledger_days, V2_ALL)
+    return window(doc, "day")["cells"]["absolute"]
+
+
+@pytest.mark.parametrize("bad", [
+    {"breaks": [{"class": "cash_gap"}]},
+    {"ties": False},
+    {"missing": ["2026-11-04"]},
+    {"ledger_cash": 50_000_01},
+    {"schema": "ledger_reconciliation.v2"},
+])
+def test_an_unclean_end_record_keeps_the_interval_estimated(bad):
+    led = clean_ledger(V2_DAYS)
+    end = V2_DAYS[-1]
+    led[end] = pt.parse_v2_ledger_day(end, recon(end, **bad), journal(end))
+    cell = _day_cell(led)
+    assert cell["status"] == pt.STATUS_ESTIMATED
+    assert pt.REASON_FLOWS in cell["reasons"]
+
+
+@pytest.mark.parametrize("kind", [
+    "opening_balance", "declared_cash_flow", "cash_gap", "position_gap", "adjustment", "split",
+    "a_kind_added_later",
+])
+def test_a_journal_kind_that_can_carry_or_hide_a_flow_keeps_the_interval_estimated(kind):
+    led = clean_ledger(V2_DAYS)
+    end = V2_DAYS[-1]
+    led[end] = pt.parse_v2_ledger_day(end, recon(end), journal(end, ("fill", kind)))
+    assert _day_cell(led)["status"] == pt.STATUS_ESTIMATED
+
+
+def test_an_unreadable_journal_or_a_missing_base_record_keeps_it_estimated():
+    led = clean_ledger(V2_DAYS)
+    end = V2_DAYS[-1]
+    led[end] = pt.parse_v2_ledger_day(end, recon(end), None)
+    assert _day_cell(led)["status"] == pt.STATUS_ESTIMATED
+    led = clean_ledger(V2_DAYS)
+    del led[V2_DAYS[-2]]
+    assert _day_cell(led)["status"] == pt.STATUS_ESTIMATED
+    assert pt.parse_v2_ledger_day(end, {"schema_version": "ledger_reconciliation.v1"}, None) is None
+
+
+def test_the_nav_row_must_carry_ibs_cash_and_shares_to_the_cent():
+    end = V2_DAYS[-1]
+    off_cash = v2_nav_csv(V2_ALL, cash_cents={end: 50_000_01})
+    assert _day_cell(clean_ledger(V2_DAYS), off_cash)["status"] == pt.STATUS_ESTIMATED
+    off_base = v2_nav_csv(V2_ALL, cash_cents={V2_DAYS[-2]: 49_999_99})
+    assert _day_cell(clean_ledger(V2_DAYS), off_base)["status"] == pt.STATUS_ESTIMATED
+    off_shares = v2_nav_csv(V2_ALL, shares={end: {"AAA": 10, "BBB": 6}})
+    assert _day_cell(clean_ledger(V2_DAYS), off_shares)["status"] == pt.STATUS_ESTIMATED
+
+
+def test_without_ledger_days_every_cell_keeps_the_flows_reason():
+    doc = v2_build(v2_nav_csv(V2_ALL), None, V2_ALL)
+    assert window(doc, "day")["cells"]["absolute"]["reasons"] == [pt.REASON_FLOWS]
+    assert doc["inputs"]["flows"]["v2_ledger"]["days_read"] == 0
+
+
+def test_load_reads_the_v2_records_and_survives_their_absence(monkeypatch):
+    monkeypatch.setattr(pt, "V2_LEDGER_FIRST_DAY", V2_DAYS[0])
+    closes = {"closes": [[d.isoformat(), 100.0 + i] for i, d in enumerate(V2_ALL)]}
+    base = {
+        pt.NAV_KEY: v2_nav_csv(V2_ALL).encode(),
+        pt.CLOSE_HISTORY_KEY.format(symbol="SPY"): json.dumps(closes).encode(),
+        pt.CLOSE_HISTORY_KEY.format(symbol="QQQ"): json.dumps(closes).encode(),
+    }
+    v2 = {}
+    for d in V2_DAYS:
+        kw = {"tenant": pt.V2_LEDGER_TENANT, "day": d.isoformat()}
+        v2[pt.V2_RECONCILIATION_KEY.format(**kw)] = json.dumps(recon(d)).encode()
+        v2[pt.V2_JOURNAL_KEY.format(**kw)] = json.dumps(journal(d)).encode()
+    doc = pt.load_and_build(FakeS3({**base, **v2}), "bucket", now=NOW)
+    assert window(doc, "day")["cells"]["absolute"]["status"] == pt.STATUS_OK
+    assert doc["inputs"]["flows"]["v2_ledger"]["days_read"] == len(V2_DAYS)
+    bare = pt.load_and_build(FakeS3(base), "bucket", now=NOW)
+    assert window(bare, "day")["cells"]["absolute"]["reasons"] == [pt.REASON_FLOWS]
+
+
+def test_close_history_mapping_row_is_skipped_not_raised():
+    # codex 385d8cccc8e6d68a residual: a mapping where a [date, close] pair
+    # belongs raised KeyError past the optional-input guard.
+    doc = {"closes": [{"date": "2026-01-02"}, ["2026-01-05", 101.5]]}
+    assert pt.parse_close_history(doc) == {date(2026, 1, 5): 101.5}

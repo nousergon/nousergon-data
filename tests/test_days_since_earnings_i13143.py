@@ -69,3 +69,23 @@ def test_consumer_absent_is_none_not_zero():
 def test_consumer_passes_produced_value():
     entry = _alt_entry_from_payload({"eps_revision": {"days_since_earnings": 12}})
     assert entry["earnings"]["days_since_earnings"] == 12
+
+
+def test_replay_of_an_old_date_widens_the_window_back_to_the_anchor():
+    """alpha-engine-config-I13240 (d1cdb30f): the yfinance window counts back
+    from today, so a fixed 8 rows cannot reach a replay anchor ~2 years old."""
+    from datetime import datetime, timedelta, timezone
+
+    mod = _yf_with_dates([("2024-10-29 16:30", 1.85)])
+    old = (datetime.now(timezone.utc).date() - timedelta(days=730)).isoformat()
+    _days(mod, run_date=old)
+    limit = mod.Ticker.return_value.get_earnings_dates.call_args.kwargs["limit"]
+    assert limit >= 8 + 730 // 91
+
+
+def test_a_run_for_today_keeps_the_base_window():
+    from datetime import datetime, timezone
+
+    mod = _yf_with_dates([("2024-10-29 16:30", 1.85)])
+    _days(mod, run_date=datetime.now(timezone.utc).date().isoformat())
+    assert mod.Ticker.return_value.get_earnings_dates.call_args.kwargs["limit"] == 8

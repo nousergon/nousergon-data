@@ -2170,6 +2170,11 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
                 logger.info("Loaded %d tickers from existing constituents.json", len(tickers))
         except Exception as exc:
             logger.warning("S3 constituents load failed — will fall back to Wikipedia: %s", exc)
+    # 1b replays FULL-universe index changes backward, so it needs the full
+    # roster; replaying them from a subset reconstructs the wrong membership
+    # (alpha-engine-config-I13240 ccf4e341). In prod scope() returns this very
+    # object, so the two are identical there.
+    full_roster = tickers
     tickers = universe_scope.scope(tickers, path="phase1")
 
     # ── 1b. Historical (point-in-time) constituents ──────────────────────────
@@ -2185,7 +2190,7 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
         logger.info("=" * 60)
         logger.info("COLLECTING: historical constituents (point-in-time membership)")
         logger.info("=" * 60)
-        if not tickers:
+        if not full_roster:
             logger.warning(
                 "No tickers available — skipping historical constituents (PIT map "
                 "needs today's roster to replay changes from)"
@@ -2197,7 +2202,7 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
             results["collectors"]["historical_constituents"] = _phase_collect(
                 reg, "historical_constituents",
                 lambda: historical_constituents.collect(
-                    bucket=bucket, current_tickers=tickers,
+                    bucket=bucket, current_tickers=full_roster,
                     s3_prefix=market_prefix, dry_run=dry_run,
                 ),
                 artifact_key=f"{market_prefix}historical_constituents.json",
@@ -5386,8 +5391,36 @@ def _seed_index_entrants(
         if admits_universe_write(t) and t.lstrip("^") not in not_members
     }
     present = set(get_universe_lib(bucket).list_symbols())
-    entrants = sorted(wanted - present)
+    missing = wanted - present
+    # A name the delisted-prune has already RETIRED to `delisted_history` is
+    # not an entrant: it is absent from `universe` because it stopped trading,
+    # and the membership document still lists it only until the next weekly
+    # constituents refresh. Measured 2026-11-05 (alpha-engine-config-I13299):
+    # KVUE (acquired; last bar 2026-10-30) was pruned 11-04 12:33Z, stayed in
+    # the 10-30 constituents, and its per-ticker backfill ate the whole 600s
+    # bound. The prune's retention record is the newer, more specific fact.
+    retired: list[str] = []
+    if missing:
+        try:
+            from store.arctic_store import get_delisted_history_lib
+            retained = set(get_delisted_history_lib(bucket).list_symbols())
+        except Exception:  # noqa: BLE001 — unreadable retention store must not block seeding
+            logger.warning(
+                "Index-entrant seed: delisted_history unreadable; seeding without "
+                "the retired-name filter", exc_info=True,
+            )
+            retained = set()
+        retired = sorted(missing & retained)
+        if retired:
+            logger.warning(
+                "Index-entrant seed: %d absent member(s) are retired in "
+                "delisted_history, not entrants; skipping: %s",
+                len(retired), retired,
+            )
+    entrants = sorted(missing - set(retired))
     summary: dict = {"entrants": entrants, "seeded": [], "errors": []}
+    if retired:
+        summary["retired_skipped"] = retired
     if not entrants:
         return {"status": "ok", **summary}
     if len(entrants) > _ENTRANT_SEED_MAX:

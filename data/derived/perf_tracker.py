@@ -33,6 +33,15 @@ Inputs and their basis (named, never silently swapped; Rule 5)
   is ``None`` and every cell carries the ``external_flows_not_journaled``
   estimate reason. When the builder lands, that constant moves to its first
   date in the same change and the reason drops for later windows.
+  Until then (alpha-engine-config-I12806) an interval ``(d_{t-1}, d_t]`` is
+  PROVEN flow-free by the v2 book of record (crucible-trader ``ledger.py``)
+  when, cents exact: both rows' ``total_cash`` and share counts equal IB's in
+  that day's ledger reconciliation, the ledger equals IB on both days, day
+  ``t``'s roll-forward ties with no break and no missing journal, its journal
+  holds only trading and income kinds (:data:`V2_NON_FLOW_KINDS`), and no
+  trading day lies between the rows. A window whose every interval is proven
+  drops ``external_flows_not_journaled``; any other window keeps it. Absent or
+  unreadable records prove nothing and change nothing else.
 * **SPY total return**: each ``eod_pnl`` row's persisted ``spy_return_pct``,
   the EOD reconcile's total-return leg on Polygon settled closes and
   ex-dividends (the same figure ``daily_alpha_pct`` is struck against, and
@@ -105,6 +114,7 @@ import logging
 import math
 import statistics
 import sys
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from collections.abc import Iterable, Mapping, Sequence
 import dataclasses
 from dataclasses import dataclass
@@ -148,6 +158,25 @@ TRANSFER_SOURCE = "transfer"
 #: First date from which the ledger journals every external flow. ``None``
 #: until the transfer builder lands; a window starting before it is estimated.
 FLOWS_JOURNALED_FROM: date | None = None
+#: The v2 book of record (crucible-trader ``ledger.py``): its daily
+#: reconciliation ties the ledger's cash and positions to IB's, cents exact
+#: (alpha-engine-config-I12806). Read-only, optional.
+V2_LEDGER_BUCKET = "alpha-engine-crucible-v2"
+V2_LEDGER_TENANT = "nous-ergon-paper"
+V2_RECONCILIATION_KEY = "crucible/trader/ledger/reconciliation/{tenant}/{day}.json"
+V2_JOURNAL_KEY = "crucible/trader/ledger/journal/{tenant}/{day}.json"
+V2_RECONCILIATION_SCHEMA = "ledger_reconciliation.v1"
+V2_JOURNAL_SCHEMA = "ledger_journal.v1"
+#: The v2 ledger's opening day; no record exists before it.
+V2_LEDGER_FIRST_DAY = date(2026, 11, 3)
+#: Journal kinds that move cash or shares only by trading or by income the
+#: account earns. Anything else (opening balance, declared cash flow, a gap or
+#: an adjustment into or out of suspense, a split, a kind added later) can
+#: carry or hide an external flow, so a day journaling one proves nothing.
+V2_NON_FLOW_KINDS = frozenset({
+    "fill", "commission", "interest_accrual", "interest_settlement",
+    "dividend_receivable", "dividend_settlement", "cash_rounding",
+})
 #: How far back a close lookup may reach for a missing date before giving up.
 CLOSE_LOOKBACK_DAYS = 7
 
@@ -254,6 +283,23 @@ class NavRow:
     nav_basis: str
     qqq_close: float | None = None
     qqq_dividend: float = 0.0
+    #: IB cash in whole cents and the share counts, from ``total_cash`` and
+    #: ``positions_snapshot``; ``None`` when absent or not exact.
+    cash_cents: int | None = None
+    shares: tuple[tuple[str, int], ...] | None = None
+
+
+@dataclass(frozen=True)
+class LedgerDay:
+    """One v2 ledger reconciliation day, reduced to what proves a flow-free day."""
+
+    day: date
+    broker_cash_cents: int
+    broker_positions: tuple[tuple[str, int], ...]
+    #: The ledger's cash and positions equal IB's at this close.
+    ledger_ties_broker: bool
+    #: This day's activity is fully journaled and holds no flow-capable kind.
+    activity_flow_free: bool
 
 
 @dataclass(frozen=True)
@@ -283,6 +329,65 @@ def _float_or_none(raw: str | None) -> float | None:
     except ValueError:
         return None
     return value if math.isfinite(value) else None
+
+
+def _cents(raw: str | None) -> int | None:
+    try:
+        return int((Decimal((raw or "").strip()) * 100).to_integral_value(ROUND_HALF_UP))
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def _share_counts(raw: Any) -> tuple[tuple[str, int], ...] | None:
+    """Non-zero integer share counts by ticker, or ``None`` when not exact."""
+    if not isinstance(raw, Mapping):
+        return None
+    out = []
+    for ticker, qty in raw.items():
+        qty = qty.get("shares") if isinstance(qty, Mapping) else qty
+        if isinstance(qty, bool) or not isinstance(qty, (int, float)) or qty != int(qty):
+            return None
+        if qty:
+            out.append((str(ticker), int(qty)))
+    return tuple(sorted(out))
+
+
+def _snapshot_shares(raw: str | None) -> tuple[tuple[str, int], ...] | None:
+    try:
+        return _share_counts(json.loads(raw or ""))
+    except ValueError:
+        return None
+
+
+def parse_v2_ledger_day(
+    day: date, recon: Mapping[str, Any] | None, journal: Mapping[str, Any] | None
+) -> LedgerDay | None:
+    """A v2 reconciliation day, or ``None`` when the record is unusable."""
+    if not isinstance(recon, Mapping) or recon.get("schema_version") != V2_RECONCILIATION_SCHEMA:
+        return None
+    cash, positions = recon.get("broker_cash_cents"), _share_counts(recon.get("broker_positions"))
+    if recon.get("trading_day") != day.isoformat() or type(cash) is not int or positions is None:
+        return None
+    checks = recon.get("checks") if isinstance(recon.get("checks"), Mapping) else {}
+    rolled = checks.get("roll_forward") if isinstance(checks.get("roll_forward"), Mapping) else {}
+    complete = checks.get("completeness") if isinstance(checks.get("completeness"), Mapping) else {}
+    ties = recon.get("ledger_cash_cents") == cash and _share_counts(recon.get("ledger_positions")) == positions
+    entries = journal.get("entries") if isinstance(journal, Mapping) else None
+    kinds_ok = (
+        isinstance(journal, Mapping)
+        and journal.get("schema_version") == V2_JOURNAL_SCHEMA
+        and journal.get("trading_day") == day.isoformat()
+        and isinstance(entries, list)
+        and all(isinstance(e, Mapping) and e.get("kind") in V2_NON_FLOW_KINDS for e in entries)
+    )
+    flow_free = (
+        ties
+        and kinds_ok
+        and rolled.get("ties") is True
+        and recon.get("breaks") == []
+        and complete.get("missing") == []
+    )
+    return LedgerDay(day, cash, positions, ties, flow_free)
 
 
 def parse_nav_csv(text: str) -> list[NavRow]:
@@ -319,6 +424,8 @@ def parse_nav_csv(text: str) -> list[NavRow]:
             nav_basis=(raw.get("nav_basis") or "").strip() or "unrecorded",
             qqq_close=qqq if qqq and qqq > 0 else None,
             qqq_dividend=_float_or_none(raw.get("qqq_dividend_per_share")) or 0.0,
+            cash_cents=_cents(raw.get("total_cash")),
+            shares=_snapshot_shares(raw.get("positions_snapshot")),
         )
     if not by_day:
         raise PerfInputError(f"{NAV_KEY} has no row with a positive NAV")
@@ -348,8 +455,8 @@ def parse_close_history(doc: Mapping[str, Any]) -> dict[date, float]:
         try:
             day = date.fromisoformat(str(pair[0])[:10])
             close = float(pair[1])
-        except (TypeError, ValueError, IndexError):
-            continue
+        except (TypeError, ValueError, IndexError, KeyError):
+            continue  # a mapping row raises KeyError on pair[0] (codex 385d8cccc8e6d68a)
         if math.isfinite(close) and close > 0:
             out[day] = close
     return out
@@ -675,6 +782,7 @@ def build(
     as_of: date | None = None,
     extra_histories: Mapping[str, Mapping[date, float] | None] | None = None,
     personal: Sequence[PersonalRow] | None = None,
+    ledger_days: Mapping[date, LedgerDay] | None = None,
 ) -> dict[str, Any]:
     """The whole ``perf_tracker.v1`` document. Pure; no I/O.
 
@@ -710,13 +818,38 @@ def build(
         lo, hi = rows[i - 1].day, rows[i].day
         return sum(a for d, a in flow_by_day.items() if lo < d <= hi)
 
+    ledger = ledger_days or {}
+
+    def ties_ib(row: NavRow, led: LedgerDay | None) -> bool:
+        return (
+            led is not None
+            and led.ledger_ties_broker
+            and row.cash_cents == led.broker_cash_cents
+            and row.shares == led.broker_positions
+        )
+
+    def proven_flow_free(i: int) -> bool:
+        """The v2 ledger proves no external flow in ``(d_{i-1}, d_i]``."""
+        prev, cur = rows[i - 1], rows[i]
+        end = ledger.get(cur.day)
+        return (
+            ties_ib(prev, ledger.get(prev.day))
+            and ties_ib(cur, end)
+            and end is not None
+            and end.activity_flow_free
+            and not calendar_gaps(prev.day, cur.day)
+            and interval_flow(i) == 0
+        )
+
     def legs(base: date, end: date) -> tuple[_Leg, _Leg, _Leg]:
         lo, hi = index[base], index[end]
         p_f, s_f, q_f = [], [], []
         p_reasons: list[str] = []
         s_reasons: list[str] = []
         q_reasons: list[str] = []
-        if FLOWS_JOURNALED_FROM is None or base < FLOWS_JOURNALED_FROM:
+        if (FLOWS_JOURNALED_FROM is None or base < FLOWS_JOURNALED_FROM) and not all(
+            proven_flow_free(i) for i in range(lo + 1, hi + 1)
+        ):
             p_reasons.append(REASON_FLOWS)
         off_basis = [r.day for r in rows[lo:hi + 1] if r.nav_basis != NAV_BASIS_SETTLED_CLOSE]
         if off_basis:
@@ -910,7 +1043,22 @@ def build(
         "benchmark_labels": BENCHMARK_LABELS,
         "inputs": {
             "nav": {"key": NAV_KEY, "rows": len(rows), "nav_basis_latest": rows[-1].nav_basis},
-            "flows": {"prefix": JOURNAL_PREFIX, "source": TRANSFER_SOURCE, **flows_summary},
+            "flows": {
+                "prefix": JOURNAL_PREFIX,
+                "source": TRANSFER_SOURCE,
+                **flows_summary,
+                "v2_ledger": {
+                    "reconciliation": f"s3://{V2_LEDGER_BUCKET}/"
+                    + V2_RECONCILIATION_KEY.format(tenant=V2_LEDGER_TENANT, day="{day}"),
+                    "basis": "an interval is flow-free when both rows' IB cash and shares equal "
+                    "the reconciled broker figures to the cent and the end day's journal ties "
+                    "with trading and income entries only",
+                    "days_read": sum(1 for r in rows if r.day in ledger),
+                    "flow_free_intervals": sum(
+                        1 for i in range(1, len(rows)) if proven_flow_free(i)
+                    ),
+                },
+            },
             "spy": {
                 "primary": f"{NAV_KEY} spy_return_pct (Polygon settled total return)",
                 "fallback": [
@@ -999,6 +1147,25 @@ def _optional_inputs(s3: Any, bucket: str) -> tuple[dict[str, dict[date, float] 
     return extra, personal
 
 
+def _v2_ledger_days(s3: Any, nav_rows: Sequence[NavRow]) -> dict[date, LedgerDay]:
+    """The v2 reconciliation day for each NAV row since the ledger opened.
+
+    Optional: a record that is absent or unreadable proves nothing."""
+    out: dict[date, LedgerDay] = {}
+    for row in nav_rows:
+        if row.day < V2_LEDGER_FIRST_DAY:
+            continue
+        kw = {"tenant": V2_LEDGER_TENANT, "day": row.day.isoformat()}
+        recon = _get_optional_json(s3, V2_LEDGER_BUCKET, V2_RECONCILIATION_KEY.format(**kw))
+        if recon is None:
+            continue
+        journal = _get_optional_json(s3, V2_LEDGER_BUCKET, V2_JOURNAL_KEY.format(**kw))
+        led = parse_v2_ledger_day(row.day, recon, journal)
+        if led is not None:
+            out[row.day] = led
+    return out
+
+
 def load_and_build(s3: Any, bucket: str, *, now: datetime, as_of: date | None = None) -> dict[str, Any]:
     nav_rows = parse_nav_csv(_get(s3, bucket, NAV_KEY).decode())
     flows, summary = flows_from_journal(_journal_entries(s3, bucket))
@@ -1007,7 +1174,7 @@ def load_and_build(s3: Any, bucket: str, *, now: datetime, as_of: date | None = 
     extra, personal = _optional_inputs(s3, bucket)
     return build(
         nav_rows, flows, summary, spy, qqq, now=now, as_of=as_of,
-        extra_histories=extra, personal=personal,
+        extra_histories=extra, personal=personal, ledger_days=_v2_ledger_days(s3, nav_rows),
     )
 
 
@@ -1041,12 +1208,13 @@ def load_and_backfill(s3: Any, bucket: str, *, now: datetime) -> list[dict[str, 
     spy = parse_close_history(json.loads(_get(s3, bucket, CLOSE_HISTORY_KEY.format(symbol="SPY"))))
     qqq = parse_close_history(json.loads(_get(s3, bucket, CLOSE_HISTORY_KEY.format(symbol="QQQ"))))
     extra, personal = _optional_inputs(s3, bucket)
+    ledger_days = _v2_ledger_days(s3, nav_rows)
     latest = nav_rows[-1].day.isoformat()
     docs = []
     for row in nav_rows[1:]:
         doc = build(
             nav_rows, flows, summary, spy, qqq, now=now, as_of=row.day,
-            extra_histories=extra, personal=personal,
+            extra_histories=extra, personal=personal, ledger_days=ledger_days,
         )
         doc["backfill"] = {"recomputed_from_inputs_as_of": latest}
         docs.append(doc)

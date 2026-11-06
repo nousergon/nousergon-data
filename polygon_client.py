@@ -597,6 +597,97 @@ class PolygonClient:
         results.sort(key=lambda r: (str(r[date_field]), r["ticker"]))
         return results
 
+    def get_all_delistings_between(
+        self, start_date: str, end_date: str, *, max_pages: int = 20
+    ) -> list[dict]:
+        """Every stock ticker Polygon delisted in ``[start_date, end_date]``.
+
+        A cash takeover, a merger into another issuer, and an exchange
+        delisting all end the same way in Polygon's reference data: the ticker
+        turns ``active=false`` with a ``delisted_utc`` stamp. The splits and
+        dividends endpoints never mention them, so without this query a held
+        name bought out for cash reaches the trader's three-way check as an
+        unexplained share move (alpha-engine-config-I13312).
+
+        Queries ``/v3/reference/tickers?active=false`` newest-delisted first
+        and stops at the first page that reaches back past ``start_date``.
+        The stop relies on that order, so the order is checked row by row and
+        a violation RAISES rather than returning a list that may be short.
+        Dates are the America/New_York calendar date of ``delisted_utc``.
+        Every query error raises, like the other strict ``*_between`` methods.
+        """
+        from urllib.parse import parse_qsl, urlsplit
+        from zoneinfo import ZoneInfo
+
+        new_york = ZoneInfo("America/New_York")
+        path = "/v3/reference/tickers"
+        params: dict = {
+            "market": "stocks",
+            "active": "false",
+            "sort": "delisted_utc",
+            "order": "desc",
+            "limit": 1000,
+        }
+        results: list[dict] = []
+        skipped = 0
+        previous: datetime | None = None
+        for _ in range(max_pages):
+            data = self._get(path, params=params)
+            reached_start = False
+            for r in data.get("results", []) or []:
+                ticker, stamp = r.get("ticker"), r.get("delisted_utc")
+                if not ticker or not stamp:
+                    skipped += 1
+                    continue
+                try:
+                    when = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+                except ValueError:
+                    skipped += 1
+                    continue
+                if when.tzinfo is None:
+                    when = when.replace(tzinfo=timezone.utc)
+                if previous is not None and when > previous:
+                    raise RuntimeError(
+                        "polygon delistings: rows not in delisted_utc descending "
+                        "order; refusing a possibly short list"
+                    )
+                previous = when
+                day = when.astimezone(new_york).date().isoformat()
+                if day > end_date:
+                    continue
+                if day < start_date:
+                    reached_start = True
+                    break
+                results.append(
+                    {
+                        "ticker": str(ticker),
+                        "delisted_date": day,
+                        "delisted_utc": str(stamp),
+                        "name": r.get("name"),
+                        "type": r.get("type"),
+                        "primary_exchange": r.get("primary_exchange"),
+                        "cik": r.get("cik"),
+                        "composite_figi": r.get("composite_figi"),
+                    }
+                )
+            next_url = data.get("next_url")
+            if reached_start or not next_url:
+                break
+            parts = urlsplit(next_url)
+            path = parts.path
+            params = {k: v for k, v in parse_qsl(parts.query) if k.lower() != "apikey"}
+        else:
+            raise RuntimeError(
+                f"polygon delistings {start_date}..{end_date}: more than {max_pages} pages"
+            )
+        if skipped:
+            logger.warning(
+                "polygon delistings %s..%s: skipped %d rows without a ticker or "
+                "a parseable delisted_utc", start_date, end_date, skipped,
+            )
+        results.sort(key=lambda r: (r["delisted_date"], r["ticker"]))
+        return results
+
     def get_dividends(self, ticker: str) -> list[dict]:
         """Fetch the cash-dividend history for one ticker (authoritative).
 

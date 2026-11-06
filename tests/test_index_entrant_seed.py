@@ -26,7 +26,7 @@ def _lib(symbols):
     return lib
 
 
-def _seed(expected, present, backfill_side_effect=None, dry_run=False):
+def _seed(expected, present, backfill_side_effect=None, dry_run=False, retired=()):
     calls = []
 
     def _fake_backfill(**kwargs):
@@ -36,9 +36,45 @@ def _seed(expected, present, backfill_side_effect=None, dry_run=False):
         return {"status": "ok"}
 
     with patch("store.arctic_store.get_universe_lib", return_value=_lib(present)), \
+         patch("store.arctic_store.get_delisted_history_lib", return_value=_lib(retired)), \
          patch("builders.backfill.backfill", side_effect=_fake_backfill):
         out = _real_seed(BUCKET, expected, dry_run=dry_run)
     return out, calls
+
+
+def test_a_member_already_retired_to_delisted_history_is_not_an_entrant():
+    # KVUE, 2026-11-05 (alpha-engine-config-I13299): pruned to delisted_history
+    # on 11-04 but still listed by the 10-30 constituents; seeding it spent the
+    # whole 600s bound on a name that no longer trades.
+    out, calls = _seed(
+        ["AAPL", "BE", "KVUE"], present=["AAPL"], retired=["KVUE", "HOLX"],
+    )
+    assert out["status"] == "ok"
+    assert out["entrants"] == ["BE"]
+    assert out["retired_skipped"] == ["KVUE"]
+    assert [c["ticker_filter"] for c in calls] == ["BE"]
+
+
+def test_only_retired_absentees_means_no_entrants_and_no_backfill():
+    out, calls = _seed(["AAPL", "KVUE"], present=["AAPL"], retired=["KVUE"])
+    assert out == {"status": "ok", "entrants": [], "seeded": [], "errors": [],
+                   "retired_skipped": ["KVUE"]}
+    assert calls == []
+
+
+def test_an_unreadable_retention_store_does_not_block_seeding():
+    calls = []
+
+    def _fake_backfill(**kwargs):
+        calls.append(kwargs)
+        return {"status": "ok"}
+
+    with patch("store.arctic_store.get_universe_lib", return_value=_lib(["AAPL"])), \
+         patch("store.arctic_store.get_delisted_history_lib", side_effect=RuntimeError("boom")), \
+         patch("builders.backfill.backfill", side_effect=_fake_backfill):
+        out = _real_seed(BUCKET, ["AAPL", "BE"])
+    assert out["seeded"] == ["BE"]
+    assert "retired_skipped" not in out
 
 
 def test_member_without_a_symbol_is_seeded_through_the_per_ticker_backfill():
