@@ -5386,8 +5386,36 @@ def _seed_index_entrants(
         if admits_universe_write(t) and t.lstrip("^") not in not_members
     }
     present = set(get_universe_lib(bucket).list_symbols())
-    entrants = sorted(wanted - present)
+    missing = wanted - present
+    # A name the delisted-prune has already RETIRED to `delisted_history` is
+    # not an entrant: it is absent from `universe` because it stopped trading,
+    # and the membership document still lists it only until the next weekly
+    # constituents refresh. Measured 2026-11-05 (alpha-engine-config-I13299):
+    # KVUE (acquired; last bar 2026-10-30) was pruned 11-04 12:33Z, stayed in
+    # the 10-30 constituents, and its per-ticker backfill ate the whole 600s
+    # bound. The prune's retention record is the newer, more specific fact.
+    retired: list[str] = []
+    if missing:
+        try:
+            from store.arctic_store import get_delisted_history_lib
+            retained = set(get_delisted_history_lib(bucket).list_symbols())
+        except Exception:  # noqa: BLE001 — unreadable retention store must not block seeding
+            logger.warning(
+                "Index-entrant seed: delisted_history unreadable; seeding without "
+                "the retired-name filter", exc_info=True,
+            )
+            retained = set()
+        retired = sorted(missing & retained)
+        if retired:
+            logger.warning(
+                "Index-entrant seed: %d absent member(s) are retired in "
+                "delisted_history, not entrants; skipping: %s",
+                len(retired), retired,
+            )
+    entrants = sorted(missing - set(retired))
     summary: dict = {"entrants": entrants, "seeded": [], "errors": []}
+    if retired:
+        summary["retired_skipped"] = retired
     if not entrants:
         return {"status": "ok", **summary}
     if len(entrants) > _ENTRANT_SEED_MAX:
