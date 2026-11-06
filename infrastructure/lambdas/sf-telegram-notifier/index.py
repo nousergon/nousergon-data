@@ -580,34 +580,39 @@ def day_message(run_date: str | None, outcomes: list[tuple[str, str]]) -> str:
     return f"{head}\n{_PIPELINES_URL}"
 
 
-def handler(event: dict, context) -> dict:  # noqa: ARG001
-    detail = event.get("detail") or {}
-    status = detail.get("status", "UNKNOWN")
-    sm_name = (detail.get("stateMachineArn") or "").rsplit(":", 1)[-1]
-    logger.info("SF status change: sf=%s status=%s", sm_name, status)
+def _record(text: str, *, silent: bool, severity: str, dedup_key: str) -> bool:
+    """Put a per-run report on the alert bus as tracked-only. Never raises."""
+    from krepis.fleet_events import emit_alert_event
 
-    # §7.2b: only the day's closing terminal reaches the chat.
-    describe_resp = _describe_execution(detail.get("executionArn", "")) if status != "RUNNING" else None
-    closes_day = (
-        status in _TERMINAL_STATUSES
-        and sm_name in _DAY_CLOSERS
-        and not _is_preflight_execution(describe_resp)
-        and not _is_partial_execution(detail.get("stateMachineArn", ""), describe_resp)[0]
+    return emit_alert_event(
+        origin="sf-telegram-notifier", body=text, severity_raw=severity,
+        source="flow-doctor:sf-telegram-notifier", dedup_key=dedup_key,
+        disable_notification=silent, delivery_tier="tracked-only",
+        alert_class="sf_completion_telegram",
     )
-    if not closes_day:
-        logger.info("not the day's closing terminal: no chat message (sf=%s status=%s)", sm_name, status)
-        if status in ("FAILED", "TIMED_OUT", "ABORTED"):
-            # Recorded for /page/incidents and the nightly sweep; never the chat.
-            from krepis.fleet_events import emit_alert_event
-            emit_alert_event(
-                origin="sf-telegram-notifier", body=f"{_label_for_arn(detail.get('stateMachineArn', ''))} — {status}: {detail.get('name', '')}",
-                severity_raw="warning", source="flow-doctor:sf-telegram-notifier",
-                dedup_key=_dedup_key(detail), delivery_tier="tracked-only",
-                alert_class="sf_completion_telegram",
-            )
-        return {"status": status, "state_machine": sm_name,
-                "execution": detail.get("name", ""), "telegram_sent": False,
-                "silent": True, "hollow_suspect": False}
+
+
+def handler(event: dict, context) -> dict:  # noqa: ARG001
+    """Record every run; send the chat ONE message a day (§7.2b)."""
+    result = _record_run(event)
+    detail = event.get("detail") or {}
+    if _closes_day(detail):
+        result["day_message_sent"] = _send_day_message(detail)
+    return result
+
+
+def _closes_day(detail: dict) -> bool:
+    status = detail.get("status", "UNKNOWN")
+    sm_arn = detail.get("stateMachineArn") or ""
+    if status not in _TERMINAL_STATUSES or sm_arn.rsplit(":", 1)[-1] not in _DAY_CLOSERS:
+        return False
+    describe_resp = _describe_execution(detail.get("executionArn", ""))
+    return not _is_preflight_execution(describe_resp) and not _is_partial_execution(sm_arn, describe_resp)[0]
+
+
+def _send_day_message(detail: dict) -> bool:
+    sm_name = (detail.get("stateMachineArn") or "").rsplit(":", 1)[-1]
+    describe_resp = _describe_execution(detail.get("executionArn", ""))
     run_date = parse_run_date_from_input((describe_resp or {}).get("input")) or \
         parse_run_date_from_execution_name(detail.get("name", ""))
     outcomes = _day_outcomes(
@@ -615,61 +620,53 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001
         sf_client=boto3.client("stepfunctions", region_name=REGION),
         now_s=datetime.now(timezone.utc).timestamp(),
     )
-    text = day_message(run_date, outcomes)
-    silent, hollow_suspect, is_partial = False, False, False
-    needs_triage = any(st != "SUCCEEDED" for _, st in outcomes)
-    ok = notify_via_flow_doctor(
+    failed = any(st != "SUCCEEDED" for _, st in outcomes)
+    return notify_via_flow_doctor(
+        day_message(run_date, outcomes),
+        silent=False,
+        severity="warning" if failed else "info",
+        dedup_key=f"{_FLOW_NAME}:day:{sm_name}:{run_date or detail.get('name', '')}",
+        flow_name=_FLOW_NAME,
+        topics=PIPELINE_OBSERVER_TELEGRAM_TOPICS,
+        db_basename=_DB_BASENAME,
+        # Out of the shared daily budget, and guaranteed to land: a once-a-day
+        # result that is suppressed reads exactly like a day that never ran
+        # (Brian's 2026-08-17 ruling, carried over).
+        rate_limit_exempt_severities=_RATE_LIMIT_EXEMPT_SEVERITIES,
+        guaranteed_topic=FleetTelegramTopic.PIPELINE,
+        context={"state_machine": sm_name, "execution": detail.get("name"), "day": run_date},
+        # Matches playbooks.yaml's registered `sf_completion_telegram` class.
+        source="flow-doctor:sf-telegram-notifier",
+    )
+
+
+def _record_run(event: dict) -> dict:
+    """The per-run report, built exactly as before 2026-11-06 and RECORDED
+    (alert bus, tracked-only: /page/incidents and the nightly sweep), never
+    sent to the chat (observability-policy §7.2b)."""
+    detail = event.get("detail") or {}
+    status = detail.get("status", "UNKNOWN")
+    sm_name = (detail.get("stateMachineArn") or "").rsplit(":", 1)[-1]
+    logger.info("SF status change: sf=%s status=%s", sm_name, status)
+
+    text, silent, hollow_suspect, is_partial, needs_triage = _build_message(detail)
+    ok = _record(
         text,
         silent=silent,
-        # A partial run is recorded at info regardless of its terminal status:
-        # severity belongs to the invariant breached, and a narrowed
-        # verification run failing does not breach the cadence cycle's.
         severity=(
             "info" if is_partial
             else "warning" if (hollow_suspect or needs_triage) and status == "SUCCEEDED"
             else _severity_for_status(status)
         ),
-        dedup_key=f"{_FLOW_NAME}:day:{sm_name}:{run_date or detail.get('name', '')}",
-        flow_name=_FLOW_NAME,
-        topics=PIPELINE_OBSERVER_TELEGRAM_TOPICS,
-        db_basename=_DB_BASENAME,
-        # Brian's ruling, 2026-08-17: "eod outcome should land in the same
-        # place as 'Post-close Trading SF — RUNNING'". Those two messages take
-        # DIFFERENT delivery paths, which is why they had different
-        # reliability. RUNNING goes out via the `silent_topic` branch's
-        # `send_raw`, which never touches flow-doctor's alert pipeline and so
-        # always arrives. The terminal goes through `notify_event`, where the
-        # fleet-shared daily budget can drop it — measured on the postclose SF:
-        # 2026-08-03, -04 and -07 all reached SUCCEEDED and all three reports
-        # were recorded `reason=rate_limited`, delivered nowhere, while that
-        # morning's RUNNING ping landed normally. Three of the last eight
-        # trading days had a green EOD that was indistinguishable, on the
-        # thread the operator actually reads, from a pipeline that never ran.
-        #
-        # Two changes make the ruling structurally true rather than probable:
-        # the exemption below takes this bounded lifecycle mirror out of the
-        # shared budget so the ordinary path fires, and `guaranteed_topic` is
-        # the belt — any FUTURE suppression that is not dedup still lands the
-        # message in PIPELINE, the same thread RUNNING goes to.
-        rate_limit_exempt_severities=_RATE_LIMIT_EXEMPT_SEVERITIES,
-        guaranteed_topic=FleetTelegramTopic.PIPELINE,
-        context={
-            "state_machine": sm_name,
-            "execution": detail.get("name"),
-            "status": status,
-            "partial_run": is_partial,
-        },
-        silent_topic=FleetTelegramTopic.PIPELINE,
-        # Matches playbooks.yaml's registered `sf_completion_telegram` class
-        # source exactly (config-I3513).
-        source="flow-doctor:sf-telegram-notifier",
+        dedup_key=_dedup_key(detail),
     )
 
     return {
         "status": status,
         "state_machine": sm_name,
         "execution": detail.get("name", ""),
-        "telegram_sent": ok,
+        "telegram_sent": False,
+        "recorded": ok,
         "silent": silent,
         "hollow_suspect": hollow_suspect,
     }
