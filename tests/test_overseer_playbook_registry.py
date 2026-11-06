@@ -449,7 +449,9 @@ def test_backtester_spot_exit_sources_are_declared(source):
     row = rows[0]
     assert row["severities"] == ["warning", "error"]
     assert row["intake"] == "bus" and row["response"] == "drain-queue"
-    assert row["tier"] == "notify-silent"
+    # observability-policy.md §7.2b (2026-11-06): the nightly sweep drains it;
+    # it never reaches the chat.
+    assert row["tier"] == "tracked-only" and row["chat"] == "none"
 
 
 def test_registry_model_passes_its_executor_validator():

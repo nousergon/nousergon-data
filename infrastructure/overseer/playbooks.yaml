@@ -787,13 +787,15 @@ alert_classes:
     response: drain-queue
     # derived: severities [dynamic] — resolved per emission
     tier: dynamic
+    chat: critical-only
   - class: executor_optimizer_shadow_rebalance
     source: "alpha-engine/executor/optimizer_shadow.py"
     severities: [warning]
     intake: bus
     response: drain-queue
     # DECLARED: shadow-optimizer divergence, named in I6751's NOTIFY-SILENT row.
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
   - class: executor_short_sell_guard_blind
     source: "alpha-engine/executor/daemon.py::short_sell_guard"
     severities: [error]
@@ -804,7 +806,8 @@ alert_classes:
     # be sold and makes the check PASS. That is the direction of the
     # 2026-04-22 PFE incident the guard exists to prevent (three duplicate
     # SELL 77s each passing held=155, summing to short 76).
-    tier: page
+    tier: tracked-only
+    chat: none
     operator_reason: >-
       Unlike every other row in this block, the safe state here is NOT
       already reached when the alert fires: the order may already have been
@@ -820,7 +823,8 @@ alert_classes:
     response: drain-queue
     # Cash freed by a hard-risk exit is not redeployed for the rest of the
     # session. Book-affecting, and nothing else records it.
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
     operator_reason: >-
       Deliberately NOT page, unlike its siblings here. The omission is
       bounded and self-correcting — the next morning planner redeploys the
@@ -836,7 +840,8 @@ alert_classes:
     # an observe-only leg. With the flag on, a protective bear/drawdown
     # override that should have fired did not, and the whole book was sized
     # against an unadjusted regime.
-    tier: page
+    tier: tracked-only
+    chat: none
     operator_reason: >-
       The book is already sized and written by the time this is known, so
       the safe state is not reached by waiting. The human decision is
@@ -856,7 +861,8 @@ alert_classes:
     # (alpha-engine-config-I11369). Distinct from
     # executor_optimizer_shadow_rebalance, which is divergence in a shadow
     # that is NOT driving the book.
-    tier: page
+    tier: tracked-only
+    chat: none
     operator_reason: >-
       overseer-policy.md invariant 4: this is a closed loop through
       drain-queue, and the page is the deliberate extra. The optimizer
@@ -878,7 +884,8 @@ alert_classes:
     # The consumer-side twin of executor_optimizer_held_book — either can
     # fire without the other (the sentinel write can fail, or the log can be
     # unusable for a reason that raised nothing).
-    tier: page
+    tier: tracked-only
+    chat: none
     operator_reason: >-
       Same disposition as executor_optimizer_held_book, from the consumer
       side: the empty order book IS the safe state and is reached without a
@@ -893,6 +900,7 @@ alert_classes:
     response: drain-queue
     # derived: warning/info only, automated response declared
     tier: tracked-only
+    chat: none
   - class: executor_trading_window_merge
     source: "crucible-executor/scripts/trading_window_merge_check.py"
     severities: [error]
@@ -905,6 +913,7 @@ alert_classes:
     # never a fixed UTC span — alpha-engine-config-I12769). Detector only;
     # merge-time refusal is option 1 on the same issue.
     tier: page
+    chat: action
     operator_reason: >-
       A merge cannot be reverted by automation — whether the change must be
       backed out before the trading box picks it up (deploy-on-merge or a
@@ -922,7 +931,8 @@ alert_classes:
     # `failed`; systemd's OnFailure= runs the notifier, which carries the
     # unit's state and last 50 journal lines. On 2026-10-14/15 four such runs
     # died before writing any record and nothing paged.
-    tier: page
+    tier: tracked-only
+    chat: none
     operator_reason: >-
       The trader timers do not catch up (Persistent=false), so the failed
       run is not retried and a paper session is lost unless a human fixes
@@ -940,6 +950,7 @@ alert_classes:
     # DECLARED: guardrail-HELD is the system working. Named in I6751's
     # TRACKED-ONLY row.
     tier: tracked-only
+    chat: none
   - class: backtester_empty_param_sweep
     source: "alpha-engine-backtester/backtest.py"
     severities: [warning]
@@ -947,6 +958,7 @@ alert_classes:
     response: drain-queue
     # derived: warning/info only, automated response declared
     tier: tracked-only
+    chat: none
   - class: backtester_stance_drift
     source: "alpha-engine-backtester/analysis/stance_distribution.py"
     severities: [error]
@@ -954,14 +966,16 @@ alert_classes:
     response: drain-queue
     # DECLARED: stance drift is named in I6751's NOTIFY-SILENT row (suboptimal,
     # not broken).
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
   - class: backtester_cost_anomaly
     source: "alpha-engine-backtester/analysis/cost_report.py"
     severities: [error]
     intake: bus
     response: drain-queue
     # derived: error-capable, automated response declared
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
   - class: backtester_champion_promotion
     # I3302 rename complete: code now emits the canonical alpha-engine-backtester/ prefix.
     source: "alpha-engine-backtester/optimizer/champion_promotion.py::run_weekly_evaluation"
@@ -969,7 +983,8 @@ alert_classes:
     intake: bus
     response: drain-queue
     # derived: error-capable, automated response declared
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
   - class: backtester_producer_arena
     # alpha-engine-config-I9318: the R-slot (selection-producer) arena cycle.
     # Fires only when the cycle comes out `unmeasurable` or `unservable` — i.e.
@@ -984,7 +999,8 @@ alert_classes:
     intake: bus
     response: drain-queue
     # derived: error-capable, automated response declared
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
     operator_reason: >-
       The R-slot arena could not promote or defend the live producer_champion
       pointer on evidence (unmeasurable or unservable). drain-queue is the
@@ -996,7 +1012,8 @@ alert_classes:
     intake: bus
     response: drain-queue
     # derived: critical/alarm-capable
-    tier: page
+    tier: tracked-only
+    chat: none
   - class: backtester_pit_parity
     source: "alpha-engine-backtester/pit_parity"
     severities: [warning]
@@ -1004,14 +1021,16 @@ alert_classes:
     response: drain-queue
     # DECLARED: point-in-time parity divergence is a measurement-quality
     # finding.
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
   - class: backtester_input_quality
     source: "alpha-engine-backtester/analysis/input_quality.py"
     severities: [warning]
     intake: bus
     response: drain-queue
     # DECLARED: input-quality degradation — suboptimal results, not a halt.
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
   - class: backtester_replay_concordance_empty_corpus
     # alpha-engine-config-I10539 (Brian ruling 2026-09-16, option b): the
     # ReplayConcordance STAGE is retired from ne-weekly-freshness-pipeline,
@@ -1036,6 +1055,7 @@ alert_classes:
     # DECLARED: an empty-filter finding for an operator to act on, not a
     # failure — mirrors backtester_empty_param_sweep's tracked-only tier.
     tier: tracked-only
+    chat: none
   # Spot-launcher EXIT-trap notices (alpha-engine-config-I12385). Every
   # crucible-backtester spot stage script sources infrastructure/_spot_common.sh,
   # whose `cleanup` trap publishes ONE ops alert on a non-zero exit with
@@ -1057,7 +1077,8 @@ alert_classes:
     intake: bus
     response: drain-queue
     # derived: error-capable, automated response declared
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
     operator_reason: &backtester_spot_exit_reason >-
       A spot stage's own EXIT-trap notice. `warning` means the trap is
       relaunching (spot reclaim, or a launch-time capacity/quota refusal with
@@ -1073,7 +1094,8 @@ alert_classes:
     intake: bus
     response: drain-queue
     # derived: error-capable, automated response declared
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
     operator_reason: *backtester_spot_exit_reason
   - class: backtester_spot_exit_parity
     source: "alpha-engine-backtester/parity"
@@ -1081,7 +1103,8 @@ alert_classes:
     intake: bus
     response: drain-queue
     # derived: error-capable, automated response declared
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
     operator_reason: *backtester_spot_exit_reason
   - class: backtester_spot_exit_parity_compare
     source: "alpha-engine-backtester/parity-compare"
@@ -1089,7 +1112,8 @@ alert_classes:
     intake: bus
     response: drain-queue
     # derived: error-capable, automated response declared
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
     operator_reason: *backtester_spot_exit_reason
   - class: backtester_spot_exit_parity_replay
     source: "alpha-engine-backtester/parity-replay"
@@ -1097,7 +1121,8 @@ alert_classes:
     intake: bus
     response: drain-queue
     # derived: error-capable, automated response declared
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
     operator_reason: *backtester_spot_exit_reason
   - class: backtester_spot_exit_pit_lookahead
     source: "alpha-engine-backtester/pit-lookahead"
@@ -1105,7 +1130,8 @@ alert_classes:
     intake: bus
     response: drain-queue
     # derived: error-capable, automated response declared
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
     operator_reason: *backtester_spot_exit_reason
   - class: backtester_spot_exit_pit_walkforward
     source: "alpha-engine-backtester/pit-walkforward"
@@ -1113,7 +1139,8 @@ alert_classes:
     intake: bus
     response: drain-queue
     # derived: error-capable, automated response declared
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
     operator_reason: *backtester_spot_exit_reason
   - class: backtester_spot_exit_portfolio_optimizer
     source: "alpha-engine-backtester/portfolio-optimizer"
@@ -1121,7 +1148,8 @@ alert_classes:
     intake: bus
     response: drain-queue
     # derived: error-capable, automated response declared
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
     operator_reason: *backtester_spot_exit_reason
   - class: backtester_spot_exit_predictor_backtest
     source: "alpha-engine-backtester/predictor-backtest"
@@ -1129,7 +1157,8 @@ alert_classes:
     intake: bus
     response: drain-queue
     # derived: error-capable, automated response declared
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
     operator_reason: *backtester_spot_exit_reason
   - class: backtester_spot_exit_spot_backtest
     source: "alpha-engine-backtester/spot_backtest.sh"
@@ -1137,7 +1166,8 @@ alert_classes:
     intake: bus
     response: drain-queue
     # derived: error-capable, automated response declared
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
     operator_reason: *backtester_spot_exit_reason
 
   # ── predictor (crucible-predictor) ──
@@ -1148,27 +1178,31 @@ alert_classes:
     response: drain-queue
     # derived: warning/info only, automated response declared
     tier: tracked-only
+    chat: none
   - class: predictor_model_zoo
     source: "alpha-engine-predictor/training/model_zoo.py::run_rotation_and_select"
     severities: [info, warning, critical]
     intake: bus
     response: drain-queue
     # derived: critical/alarm-capable
-    tier: page
+    tier: tracked-only
+    chat: none
   - class: predictor_predictions_write
     source: "alpha-engine-predictor/inference/stages/write_output.py::write_predictions"
     severities: [warning, critical]
     intake: bus
     response: drain-queue
     # derived: critical/alarm-capable
-    tier: page
+    tier: tracked-only
+    chat: none
   - class: predictor_observe_calibration
     source: "predictor.inference.observe_calibration"
     severities: [warning]
     intake: bus
     response: drain-queue
     # DECLARED: calibration drift, named in I6751's NOTIFY-SILENT row.
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
   - class: predictor_shadow_leaderboard_unmeasurable_arm
     # alpha-engine-config-I9336 (crucible-predictor-PR587): a registered
     # stage=challenger arm (e.g. sota-directional-combine, the champion-arch
@@ -1190,6 +1224,7 @@ alert_classes:
     # The tier field is where that intent finally binds instead of being a
     # comment the delivery path never read.
     tier: tracked-only
+    chat: none
   - class: predictor_inference
     # alpha-engine-config-I7740 (operator ruling 2026-08-21): new registry
     # row for a previously-undeclared source. One source string covers
@@ -1206,7 +1241,8 @@ alert_classes:
     intake: bus
     response: drain-queue
     # derived: severities [dynamic] — resolved per emission
-    tier: dynamic
+    tier: tracked-only
+    chat: none
   - class: deploy_notification_predictor
     # config#3305 static-chokepoint registration: predictor deploy scripts
     # that call ``krepis.alerts publish --source <path>/deploy.sh``.
@@ -1215,7 +1251,8 @@ alert_classes:
     intake: bus
     response: drain-queue
     # derived: error-capable, automated response declared
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
 
   # ── research (crucible-research) ──
   # alpha-engine-config-I8177 (crucible-research-PR724). The weekly
@@ -1232,7 +1269,8 @@ alert_classes:
     intake: bus
     response: drain-queue
     # derived: error-capable, automated response declared
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
   - class: research_score_aggregator_gap
     source: "research:score_aggregator"
     severities: [warning]
@@ -1240,20 +1278,23 @@ alert_classes:
     response: drain-queue
     # derived: warning/info only, automated response declared
     tier: tracked-only
+    chat: none
   - class: research_archive_writer_quarantine
     source: "research:archive_writer"
     severities: [error]
     intake: bus
     response: drain-queue
     # derived: error-capable, automated response declared
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
   - class: research_daemon_down
     source: "research:alerts_handler"
     severities: [critical]
     intake: bus
     response: drain-queue
     # derived: critical/alarm-capable
-    tier: page
+    tier: tracked-only
+    chat: none
   # config#3305 static-chokepoint registration: crucible-research
   # ``publish_observe_alert`` call sites detected during the cross-repo
   # completeness sweep. All are secondary observability (non-fatal, no
@@ -1266,6 +1307,7 @@ alert_classes:
     response: drain-queue
     # derived: warning/info only, automated response declared
     tier: tracked-only
+    chat: none
   - class: research_challenger_producers
     source: "research:challenger_producers"
     severities: [warning]
@@ -1273,6 +1315,7 @@ alert_classes:
     response: drain-queue
     # derived: warning/info only, automated response declared
     tier: tracked-only
+    chat: none
   - class: research_producer_leaderboard_alerts
     source: "research:producer_leaderboard"
     severities: [warning]
@@ -1280,6 +1323,7 @@ alert_classes:
     response: drain-queue
     # derived: warning/info only, automated response declared
     tier: tracked-only
+    chat: none
   - class: research_scanner_leaderboard_alerts
     source: "research:scanner_leaderboard"
     severities: [warning]
@@ -1287,6 +1331,7 @@ alert_classes:
     response: drain-queue
     # derived: warning/info only, automated response declared
     tier: tracked-only
+    chat: none
   - class: research_cuts_leaderboard_alerts
     # alpha-engine-config-I7752 static-chokepoint registration: the cuts
     # leaderboard build is observe-only and swallows its own exception
@@ -1300,6 +1345,7 @@ alert_classes:
     response: drain-queue
     # derived: warning/info only, automated response declared
     tier: tracked-only
+    chat: none
   - class: research_cut_promotion_alerts
     # alpha-engine-config-I7876 static-chokepoint registration: the scanner-cut
     # promotion engine (crucible-research/lambda/scanner_handler.py, calling
@@ -1315,7 +1361,8 @@ alert_classes:
     intake: bus
     response: drain-queue
     # derived: error-capable, automated response declared
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
   - class: research_spec_promotion_alerts
     # alpha-engine-config-I9273 static-chokepoint registration. The scanner
     # SPEC slot's promotion engine (crucible-research/scoring/spec_promotion.py
@@ -1336,7 +1383,8 @@ alert_classes:
     intake: bus
     response: drain-queue
     # derived: error-capable, automated response declared
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
     # overseer-policy.md invariant 4 (alpha-engine-config-I8991): a pageable
     # class is a CLOSED LOOP or a TRACKED GAP, and there is no third state.
     # This is the tracked gap, deliberately, rather than an operator_reason.
@@ -1370,7 +1418,8 @@ alert_classes:
     intake: bus
     response: drain-queue
     # derived: error-capable, automated response declared
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
   - class: research_corpus_stats_alerts
     # alpha-engine-config-I7896 static-chokepoint registration. Emitted by
     # crucible-research/lambda/aggregate_costs_handler.py::_refresh_corpus_stats
@@ -1392,6 +1441,7 @@ alert_classes:
     response: drain-queue
     # derived: warning/info only, automated response declared
     tier: tracked-only
+    chat: none
   - class: research_experiment_record_alerts
     source: "research:experiment_record"
     severities: [warning]
@@ -1399,6 +1449,7 @@ alert_classes:
     response: drain-queue
     # derived: warning/info only, automated response declared
     tier: tracked-only
+    chat: none
   - class: research_thinktank_daily_alerts
     source: "research:thinktank_daily"
     severities: [warning]
@@ -1406,6 +1457,7 @@ alert_classes:
     response: drain-queue
     # derived: warning/info only, automated response declared
     tier: tracked-only
+    chat: none
   # alpha-engine-config-I9282 (crucible-research-PR762). The Think Tank
   # challenger arm writes its leaderboard evidence
   # (signals_shadow/thinktank_coverage/{date}/signals.json) ONLY when its
@@ -1424,6 +1476,7 @@ alert_classes:
     response: drain-queue
     # derived: warning/info only, automated response declared
     tier: tracked-only
+    chat: none
   - class: research_signals_envelope_rejected
     # NOTE: this class emits via ``alerts.publish`` with explicit
     # ``severity="error"`` (not ``publish_observe_alert``), so its
@@ -1434,7 +1487,8 @@ alert_classes:
     intake: bus
     response: drain-queue
     # derived: error-capable, automated response declared
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
   - class: research_signals_envelope_handler_observe_alerts
     source: "signals_envelope_handler:*"
     severities: [warning]
@@ -1442,6 +1496,7 @@ alert_classes:
     response: drain-queue
     # derived: warning/info only, automated response declared
     tier: tracked-only
+    chat: none
   - class: research_experiment_record
     # config#3305 static-chokepoint registration: ``publish_observe_alert``
     # for experiment_record emission failures (secondary observability, never
@@ -1452,6 +1507,7 @@ alert_classes:
     response: drain-queue
     # derived: warning/info only, automated response declared
     tier: tracked-only
+    chat: none
   - class: research_thinktank_daily
     # config#3305 static-chokepoint registration: thinktank daily run outcome
     # notification (DEGRADED/ok — secondary observability, not a gating check).
@@ -1461,6 +1517,7 @@ alert_classes:
     response: drain-queue
     # derived: warning/info only, automated response declared
     tier: tracked-only
+    chat: none
   - class: deploy_notification_research
     # config#3305 static-chokepoint registration: research deploy scripts that
     # call ``krepis.alerts publish --source <path>/deploy.sh``.
@@ -1469,7 +1526,8 @@ alert_classes:
     intake: bus
     response: drain-queue
     # derived: error-capable, automated response declared
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
 
   - class: research_cut_slot_below_arm_floor
     # alpha-engine-config-I9409 / -I11240 (registry drift; first observed by
@@ -1487,7 +1545,8 @@ alert_classes:
     # derived: critical/alarm-capable. A slot below its floor produces ZERO
     # comparisons and writes a hold that reads like a decision — the
     # 2026-08-21/2026-08-28 no_promotable_challenger defect.
-    tier: page
+    tier: tracked-only
+    chat: none
     operator_reason: >-
       Page by design (alpha-engine-config-I9317): the scanner run has already
       raised, so the safe state (no decision recorded, the standing champion
@@ -1523,6 +1582,7 @@ alert_classes:
     intake: bus
     response: drain-queue
     tier: tracked-only
+    chat: none
   - class: crucible_v2_heartbeat_error
     # DECLARED: `error` here names one of three real findings (unwatched
     # prefix, empty subscriber set, or cost-ledger divergence) — each is
@@ -1532,6 +1592,7 @@ alert_classes:
     intake: bus
     response: drain-queue
     tier: page
+    chat: critical
     operator_reason: >-
       Deliberate page-by-design (alpha-engine-config-I10593), not a tracked
       gap: an unwatched prefix, an empty alert-subscriber set, or a diverged
@@ -1555,6 +1616,7 @@ alert_classes:
     response: drain-queue
     # DECLARED page: one of the two page conditions plan §4.6 admits.
     tier: page
+    chat: critical
     operator_reason: >-
       Page by design (crucible v2 plan §4.6): a member that did not produce
       its artifact on a trading day is one of exactly two conditions v2
@@ -1569,6 +1631,7 @@ alert_classes:
     # DECLARED page: the other page condition — a hard member failure with a
     # run id and exception text (e.g. MissingSourceError).
     tier: page
+    chat: critical
     operator_reason: >-
       Page by design (crucible v2 plan §4.6): a hard member failure is the
       second of the two page conditions, carries its run id, and is deduped
@@ -1586,7 +1649,8 @@ alert_classes:
     # the producer (crucible-PR189, active from 2026-09-20); this row does the
     # same for the Telegram leg, which the undeclared source was still pushing
     # to the operator chat as a registry-drift page.
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
     operator_reason: >-
       A synthetic page is a fault-injection or replay exercise, not a
       production failure (crucible/synthetic.py). It is recorded in full on
@@ -1600,7 +1664,8 @@ alert_classes:
     # Same disposition as crucible_v2_synthetic_absence. Not yet observed on
     # the intake, declared with its sibling because the condition set is
     # closed and the source is derived from it.
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
     operator_reason: >-
       A synthetic page is a fault-injection or replay exercise, not a
       production failure (crucible/synthetic.py). It is recorded in full on
@@ -1622,6 +1687,7 @@ alert_classes:
     # silent=False at that tier. A lifecycle notice under the 2026-08-03
     # ruling, not an incident.
     tier: notify-silent
+    chat: order-book
 
   # ── data plane (nousergon-data) ──
   - class: data_collection_daily_report
@@ -1638,6 +1704,7 @@ alert_classes:
     intake: bus
     response: drain-queue
     tier: notify-silent
+    chat: pipelines
 
   - class: weekly_cost_coverage_gap
     # alpha-engine-config-I11298, Brian ruling 2026-09-21 ("proceed with rec
@@ -1658,6 +1725,7 @@ alert_classes:
     # standing owner for a gap on the director-plan callsite is
     # alpha-engine-config-I11298.
     tier: tracked-only
+    chat: none
   - class: automation_pause_check
     # alpha-engine-config-I9409. infrastructure/automation_pause.py
     # ::alert_on_findings (--check --alert-on-fail, pause-check-alert.yml, every
@@ -1672,7 +1740,8 @@ alert_classes:
     response: drain-queue
     # DECLARED page, matching the emitter's stated intent: with the groom
     # paused, the phone push is the only delivery this check can rely on.
-    tier: page
+    tier: tracked-only
+    chat: none
     operator_reason: >-
       Page by design (alpha-engine-config-I8110): a trigger Brian ruled paused
       is live, or an alarm is muted without a declared pause. Re-arming or
@@ -1688,7 +1757,8 @@ alert_classes:
     response: drain-queue
     # DECLARED dynamic: non-severe constituents drift is TRACKED-ONLY per the
     # matrix; a severe (critical) drift is a data-integrity break and pages.
-    tier: dynamic
+    tier: tracked-only
+    chat: none
   - class: data_stage_output_sweep
     # alpha-engine-config-I7752 static-chokepoint registration: the per-run
     # stage-output verdict (validators/stage_output_sweep.py). Severity is
@@ -1702,14 +1772,16 @@ alert_classes:
     # and `warn` otherwise, and a DEGRADED run that still produced its artifact
     # is tracked-only work (tonight's data-collector 'Collection finished
     # DEGRADED' page). Resolved per emission.
-    tier: dynamic
+    tier: tracked-only
+    chat: none
   - class: data_phase_marker_sweep
     source: "alpha-engine-data/validators/phase_marker_sweep.py"
     severities: [dynamic]
     intake: bus
     response: drain-queue
     # derived: severities [dynamic] — resolved per emission
-    tier: dynamic
+    tier: tracked-only
+    chat: none
   - class: data_d02_reference_diff_probe
     # alpha-engine-config-I13045 (prevention for nous-ergon-ops-I2043): the
     # weekday READ-ONLY rehearsal of D02's reference attestation. It names each
@@ -1723,7 +1795,8 @@ alert_classes:
     # DECLARED notify-silent: the finding is days ahead of the run it would
     # fail, so it is actionable this week, not this minute; D02 itself stays
     # fail-closed and keeps its own page on Saturday.
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
   - class: data_spot_quota_fallback
     source: "data-spot-dispatcher._launch_instance"
     severities: [warning]
@@ -1733,6 +1806,7 @@ alert_classes:
     # NOTIFY-SILENT/TRACKED-ONLY discussion as 'spot-quota fallback (succeeded
     # on fallback)'; it is capacity-planning backlog, not an incident.
     tier: tracked-only
+    chat: none
   - class: lib_spot_quota_fallback
     source: "nousergon_lib.spot_dispatch.launch_with_fallback"
     severities: [warning]
@@ -1741,20 +1815,23 @@ alert_classes:
     # DECLARED: same condition as data_spot_quota_fallback, from the shared-lib
     # dispatcher.
     tier: tracked-only
+    chat: none
   - class: canary_replay_liveness
     source: "canary-replay-liveness-probe"
     severities: [critical]
     intake: bus
     response: drain-queue
     # derived: critical/alarm-capable
-    tier: page
+    tier: tracked-only
+    chat: none
   - class: pipeline_watchdog_stuck_sf
     source: "alpha-engine-pipeline-watchdog"
     severities: [error]
     intake: bus
     response: drain-queue
     # derived: error-capable, automated response declared
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
   - class: overseer_dispatch_escalation
     source: "overseer-dispatcher"
     severities: [critical]
@@ -1762,6 +1839,7 @@ alert_classes:
     response: drain-queue
     # derived: critical/alarm-capable
     tier: page
+    chat: critical
   - class: freshness_monitor_staleness
     # CRITICALs additionally trigger EVENT-TIME drain dispatch per the
     # artifact registry's remediation declarations (config-I3282) — this is
@@ -1772,6 +1850,7 @@ alert_classes:
     response: playbook:alert-drain
     # derived: severities [dynamic] — resolved per emission
     tier: dynamic
+    chat: critical-only
   - class: data_sf_definition_drift
     source: "alpha-engine-data/infrastructure/step-functions/check-definition-drift.py"
     severities: [dynamic]
@@ -1780,6 +1859,7 @@ alert_classes:
     # DECLARED: SF-definition drift is conformance, named in I6751's
     # TRACKED-ONLY row.
     tier: tracked-only
+    chat: none
   - class: deploy_notification_data_plane
     # config#3305 static-chokepoint registration: data-plane deploy scripts
     # that call ``krepis.alerts publish --source <path>/deploy.sh``.
@@ -1788,7 +1868,8 @@ alert_classes:
     intake: bus
     response: drain-queue
     # derived: error-capable, automated response declared
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
   - class: deploy_notification_changelog
     # config#3305 static-chokepoint registration: changelog mirror deploy
     # script that calls ``krepis.alerts publish``.
@@ -1797,7 +1878,8 @@ alert_classes:
     intake: bus
     response: drain-queue
     # derived: error-capable, automated response declared
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
   - class: check_systemd_unit_drift
     # config-I3211 backstop registration (alpha-engine-config#5715): installed
     # systemd units on a box diverge from what the repo expects. Emitter
@@ -1813,6 +1895,7 @@ alert_classes:
     # DECLARED: conformance drift — backlog work, nothing broken. I6751 matrix
     # names systemd-unit-drift in the TRACKED-ONLY row.
     tier: tracked-only
+    chat: none
   - class: boot_pull
     # config-I3211 backstop registration (alpha-engine-config#5714 / #4793):
     # boot-time repo pull on a box failed, risking stale code at session start.
@@ -1827,7 +1910,8 @@ alert_classes:
     intake: bus
     response: drain-queue
     # derived: error-capable, automated response declared
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
 
   # ── metron ──
   - class: metron_reconciliation
@@ -1839,7 +1923,8 @@ alert_classes:
     intake: bus
     response: drain-queue
     # derived: severities [dynamic] — resolved per emission
-    tier: dynamic
+    tier: tracked-only
+    chat: none
   - class: metron_deploy
     # alpha-engine-config-I7740 (operator ruling 2026-08-21): new registry
     # row for a previously-undeclared source. Observed: deploy FAILED at
@@ -1849,7 +1934,8 @@ alert_classes:
     intake: bus
     response: drain-queue
     # derived: error-capable, automated response declared
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
   - class: metron_deploy_drift
     # alpha-engine-config-I8991: metron-deploy-drift.timer (hourly,
     # metron/api/services/deploy_drift.py::report) correctly detected the box
@@ -1879,7 +1965,8 @@ alert_classes:
     intake: bus
     response: drain-queue
     # derived: error-capable, automated response declared
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
     migration_issue: alpha-engine-config-I8991
 
   # ── groom (alpha-engine-config emitter) ──
@@ -1889,7 +1976,8 @@ alert_classes:
     intake: bus
     response: drain-queue
     # DECLARED: groom lifecycle, named in I6751's NOTIFY-SILENT row.
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
 
   # ── fleet transport + credential probes (alpha-engine-config-I9409) ──
   - class: alert_transport_liveness_probe
@@ -1911,6 +1999,7 @@ alert_classes:
     # it at T0; a missing probe is detected by the probe's own read-back
     # (nonce/counter), never by this row.
     tier: tracked-only
+    chat: none
   - class: credential_liveness
     # alpha-engine-config-I7926: third-party credential liveness in
     # alpha-engine-config/scripts/check_credential_health.py::_send_page,
@@ -1925,6 +2014,7 @@ alert_classes:
     # expiring credential still works, so it is notify-silent (the drain files
     # or updates the rotation issue); a dead one is broken now and pages.
     tier: dynamic
+    chat: critical-only
     operator_reason: >-
       Rotating a third-party credential is human-only: it needs a login at
       the vendor, and no automation holds or should hold that authority. The
@@ -1944,7 +2034,8 @@ alert_classes:
     intake: cw-alarm
     response: drain-queue
     # derived: critical/alarm-capable
-    tier: page
+    tier: tracked-only
+    chat: none
 
   # ── infra (box health + deploy-on-merge — config-I3211 alert-drain registry) ──
   # Both emitters were added without declaring a class; the config-I3211
@@ -1962,6 +2053,7 @@ alert_classes:
     # INFO-RESOLVED for a condition that self-healed in 59 minutes. Same shape
     # as the 2026-08-28 five-CRITICAL/five-RESOLVED episode.
     tier: dynamic
+    chat: critical-only
     # box-health runs hourly (cadence 60min <= the 60min operator-response
     # floor), so its own next run precedes any human action: PAGE only when the
     # condition survives two consecutive runs.
@@ -1982,6 +2074,7 @@ alert_classes:
     response: operator
     # derived: response=operator (no automated path exists, §7.4)
     tier: page
+    chat: action
     operator_reason: Model route account has no credit; only an operator top-up clears it.
   - class: ci_watch_run_provider_unfunded
     source: "ci-watch-run"
@@ -1990,6 +2083,7 @@ alert_classes:
     response: operator
     # derived: response=operator (no automated path exists, §7.4)
     tier: page
+    chat: action
     operator_reason: Model route account has no credit; only an operator top-up clears it.
   - class: alert_drain_run_provider_unfunded
     source: "alert-drain-run"
@@ -1998,6 +2092,7 @@ alert_classes:
     response: operator
     # derived: response=operator (no automated path exists, §7.4)
     tier: page
+    chat: action
     operator_reason: Model route account has no credit; only an operator top-up clears it.
   - class: overseer_run_provider_unfunded
     source: "overseer-run"
@@ -2006,6 +2101,7 @@ alert_classes:
     response: operator
     # derived: response=operator (no automated path exists, §7.4)
     tier: page
+    chat: action
     operator_reason: Model route account has no credit; only an operator top-up clears it.
   - class: deploy_on_merge
     source: "deploy-on-merge"
@@ -2013,7 +2109,8 @@ alert_classes:
     intake: bus
     response: drain-queue
     # derived: critical/alarm-capable
-    tier: page
+    tier: tracked-only
+    chat: none
   - class: scan_unlisted_state
     # TRACKED-ONLY tier (routing epic config-I6751, re-route config-I6752):
     # hygiene finding, emitted `--severity warning --no-sns` — silent Telegram
@@ -2027,6 +2124,7 @@ alert_classes:
     # DECLARED: the epic's Phase-0 trigger example. Hygiene finding; the drain's
     # disposition issue IS the remediation path (observability-policy.md §7.4).
     tier: tracked-only
+    chat: none
   - class: tracked_only_digest
     # alpha-engine-config/scripts/notification_actionability.py `digest` arm
     # (alpha-engine-config-I6751 Phase 4): the weekly roll-up of everything
@@ -2041,7 +2139,8 @@ alert_classes:
     # to keep the suppressed tier VISIBLE without paging, and tracked-only
     # would suppress the very message that carries it. A weekly lifecycle
     # notice, not an incident.
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
 
   # ── CLI-shaped emitters the config-I6753 chokepoint extension surfaced ──
   # These predate the extension; every one emitted through the krepis CLI,
@@ -2053,6 +2152,7 @@ alert_classes:
     response: drain-queue
     # derived: warning/info only, automated response declared
     tier: tracked-only
+    chat: none
   - class: reboot_if_needed
     source: "reboot-if-needed"
     severities: [dynamic]
@@ -2060,27 +2160,31 @@ alert_classes:
     response: drain-queue
     # DECLARED: a pending-reboot notice is scheduled maintenance, not a break.
     tier: tracked-only
+    chat: none
   - class: deploy_notification_backtester_concordance
     source: "alpha-engine-backtester/infrastructure/deploy_concordance.sh"
     severities: [error]
     intake: bus
     response: drain-queue
     # derived: error-capable, automated response declared
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
   - class: deploy_notification_backtester_counterfactual
     source: "alpha-engine-backtester/infrastructure/deploy_counterfactual.sh"
     severities: [error]
     intake: bus
     response: drain-queue
     # derived: error-capable, automated response declared
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
   - class: deploy_notification_backtester_health
     source: "alpha-engine-backtester/infrastructure/deploy_health.sh"
     severities: [error]
     intake: bus
     response: drain-queue
     # derived: error-capable, automated response declared
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
   - class: eod_snapshot_existence_check
     source: "alpha-engine-eod-snapshot-existence-check"
     severities: [critical]
@@ -2088,6 +2192,7 @@ alert_classes:
     response: drain-queue
     # derived: critical/alarm-capable
     tier: page
+    chat: critical
   - class: alpha_engine_preopen_deploy_readiness_probe
     source: "alpha-engine-preopen-deploy-readiness-probe"
     severities: [critical]
@@ -2095,13 +2200,15 @@ alert_classes:
     response: drain-queue
     # derived: critical/alarm-capable
     tier: page
+    chat: critical
   - class: weekly_sf_recovery_metric
     source: "nousergon-data/scripts/weekly_sf_recovery_metric.py"
     severities: [error]
     intake: bus
     response: drain-queue
     # derived: error-capable, automated response declared
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
   - class: executor_zero_entries_alarm
     # In-process emitter merged to crucible-executor while the drift
     # chokepoint was dead on infra (config-I6753) — caught by the revived
@@ -2111,7 +2218,8 @@ alert_classes:
     intake: bus
     response: drain-queue
     # derived: error-capable, automated response declared
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
 
   # ── laptop LLM-routing plane (claude-code-config, config-I6753) ──
   # All four call sites previously omitted the REQUIRED `publish` subcommand,
@@ -2137,6 +2245,7 @@ alert_classes:
     # the tier is a property of the emitting SOURCE, and PR246 does not change
     # the source string.
     tier: tracked-only
+    chat: none
   - class: llm_egress_proxy_sli
     source: "llm-egress-proxy"
     severities: [error]
@@ -2145,14 +2254,16 @@ alert_classes:
     # DECLARED: an SLI breach is degraded-not-broken; the proxy fails CLOSED, so
     # a real outage surfaces as the consumer's own error, which pages on its own
     # class.
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
   - class: llm_router_reload_health
     source: "llm-router-reload"
     severities: [error]
     intake: bus
     response: drain-queue
     # derived: error-capable, automated response declared
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
   - class: litellm_proxy_degraded_start
     source: "litellm-proxy-shim"
     severities: [warning]
@@ -2160,7 +2271,8 @@ alert_classes:
     response: drain-queue
     # DECLARED: started-degraded is a degraded-results condition; the router's
     # own health class pages when routing actually fails.
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
   # claude-code-config-PR282 (alpha-engine-config-I12780): the egress shims page
   # once a day while the frozen binary is missing. reload-on-change rebuilds it
   # on the next source change and pages llm-router-reload if that fails, so the
@@ -2172,7 +2284,8 @@ alert_classes:
     response: drain-queue
     # DECLARED: the proxy still serves on the shared python; only LuLu's
     # per-process identity is lost, which is degraded, not down.
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
   # claude-code-config-PR290 (alpha-engine-config-I12884): daily laptop checks.
   # Both remedies need Brian at the laptop -- a LuLu upgrade replaces a system
   # extension that macOS makes him approve, and the checkout is pulled by hand
@@ -2184,6 +2297,7 @@ alert_classes:
     response: operator
     # derived: response=operator (no automated path exists, §7.4)
     tier: page
+    chat: action
     operator_reason: A LuLu upgrade needs macOS approval of its system extension on the laptop.
   - class: laptop_checkout_behind
     source: "checkout-behind"
@@ -2192,6 +2306,7 @@ alert_classes:
     response: operator
     # derived: response=operator (no automated path exists, §7.4)
     tier: page
+    chat: action
     operator_reason: The laptop checkout is pulled by hand per Brian's ruling; background pulls are ruled out.
   - class: router_degraded_mode_drill
     # alpha-engine-config-I7740 (operator ruling 2026-08-21): new registry
@@ -2203,6 +2318,7 @@ alert_classes:
     # DECLARED: a DRILL. A drill result is conformance evidence, never an
     # outage.
     tier: tracked-only
+    chat: none
   - class: router_spend_export_pricing_zero
     # alpha-engine-config-I10548 (nous-ergon-ops-PR1212): new registry row
     # for a previously-undeclared source. router-spend-export's daily export
@@ -2219,7 +2335,8 @@ alert_classes:
     # human's attention (it hides real spend from every cost surface) but not
     # tonight's page; it clears on its own once the generator emits a price
     # for the row (alpha-engine-config-PR10549 is exactly that fix).
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
 
   # ── DRAIN-BLIND rows (every one carries its migration or declaration) ──
   - class: executor_emergency_shutdown
@@ -2229,6 +2346,7 @@ alert_classes:
     response: operator
     # derived: response=operator (no automated path exists, §7.4)
     tier: page
+    chat: critical
     migration_issue: alpha-engine-config-I2908   # highest-value migration: a live emergency shutdown is invisible to the overseer today
   - class: substrate_health_raw_sns
     source: "raw-sns:nousergon_lib/transparency.py"
@@ -2236,7 +2354,8 @@ alert_classes:
     intake: none
     response: operator
     # derived: response=operator (no automated path exists, §7.4)
-    tier: page
+    tier: tracked-only
+    chat: none
     migration_issue: alpha-engine-config-I2908
   - class: predictor_drift_raw_sns
     source: "raw-sns:predictor/monitoring/drift_detector.py"
@@ -2244,7 +2363,8 @@ alert_classes:
     intake: none
     response: operator
     # derived: severities [dynamic] — resolved per emission
-    tier: dynamic
+    tier: tracked-only
+    chat: none
     migration_issue: alpha-engine-config-I2908
   - class: ci_runner_lambda_raw_telegram
     source: "raw-telegram:ci-runner-dispatcher-lambdas"
@@ -2252,7 +2372,8 @@ alert_classes:
     intake: none
     response: operator
     # derived: response=operator (no automated path exists, §7.4)
-    tier: page
+    tier: tracked-only
+    chat: none
     migration_issue: alpha-engine-config-I2909
   - class: governance_script_raw_telegram
     source: "raw-telegram:operator_triage_digest|neon_usage_monitor|check_doc_staleness"
@@ -2265,6 +2386,7 @@ alert_classes:
     # chokepoint cannot enforce this tier today; Phase 3
     # (alpha-engine-config-I2909-class migration) is what makes it binding.
     tier: tracked-only
+    chat: none
     operator_reason: >-
       Deliberate hermetic governance pings (no repo imports by design);
       doc-staleness auto-verify loop tracked separately (config-I3061).
@@ -2275,7 +2397,8 @@ alert_classes:
     response: operator
     # DECLARED: groom dispatch lifecycle — same 2026-08-03 ruling as
     # sf_completion_telegram.
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
     migration_issue: alpha-engine-config-I2928
   - class: sf_completion_telegram
     source: "flow-doctor:sf-telegram-notifier"
@@ -2292,6 +2415,7 @@ alert_classes:
     # started / stopped-early / finished); failures route via sf-watch, not this
     # notifier.
     tier: notify-silent
+    chat: pipelines
     operator_reason: >-
       Informational SF-completion notices (T0 class by definition — failures
       route via sf-watch, not this notifier).
@@ -2304,6 +2428,7 @@ alert_classes:
     # TRACKED-ONLY verbatim. `response: operator` would derive PAGE; spend
     # review has no actionable-now step.
     tier: tracked-only
+    chat: none
     operator_reason: Budget-usage notice; page-only by design (no automated response exists or is wanted for spend review).
 
   # ── Telegram-only notify_via_flow_doctor emitters (config-I3513 audit, alpha-engine-config-I3683) ──
@@ -2318,7 +2443,8 @@ alert_classes:
     intake: none
     response: operator
     # derived: response=operator (no automated path exists, §7.4)
-    tier: page
+    tier: tracked-only
+    chat: none
     operator_reason: >-
       Monday pre-open GO/NO-GO integrity page (Telegram-only by design; the
       Saturday-sf integrity verdict is independent of the watch plane — a silent
@@ -2329,7 +2455,8 @@ alert_classes:
     intake: none
     response: operator
     # derived: response=operator (no automated path exists, §7.4)
-    tier: page
+    tier: tracked-only
+    chat: none
     operator_reason: >-
       Watch-plane wiring/liveness probe findings (Telegram-only by design;
       the probe IS the watch-plane's own health-check — routing its findings
@@ -2340,7 +2467,8 @@ alert_classes:
     intake: none
     response: operator
     # derived: response=operator (no automated path exists, §7.4)
-    tier: page
+    tier: tracked-only
+    chat: none
     operator_reason: >-
       Mid-run spot-reclaim escalation (error) + bounded-relaunch note (info),
       Telegram-only by design (the reclaim action IS the repair; no drain-queue
@@ -2351,7 +2479,8 @@ alert_classes:
     intake: none
     response: operator
     # derived: response=operator (no automated path exists, §7.4)
-    tier: page
+    tier: tracked-only
+    chat: none
     operator_reason: >-
       Fleet-SF watch receipts (info) + budget-exhaustion escalation (error).
       Telegram-only by design: these are runtime watch-plane operational notices
@@ -2363,7 +2492,8 @@ alert_classes:
     intake: none
     response: operator
     # derived: response=operator (no automated path exists, §7.4)
-    tier: page
+    tier: tracked-only
+    chat: none
     operator_reason: >-
       EC2/GHA migration-runner outcome notices (info=noop/success,
       warning=refused-probe, critical=failure). Telegram-only by design: this
@@ -2377,6 +2507,7 @@ alert_classes:
     # DECLARED: digests are the surface, not a page. `response: operator` would
     # derive PAGE.
     tier: notify-silent
+    chat: none  # email, not chat
     operator_reason: Informational digests via the krepis email chokepoint; console deep-links are the response surface.
   - class: predictor_retrain_email
     source: "email:backtester/analysis/retrain_alert.py"
@@ -2385,6 +2516,7 @@ alert_classes:
     response: operator
     # DECLARED: a retrain RECOMMENDATION is backlog work with a known remedy.
     tier: tracked-only
+    chat: none
     migration_issue: alpha-engine-config-I3302   # also bypasses the email chokepoint itself
 
   # -- console (nousergon-console) --
@@ -2411,7 +2543,8 @@ alert_classes:
     intake: bus
     response: drain-queue
     # derived: error-capable, automated response declared
-    tier: notify-silent
+    tier: tracked-only
+    chat: none
     # overseer-policy.md invariant 4 (alpha-engine-config-I8991/I8996): a
     # pageable class needs a declared disposition, and `response: drain-queue`
     # alone is not one -- it says the drain SEES the event, not what the drain
