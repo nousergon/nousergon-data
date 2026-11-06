@@ -770,6 +770,45 @@ def _undo_vendor_preadjustment(
     return out, undone
 
 
+def _fill_vwap_from_same_basis_delta(
+    base: pd.DataFrame, delta_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Copy a delta row's VWAP onto a base row of the same date that has none.
+
+    alpha-engine-config-I13240 (b757d22f): the I13095 path keeps the adjusted
+    base row on overlapping dates, which also discarded the daily capture's
+    real VWAP whenever the price-cache row carried none. Only the VWAP moves,
+    and only where the two Closes agree: a differing Close means the rows are
+    on different bases (e.g. dividend-adjusted vs raw), and a raw VWAP on an
+    adjusted row would mix bases again.
+    """
+    if (
+        "VWAP" not in delta_df.columns
+        or base.index.has_duplicates
+        or delta_df.index.has_duplicates
+    ):
+        return base
+    overlap = base.index.intersection(delta_df.index)
+    if overlap.empty:
+        return base
+    base_vwap = base["VWAP"] if "VWAP" in base.columns else pd.Series(np.nan, index=base.index)
+    b_close = base.loc[overlap, "Close"].astype(float)
+    d_close = delta_df.loc[overlap, "Close"].astype(float)
+    d_vwap = delta_df.loc[overlap, "VWAP"].astype(float)
+    fill = (
+        base_vwap.loc[overlap].isna()
+        & d_vwap.notna()
+        & pd.Series(np.isclose(b_close, d_close, rtol=1e-4, atol=0.0), index=overlap)
+    )
+    if not fill.any():
+        return base
+    base = base.copy()
+    if "VWAP" not in base.columns:
+        base["VWAP"] = np.nan
+    base.loc[fill[fill].index, "VWAP"] = d_vwap[fill]
+    return base
+
+
 def _apply_daily_delta(
     s3, bucket: str, date_str: str, price_data: dict[str, pd.DataFrame],
     *, registry=None, override_base: bool = True,
@@ -941,6 +980,7 @@ def _apply_daily_delta(
             # An emptied delta still flows through the combine below, so the
             # declared-basis check and any registered split restatement run on
             # the merged frame exactly as before.
+            base = _fill_vwap_from_same_basis_delta(base, delta_df)
             delta_df = delta_df[delta_df.index > base.index.max()]
         if ticker in declared_base_ok and not delta_df.empty:
             # The daily-closes archive stays on the vendor basis, so its rows

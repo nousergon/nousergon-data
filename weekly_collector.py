@@ -2170,6 +2170,11 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
                 logger.info("Loaded %d tickers from existing constituents.json", len(tickers))
         except Exception as exc:
             logger.warning("S3 constituents load failed — will fall back to Wikipedia: %s", exc)
+    # 1b replays FULL-universe index changes backward, so it needs the full
+    # roster; replaying them from a subset reconstructs the wrong membership
+    # (alpha-engine-config-I13240 ccf4e341). In prod scope() returns this very
+    # object, so the two are identical there.
+    full_roster = tickers
     tickers = universe_scope.scope(tickers, path="phase1")
 
     # ── 1b. Historical (point-in-time) constituents ──────────────────────────
@@ -2185,7 +2190,7 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
         logger.info("=" * 60)
         logger.info("COLLECTING: historical constituents (point-in-time membership)")
         logger.info("=" * 60)
-        if not tickers:
+        if not full_roster:
             logger.warning(
                 "No tickers available — skipping historical constituents (PIT map "
                 "needs today's roster to replay changes from)"
@@ -2197,7 +2202,7 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
             results["collectors"]["historical_constituents"] = _phase_collect(
                 reg, "historical_constituents",
                 lambda: historical_constituents.collect(
-                    bucket=bucket, current_tickers=tickers,
+                    bucket=bucket, current_tickers=full_roster,
                     s3_prefix=market_prefix, dry_run=dry_run,
                 ),
                 artifact_key=f"{market_prefix}historical_constituents.json",

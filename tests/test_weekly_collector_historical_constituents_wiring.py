@@ -88,3 +88,27 @@ def test_historical_constituents_is_an_only_choice():
     )
     ns = parser.parse_args(["--only", "historical_constituents"])
     assert ns.only == "historical_constituents"
+
+
+def test_historical_constituents_replays_from_the_full_roster_under_a_subset_scope():
+    """alpha-engine-config-I13240 ccf4e341: in a subset-scoped environment the
+    PIT replay applies full-universe change events, so it must start from the
+    full roster, not the scoped subset (which reconstructs wrong membership)."""
+    config = {"bucket": "test-bucket", "market_data": {"s3_prefix": "market_data/"}}
+    captured: dict = {}
+
+    def fake_collect(**kwargs):
+        captured.update(kwargs)
+        return {"status": "ok", "n_changes": 3, "n_snapshots": 2}
+
+    fake_hist = MagicMock()
+    fake_hist.collect.side_effect = fake_collect
+    fake_scope = MagicMock()
+    fake_scope.scope.side_effect = lambda tickers, path: [t for t in tickers if t == "AAPL"]
+
+    with patch("weekly_collector.constituents", _fake_constituents(["AAPL", "MSFT", "XOM"])), \
+         patch("weekly_collector.universe_scope", fake_scope), \
+         patch("weekly_collector.historical_constituents", fake_hist):
+        weekly_collector._run_phase1(config, _args(only="historical_constituents"))
+
+    assert captured["current_tickers"] == ["AAPL", "MSFT", "XOM"]

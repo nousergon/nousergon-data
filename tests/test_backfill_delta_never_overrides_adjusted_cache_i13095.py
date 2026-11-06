@@ -110,3 +110,38 @@ def test_daily_default_still_lets_delta_rows_win():
     price_data, s3 = _scenario()
     out, _ = _c._apply_daily_delta(s3, "b", "2026-10-26", price_data, registry=None)
     assert out["NLY"]["Close"].loc["2026-10-21"] == 20.43
+
+
+def test_weekly_path_keeps_delta_vwap_on_same_basis_overlap_rows():
+    """alpha-engine-config-I13240 (b757d22f): keeping the adjusted base row must
+    not discard the daily capture's VWAP when the base row has none. Copied only
+    where the Closes agree (same basis); a raw row's VWAP never lands on a
+    dividend-adjusted row."""
+    import numpy as np
+
+    from features import compute as _c
+
+    price_data = {
+        "NLY": _frame("2026-10-23", [19.50, 19.60, 19.70, 19.80, 19.90]),
+        "STALE": _frame("2026-10-20", [10.0, 10.0, 10.0]),
+    }
+
+    def _with_vwap(close: float, vwap: float) -> pd.DataFrame:
+        df = _closes_file({"NLY": close})
+        df["VWAP"] = vwap
+        return df
+
+    s3 = _stub_s3({
+        "2026-10-22": _with_vwap(20.53, 20.40),  # raw, differs from adjusted 19.80
+        "2026-10-23": _with_vwap(19.90, 19.85),  # same basis as the cache row
+        "2026-10-26": _with_vwap(20.10, 20.05),
+    })
+    out, _ = _c._apply_daily_delta(
+        s3, "b", "2026-10-26", price_data, registry=None, override_base=False,
+    )
+    nly = out["NLY"]
+    assert nly.loc["2026-10-23", "Close"] == 19.90
+    assert nly.loc["2026-10-23", "VWAP"] == 19.85
+    assert nly.loc["2026-10-22", "Close"] == 19.80
+    assert np.isnan(nly.loc["2026-10-22", "VWAP"])
+    assert nly.loc["2026-10-26", "VWAP"] == 20.05
