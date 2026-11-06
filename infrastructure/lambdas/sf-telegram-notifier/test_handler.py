@@ -145,6 +145,17 @@ def reset_send_message(monkeypatch):
         return MagicMock()
 
     monkeypatch.setattr(index.boto3, "client", client)
+    # observability-policy §7.2b (2026-11-06): the per-run report these tests
+    # pin is now RECORDED (alert bus, tracked-only), not sent to the chat. Route
+    # the record into the same mock so each test still reads the report it
+    # built; the one daily chat message is pinned in
+    # tests/test_sf_notifier_one_message_a_day.py.
+    monkeypatch.setattr(
+        index, "_record",
+        lambda text, *, silent, severity, dedup_key: _telegram_mod.send_message(
+            text, disable_notification=silent),
+    )
+    monkeypatch.setattr(index, "_send_day_message", lambda detail: False)
     yield sf
 
 
@@ -161,7 +172,7 @@ def test_running_sends_silent_message_without_duration_or_cause():
     assert kwargs["disable_notification"] is True
     assert result["status"] == "RUNNING"
     assert result["silent"] is True
-    assert result["telegram_sent"] is True
+    assert result["recorded"] is True
 
 
 def test_succeeded_sends_loud_message_with_duration(reset_send_message):
@@ -301,7 +312,7 @@ def test_failed_with_describe_execution_error_still_sends(reset_send_message):
     text = _telegram_mod.send_message.call_args.args[0]
     assert "Weekly Freshness SF — FAILED" in text
     assert "Cause:" not in text  # enrichment silently dropped
-    assert result["telegram_sent"] is True
+    assert result["recorded"] is True
 
 
 def test_failed_truncates_long_cause(reset_send_message):
@@ -347,7 +358,7 @@ def test_unknown_sf_arn_falls_back_to_arn_tail():
 def test_send_message_failure_returned_in_result():
     _telegram_mod.send_message.return_value = False
     result = index.handler(_event("SUCCEEDED"), None)
-    assert result["telegram_sent"] is False
+    assert result["recorded"] is False
     assert result["status"] == "SUCCEEDED"
 
 
@@ -427,7 +438,7 @@ class TestPreflightLabel:
         result = index.handler(event, None)
         text = _telegram_mod.send_message.call_args.args[0]
         assert "Weekly Freshness SF — SUCCEEDED" in text
-        assert result["telegram_sent"] is True
+        assert result["recorded"] is True
 
     def test_malformed_input_json_falls_back_to_default_label(self, reset_send_message):
         event = _event("FAILED", sm_arn=SATURDAY_ARN)
@@ -723,7 +734,7 @@ class TestEodArtifactVerification:
         assert "⚠️ *ARTIFACT(S) MISSING*" in text
         assert "eod_pnl.csv row for 2026-08-08" in text
         assert "_sf_completion marker" not in text
-        assert result["telegram_sent"] is True
+        assert result["recorded"] is True
 
     def test_succeeded_with_missing_completion_marker_renders_loud(self, monkeypatch):
         _sf, _s3 = _eod_client_stubs(
@@ -904,7 +915,12 @@ class TestWeeklyIssueReport:
             sent.update(kwargs)
             return True
 
-        monkeypatch.setattr(index, "notify_via_flow_doctor", fake_notify)
+        # The weekly report is recorded, not sent (§7.2b); capture the record.
+        monkeypatch.setattr(
+            index, "_record",
+            lambda text, *, silent, severity, dedup_key: fake_notify(
+                text, silent=silent, severity=severity, dedup_key=dedup_key),
+        )
         return sent
 
     def test_succeeded_weekly_carries_issues_director_and_auto_fix(self, monkeypatch):
