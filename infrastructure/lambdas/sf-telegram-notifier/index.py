@@ -10,6 +10,13 @@ Migration arc: config#1742 (fleet Telegram consolidation T2). Falls back to
 (local tests / init failure).
 
 The existing SNS → email path is unaffected.
+
+ONE MESSAGE A DAY (observability-policy §7.2b, Brian 2026-11-06): the chat
+gets one pipelines message per day, success or failure, sent on the day's
+closing terminal (`_DAY_CLOSERS`). RUNNING, preflight and every other
+terminal send nothing to the chat; they stay on the alert bus and the
+console. A failure inside trading hours is caught as a critical by the
+Crucible v2 watchdogs, not here.
 """
 
 from __future__ import annotations
@@ -512,65 +519,154 @@ def terminal_resolution_line(sm_name: str, status: str) -> str | None:
     return None
 
 
+#: The terminal that closes a pipeline day: the weekday post-close reconcile,
+#: and the Saturday weekly run. Only these send to the chat (§7.2b class 4).
+_DAY_CLOSERS: frozenset[str] = frozenset({
+    "ne-postclose-reconcile-pipeline",
+    "ne-weekly-freshness-pipeline",
+})
+#: The pipelines a day's message counts. The groom dispatch SF is backlog
+#: plumbing, not a pipeline Brian reads about.
+_DAY_PIPELINES: tuple[str, ...] = tuple(n for n in _SF_LABELS if n != "alpha-engine-groom-dispatch")
+_DAY_WINDOW_S = 20 * 3600
+_PIPELINES_URL = "https://console.nousergon.ai/component"
+
+
+def _day_outcomes(sm_arn: str, *, sf_client, now_s: float) -> list[tuple[str, str]]:
+    """``[(label, status)]`` for each pipeline's latest run in the last 20 h.
+
+    Pipelines with no run in the window are left out, not counted as failed:
+    a weekday has no weekly run and a Saturday has no trading runs. A list
+    call that fails is reported as ``UNREADABLE`` so the day never reads as
+    cleaner than it was."""
+    prefix = sm_arn.rsplit(":", 1)[0]
+    out: list[tuple[str, str]] = []
+    for name in _DAY_PIPELINES:
+        try:
+            resp = sf_client.list_executions(stateMachineArn=f"{prefix}:{name}", maxResults=10)
+        except Exception as exc:  # noqa: BLE001 — one unreadable machine must not drop the day
+            logger.warning("list_executions %s failed: %s", name, type(exc).__name__)
+            out.append((_SF_LABELS[name], "UNREADABLE"))
+            continue
+        runs = [
+            e for e in resp.get("executions", [])
+            if now_s - _epoch_s(e.get("startDate")) <= _DAY_WINDOW_S
+            and not str(e.get("name", "")).startswith(("offcycle-shell", "preflight"))
+        ]
+        if runs:
+            latest = max(runs, key=lambda e: _epoch_s(e.get("startDate")))
+            out.append((_SF_LABELS[name], str(latest.get("status", "UNKNOWN"))))
+    return out
+
+
+def _epoch_s(value) -> float:
+    if isinstance(value, datetime):
+        return value.timestamp()
+    if isinstance(value, (int, float)):
+        return value / 1000 if value > 1e11 else float(value)
+    return 0.0
+
+
+def day_message(run_date: str | None, outcomes: list[tuple[str, str]]) -> str:
+    """The one pipelines message for the day. Pure."""
+    day = run_date or "today"
+    ok = [label for label, status in outcomes if status == "SUCCEEDED"]
+    bad = [f"{label} ({status.lower()})" for label, status in outcomes if status != "SUCCEEDED"]
+    if not bad:
+        head = f"✅ Pipelines {day}: all {len(ok)} succeeded."
+    else:
+        head = (f"\U0001f534 Pipelines {day}: {len(ok)} of {len(outcomes)} succeeded. "
+                f"Failed: {', '.join(bad)}. Tonight's sweep fixes them; nothing for you.")
+    return f"{head}\n{_PIPELINES_URL}"
+
+
+def _record(text: str, *, silent: bool, severity: str, dedup_key: str) -> bool:
+    """Put a per-run report on the alert bus as tracked-only. Never raises."""
+    from krepis.fleet_events import emit_alert_event
+
+    return emit_alert_event(
+        origin="sf-telegram-notifier", body=text, severity_raw=severity,
+        source="flow-doctor:sf-telegram-notifier", dedup_key=dedup_key,
+        disable_notification=silent, delivery_tier="tracked-only",
+        alert_class="sf_completion_telegram",
+    )
+
+
 def handler(event: dict, context) -> dict:  # noqa: ARG001
+    """Record every run; send the chat ONE message a day (§7.2b)."""
+    result = _record_run(event)
+    detail = event.get("detail") or {}
+    if _closes_day(detail):
+        result["day_message_sent"] = _send_day_message(detail)
+    return result
+
+
+def _closes_day(detail: dict) -> bool:
+    status = detail.get("status", "UNKNOWN")
+    sm_arn = detail.get("stateMachineArn") or ""
+    if status not in _TERMINAL_STATUSES or sm_arn.rsplit(":", 1)[-1] not in _DAY_CLOSERS:
+        return False
+    describe_resp = _describe_execution(detail.get("executionArn", ""))
+    return not _is_preflight_execution(describe_resp) and not _is_partial_execution(sm_arn, describe_resp)[0]
+
+
+def _send_day_message(detail: dict) -> bool:
+    sm_name = (detail.get("stateMachineArn") or "").rsplit(":", 1)[-1]
+    describe_resp = _describe_execution(detail.get("executionArn", ""))
+    run_date = parse_run_date_from_input((describe_resp or {}).get("input")) or \
+        parse_run_date_from_execution_name(detail.get("name", ""))
+    outcomes = _day_outcomes(
+        detail.get("stateMachineArn", ""),
+        sf_client=boto3.client("stepfunctions", region_name=REGION),
+        now_s=datetime.now(timezone.utc).timestamp(),
+    )
+    failed = any(st != "SUCCEEDED" for _, st in outcomes)
+    return notify_via_flow_doctor(
+        day_message(run_date, outcomes),
+        silent=False,
+        severity="warning" if failed else "info",
+        dedup_key=f"{_FLOW_NAME}:day:{sm_name}:{run_date or detail.get('name', '')}",
+        flow_name=_FLOW_NAME,
+        topics=PIPELINE_OBSERVER_TELEGRAM_TOPICS,
+        db_basename=_DB_BASENAME,
+        # Out of the shared daily budget, and guaranteed to land: a once-a-day
+        # result that is suppressed reads exactly like a day that never ran
+        # (Brian's 2026-08-17 ruling, carried over).
+        rate_limit_exempt_severities=_RATE_LIMIT_EXEMPT_SEVERITIES,
+        guaranteed_topic=FleetTelegramTopic.PIPELINE,
+        context={"state_machine": sm_name, "execution": detail.get("name"), "day": run_date},
+        # Matches playbooks.yaml's registered `sf_completion_telegram` class.
+        source="flow-doctor:sf-telegram-notifier",
+    )
+
+
+def _record_run(event: dict) -> dict:
+    """The per-run report, built exactly as before 2026-11-06 and RECORDED
+    (alert bus, tracked-only: /page/incidents and the nightly sweep), never
+    sent to the chat (observability-policy §7.2b)."""
     detail = event.get("detail") or {}
     status = detail.get("status", "UNKNOWN")
     sm_name = (detail.get("stateMachineArn") or "").rsplit(":", 1)[-1]
     logger.info("SF status change: sf=%s status=%s", sm_name, status)
 
     text, silent, hollow_suspect, is_partial, needs_triage = _build_message(detail)
-    ok = notify_via_flow_doctor(
+    ok = _record(
         text,
         silent=silent,
-        # A partial run is recorded at info regardless of its terminal status:
-        # severity belongs to the invariant breached, and a narrowed
-        # verification run failing does not breach the cadence cycle's.
         severity=(
             "info" if is_partial
             else "warning" if (hollow_suspect or needs_triage) and status == "SUCCEEDED"
             else _severity_for_status(status)
         ),
         dedup_key=_dedup_key(detail),
-        flow_name=_FLOW_NAME,
-        topics=PIPELINE_OBSERVER_TELEGRAM_TOPICS,
-        db_basename=_DB_BASENAME,
-        # Brian's ruling, 2026-08-17: "eod outcome should land in the same
-        # place as 'Post-close Trading SF — RUNNING'". Those two messages take
-        # DIFFERENT delivery paths, which is why they had different
-        # reliability. RUNNING goes out via the `silent_topic` branch's
-        # `send_raw`, which never touches flow-doctor's alert pipeline and so
-        # always arrives. The terminal goes through `notify_event`, where the
-        # fleet-shared daily budget can drop it — measured on the postclose SF:
-        # 2026-08-03, -04 and -07 all reached SUCCEEDED and all three reports
-        # were recorded `reason=rate_limited`, delivered nowhere, while that
-        # morning's RUNNING ping landed normally. Three of the last eight
-        # trading days had a green EOD that was indistinguishable, on the
-        # thread the operator actually reads, from a pipeline that never ran.
-        #
-        # Two changes make the ruling structurally true rather than probable:
-        # the exemption below takes this bounded lifecycle mirror out of the
-        # shared budget so the ordinary path fires, and `guaranteed_topic` is
-        # the belt — any FUTURE suppression that is not dedup still lands the
-        # message in PIPELINE, the same thread RUNNING goes to.
-        rate_limit_exempt_severities=_RATE_LIMIT_EXEMPT_SEVERITIES,
-        guaranteed_topic=FleetTelegramTopic.PIPELINE,
-        context={
-            "state_machine": sm_name,
-            "execution": detail.get("name"),
-            "status": status,
-            "partial_run": is_partial,
-        },
-        silent_topic=FleetTelegramTopic.PIPELINE,
-        # Matches playbooks.yaml's registered `sf_completion_telegram` class
-        # source exactly (config-I3513).
-        source="flow-doctor:sf-telegram-notifier",
     )
 
     return {
         "status": status,
         "state_machine": sm_name,
         "execution": detail.get("name", ""),
-        "telegram_sent": ok,
+        "telegram_sent": False,
+        "recorded": ok,
         "silent": silent,
         "hollow_suspect": hollow_suspect,
     }

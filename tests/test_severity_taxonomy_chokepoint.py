@@ -74,30 +74,14 @@ _SINK_FILE = "infrastructure/lambdas/flow_doctor_telegram.py"
 _REGISTRY: dict[str, dict[str, list[dict]]] = {
     # --- DOCUMENTED in severity_taxonomy.md ---
     "infrastructure/lambdas/sf-telegram-notifier/index.py": {
-        "handler": [
+        # Per-run outcomes are recorded on the bus (tracked-only) since
+        # observability §7.2b; the chat gets one pipelines message a day.
+        "_send_day_message": [
             {
-                "event_class": "SF execution RUNNING (mid-execution ping)",
-                "severity": "info",
-                "silent": True,
-                "citation": "severity_taxonomy.md row: index.py:162",
-            },
-            {
-                "event_class": "SF execution SUCCEEDED, no hollow-suspect",
-                "severity": "info",
+                "event_class": "Pipelines daily summary (all succeeded / N failed)",
+                "severity": "dynamic (info when all succeeded, warning when any failed)",
                 "silent": False,
-                "citation": "severity_taxonomy.md row: index.py:191-193",
-            },
-            {
-                "event_class": "SF execution SUCCEEDED, hollow-suspect (implausibly fast)",
-                "severity": "warning",
-                "silent": False,
-                "citation": "severity_taxonomy.md row: index.py:180-183,209",
-            },
-            {
-                "event_class": "SF execution FAILED / TIMED_OUT / ABORTED",
-                "severity": "warning",
-                "silent": False,
-                "citation": "severity_taxonomy.md row: index.py:68-71,191",
+                "citation": "reconciled from live code 2026-11-06 — observability-policy §7.2b pipelines class; nousergon-data#2446",
             },
         ],
     },
