@@ -1772,8 +1772,8 @@ alert_classes:
     # and `warn` otherwise, and a DEGRADED run that still produced its artifact
     # is tracked-only work (tonight's data-collector 'Collection finished
     # DEGRADED' page). Resolved per emission.
-    tier: tracked-only
-    chat: none
+    tier: dynamic
+    chat: critical-only
   - class: data_phase_marker_sweep
     source: "alpha-engine-data/validators/phase_marker_sweep.py"
     severities: [dynamic]
