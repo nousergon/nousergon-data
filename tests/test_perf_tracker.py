@@ -976,3 +976,10 @@ def test_load_reads_the_v2_records_and_survives_their_absence(monkeypatch):
     assert doc["inputs"]["flows"]["v2_ledger"]["days_read"] == len(V2_DAYS)
     bare = pt.load_and_build(FakeS3(base), "bucket", now=NOW)
     assert window(bare, "day")["cells"]["absolute"]["reasons"] == [pt.REASON_FLOWS]
+
+
+def test_close_history_mapping_row_is_skipped_not_raised():
+    # codex 385d8cccc8e6d68a residual: a mapping where a [date, close] pair
+    # belongs raised KeyError past the optional-input guard.
+    doc = {"closes": [{"date": "2026-01-02"}, ["2026-01-05", 101.5]]}
+    assert pt.parse_close_history(doc) == {date(2026, 1, 5): 101.5}

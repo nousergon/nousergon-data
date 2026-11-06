@@ -114,18 +114,17 @@ def open_hold(
       ``additional_breaks``, so the auto-clear check must see EVERY held break
       restated before it releases the name (a restated first break with a
       later one still printed is not a clean series);
-    * the stored hold was cleared by an operator for this same ``break_date``.
+    * the stored hold was cleared by an operator and this ``break_date`` is one
+      of its held breaks (the first or any of ``additional_breaks``).
       Replaying ``daily_append`` for that date re-detects the move the
-      operator already judged genuine; reopening it would undo the clearance.
+      operator already judged genuine; reopening it would undo the clearance
+      (codex 14f010ed1b164061: only the first break used to count).
 
     Any other cleared hold is replaced: the name broke again.
     """
     existing = read_hold(s3, bucket, ticker)
     if existing is not None and existing.get("status") == STATUS_ACTIVE:
-        held_dates = {existing.get("break_date")} | {
-            b.get("break_date") for b in existing.get("additional_breaks", []) or []
-        }
-        if break_date not in held_dates:
+        if break_date not in _held_dates(existing):
             body = dict(existing)
             body["additional_breaks"] = list(existing.get("additional_breaks", []) or []) + [{
                 "break_date": break_date,
@@ -152,7 +151,7 @@ def open_hold(
     if (
         existing is not None
         and existing.get("status") == STATUS_CLEARED
-        and existing.get("break_date") == break_date
+        and break_date in _held_dates(existing)
         and not str(existing.get("cleared_by", "")).startswith("auto:")
     ):
         log.warning(
@@ -188,6 +187,15 @@ def open_hold(
         ticker, body["why"], bucket, hold_key(ticker), ticker,
     )
     return body
+
+
+def _held_dates(hold: dict) -> set:
+    """The first ``break_date`` and every ``additional_breaks`` date of a hold."""
+    return {hold.get("break_date")} | {
+        b.get("break_date")
+        for b in hold.get("additional_breaks", []) or []
+        if isinstance(b, dict)
+    }
 
 
 def break_restated(hold: dict, hist: pd.DataFrame, soft_ratio: float) -> tuple[bool, float | None]:

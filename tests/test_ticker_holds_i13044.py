@@ -128,6 +128,19 @@ def test_replaying_an_operator_cleared_break_does_not_reopen_it():
     assert s3.body("CTVA")["status"] == "cleared"
 
 
+def test_replaying_an_operator_cleared_additional_break_does_not_reopen_it():
+    # codex finding 14f010ed1b164061: the clearance check compared only the
+    # first break_date, so replaying the date of an additional break reopened.
+    s3 = _FakeS3()
+    _open_ctva(s3)
+    th.open_hold(s3, "b", ticker="CTVA", break_date="2026-10-02", prior_date="2026-10-01",
+                 prior_close=12.57, break_close=4.0, ratio=4.0 / 12.57)
+    th.clear_hold(s3, "b", s3.body("CTVA"), reason="genuine moves", cleared_by="operator")
+    assert th.open_hold(s3, "b", ticker="CTVA", break_date="2026-10-02", prior_date="2026-10-01",
+                        prior_close=12.57, break_close=4.0, ratio=4.0 / 12.57) is None
+    assert s3.body("CTVA")["status"] == "cleared"
+
+
 def test_an_auto_cleared_break_that_prints_again_reopens():
     s3 = _FakeS3()
     th.clear_hold(s3, "b", _open_ctva(s3), reason="restated", cleared_by="auto:builders.daily_append")

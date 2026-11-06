@@ -351,3 +351,32 @@ def test_repo_mode_checks_a_library_checkout(tmp_path):
     # A declaration narrowed past a consumer fails without reading any repo.
     out = c.run(remote=False, constraint_file=_lib_toml(tmp_path / "d2", ">=26"))
     assert any("DISJOINT" in f for f in out), out
+
+
+# --- codex 2026-11-05/06 findings ------------------------------------------
+
+
+def test_a_bare_inline_pyarrow_install_is_validated_as_unbounded():
+    # codex d53b77479380316f: dropping the operator took the line out of validation.
+    line = "          python3 -m pip install -q 'boto3>=1.39' pyarrow\n"
+    assert c.inline_pyarrow_specs(line) == [""]
+    out = c.check_surface(_surface("bootstrap", "w.yml"), line, _venv(">=17"), "26")
+    assert any("(unbounded) inline" in f for f in out), out
+    # an import in a later command, a stub package or an uninstall is not an install of pyarrow
+    assert c.inline_pyarrow_specs("pip install 'pyarrow>=17' && python -c 'import pyarrow'\n") == [">=17"]
+    assert c.inline_pyarrow_specs("pip install pyarrow-stubs\n") == []
+    assert c.inline_pyarrow_specs("pip uninstall -y pyarrow\n") == []
+
+
+@pytest.mark.parametrize("line", ["pip install 'numpy>=2.2,<2.3'", "pip install numpy==2.2.1",
+                                  "pip install 'numpy==2.2.*'"])
+def test_a_narrow_numpy_2_spec_does_not_force_below_2(line):
+    # codex 3ea669b090402cfb: a 2.2.x-only spec matched no fixed probe.
+    assert not c.forces_numpy_below_2(line)
+
+
+def test_library_numpy_excluding_one_2x_release_is_too_narrow():
+    # codex 6106b2fe5c959582: '!=2.1.0' passed every fixed NumPy 2 probe.
+    venvs = {"data": _venv(">=26", name="data")}
+    out = c.check_library_rule(_lib(">=14.0", ">=1.24,!=2.1.0", ("data",)), venvs)
+    assert len(out) == 1 and "is too narrow" in out[0] and "2.1.0" in out[0], out
