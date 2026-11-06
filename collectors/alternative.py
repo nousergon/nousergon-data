@@ -1654,6 +1654,25 @@ def _fetch_revisions(ticker: str, bucket: str, run_date: str) -> dict:
 
 # ---- 3. Options flow ----
 
+#: Rows yfinance ``get_earnings_dates`` returns by default reach ~6 quarters
+#: back from TODAY; its ``limit`` is capped at 100.
+_EARNINGS_DATES_BASE_LIMIT = 8
+_EARNINGS_DATES_MAX_LIMIT = 100
+
+
+def _earnings_dates_limit(run_date: str) -> int:
+    """Window size that still reaches a report on or before ``run_date``.
+
+    alpha-engine-config-I13240 (d1cdb30f): yfinance counts its window back
+    from today, not from ``run_date``, so a fixed 8 rows cannot reach the
+    anchor of a replay older than ~6 quarters. Widen by one row per quarter
+    the anchor lies in the past; a run for today keeps the base window.
+    """
+    days_back = (datetime.now(timezone.utc).date() - date.fromisoformat(run_date[:10])).days
+    extra = -(-max(0, days_back) // 91)
+    return min(_EARNINGS_DATES_MAX_LIMIT, _EARNINGS_DATES_BASE_LIMIT + extra)
+
+
 def _fetch_days_since_earnings(ticker: str, run_date: str) -> Optional[int]:
     """Calendar days from the last REPORTED earnings date to ``run_date``.
 
@@ -1676,9 +1695,10 @@ def _fetch_days_since_earnings(ticker: str, run_date: str) -> Optional[int]:
 
         from collectors.yahoo_session import call_yahoo
 
+        limit = _earnings_dates_limit(run_date)
         with quiet_yfinance():
             df = call_yahoo(
-                lambda: yf.Ticker(ticker).get_earnings_dates(limit=8),
+                lambda: yf.Ticker(ticker).get_earnings_dates(limit=limit),
                 label=f"earnings_dates[{ticker}]",
                 is_empty=lambda d: d is None or d.empty,
             )
