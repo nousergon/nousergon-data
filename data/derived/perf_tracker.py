@@ -455,8 +455,8 @@ def parse_close_history(doc: Mapping[str, Any]) -> dict[date, float]:
         try:
             day = date.fromisoformat(str(pair[0])[:10])
             close = float(pair[1])
-        except (TypeError, ValueError, IndexError):
-            continue
+        except (TypeError, ValueError, IndexError, KeyError):
+            continue  # a mapping row raises KeyError on pair[0] (codex 385d8cccc8e6d68a)
         if math.isfinite(close) and close > 0:
             out[day] = close
     return out

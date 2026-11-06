@@ -71,6 +71,13 @@ _NUMPY_BELOW_2 = re.compile(r"numpy\s*<\s*2(?![0-9.])")
 #: A non-comment line that pip-installs numpy or pyarrow by name.
 #: A pyarrow requirement written inline on a pip-install line: ``pip install 'pyarrow>=17'``.
 _INLINE_PYARROW = re.compile(r"""(?<![\w.-])pyarrow(?:\[[^\]]*\])?\s*((?:[<>=!~]=?\s*[0-9][^\s'",;]*\s*,?\s*)+)""", re.IGNORECASE)
+#: A bare ``pyarrow`` (no version operator) on a pip-install command: an
+#: unconstrained install, which must not read as "no inline spec" (codex
+#: d53b77479380316f).
+_BARE_PYARROW = re.compile(r"""(?<![\w.-])pyarrow(?:\[[^\]]*\])?(?![\w.-]|\s*[<>=!~\[])""", re.IGNORECASE)
+#: One shell command of a line (``a && b; c | d``) that runs ``pip install``.
+_SHELL_SPLIT = re.compile(r"&&|\|\||;|\|")
+_PIP_INSTALL_CMD = re.compile(r"\bpip[0-9.]*\b.*\binstall\b", re.IGNORECASE)
 _INLINE_NUMPY = re.compile(r"""(?<![\w.-])numpy(?:\[[^\]]*\])?\s*((?:[<>=!~]=?\s*[0-9][^\s'",;]*\s*,?\s*)+)""", re.IGNORECASE)
 _PY_DEPENDABOT = re.compile(r"package-ecosystem:\s*[\"']?(?:pip|uv)\b")
 _PIP_INSTALL_PAIR = re.compile(r"\binstall\b.*\b(numpy|pyarrow)\b", re.IGNORECASE)
@@ -226,9 +233,16 @@ def check_library_rule(lib: Library, venvs: dict[str, Venv]) -> list[str]:
                     f"(resolves {NUMPY_1_FINAL})"
                 )
         else:
-            missing = [v for v in NUMPY_2_PROBES if not lib.numpy.contains(v)]
+            # Probe around every bound the library names as well as the fixed
+            # releases: ``!=2.1.0`` excludes none of the fixed ones
+            # (codex 6106b2fe5c959582).
+            probes = sorted(
+                set(NUMPY_2_PROBES) | {p for p in _grid(lib.numpy) if Version(p).major == 2},
+                key=Version,
+            )
+            missing = [v for v in probes if not lib.numpy.contains(v)]
             if missing:
-                kind = "excludes NumPy 2" if len(missing) == len(NUMPY_2_PROBES) else "is too narrow"
+                kind = "excludes NumPy 2" if len(missing) == len(probes) else "is too narrow"
                 out.append(
                     f"{where}: numpy{lib.numpy} {kind} (refuses {', '.join(missing)}), but consumer "
                     f"venv {name} resolves NumPy 2"
@@ -340,11 +354,18 @@ def lock_pins(path: str, text: str) -> list[str]:
 
 
 def inline_pyarrow_specs(text: str) -> list[str]:
-    """pyarrow specs a bootstrap pip-installs inline (``pip install 'pyarrow>=17'``)."""
+    """pyarrow specs a bootstrap pip-installs inline (``pip install 'pyarrow>=17'``).
+
+    A bare ``pip install pyarrow`` is reported as the empty (unbounded) spec,
+    so dropping the operator cannot take the line out of validation (codex
+    d53b77479380316f)."""
     out: list[str] = []
     for ln in _code_lines(text):
         if "install" in ln and "pip" in ln.lower():
             out.extend(m.group(1).strip().rstrip(",").replace(" ", "") for m in _INLINE_PYARROW.finditer(ln))
+            for cmd in _SHELL_SPLIT.split(_strip_inline_comment(ln)):
+                if _PIP_INSTALL_CMD.search(cmd):
+                    out.extend("" for _ in _BARE_PYARROW.finditer(cmd))
     return out
 
 
@@ -361,7 +382,9 @@ def forces_numpy_below_2(text: str) -> bool:
                 spec = SpecifierSet(m.group(1).strip().rstrip(",").replace(" ", ""))
             except InvalidSpecifier:
                 continue
-            if not any(spec.contains(v) for v in ("2.0.0", "2.1.0", "2.99.0", "3.0.0")):
+            # Spec-derived probes too: ``>=2.2,<2.3`` admits a 2.x release but
+            # none of the fixed ones (codex 3ea669b090402cfb).
+            if not admits_from(spec, "2"):
                 return True
     return False
 
@@ -406,7 +429,7 @@ def check_surface(surface: Surface, text: str, venv: Venv, threshold: str) -> li
             try:
                 if SpecifierSet(raw) != venv.pyarrow:
                     out.append(
-                        f"{where}: pip-installs pyarrow{raw} inline, which disagrees with the declared "
+                        f"{where}: pip-installs pyarrow{raw or ' (unbounded)'} inline, which disagrees with the declared "
                         f"pyarrow{venv.pyarrow} (constraints/pyarrow-numpy.toml)"
                     )
             except InvalidSpecifier:
