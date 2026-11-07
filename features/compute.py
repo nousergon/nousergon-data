@@ -39,6 +39,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 import pandas as pd
@@ -1797,9 +1798,9 @@ def build_feature_frame(
     if partition_date:
         elapsed = max(0, (datetime.fromisoformat(date_str).date()
                           - datetime.fromisoformat(partition_date).date()).days)
-        for entry in alt_data.values():
-            earnings = entry["earnings"]
-            days = earnings.get("days_since_earnings")
+        for entry in cast("dict[str, dict[str, dict[str, int | None]]]", alt_data).values():
+            earnings: dict[str, int | None] = entry["earnings"]
+            days: int | None = earnings.get("days_since_earnings")
             if days is not None:
                 # Calendar aging only: reports inside this gap are unknown to
                 # the weekly payload and cannot reset the count until refresh.
