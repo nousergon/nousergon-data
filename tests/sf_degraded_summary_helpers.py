@@ -267,13 +267,6 @@ def notify_target(states: dict, data: dict) -> str:
     dereference of an absent one fails here rather than as a ``States.Runtime``
     at the last state of an otherwise successful weekly run.
 
-    Lifted here by ``alpha-engine-config-I11299`` (``shared-code-policy``: the
-    second adoption lifts, and this is the fifth). Four test modules —
-    ``test_sf_report_card_degraded_wiring``, ``test_sf_health_check_honesty_wiring``,
-    ``test_sf_parity_gate_notify_wiring``, ``test_sf_research_predictor_degraded_wiring``
-    — still carry their own private ``_notify_target``; sweeping them onto this
-    one is tracked as ``alpha-engine-config-I11324``, and deliberately not
-    bundled with a §2.3b behaviour change.
     """
 
     def eval_rule(rule: dict) -> bool:
