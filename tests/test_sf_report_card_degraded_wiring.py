@@ -52,6 +52,7 @@ import pytest
 from tests.sf_degraded_summary_helpers import (
     assert_completion_notifier_chain,
     assert_degraded_continuation,
+    notify_target,
 )
 
 _WEEKLY = pathlib.Path(__file__).parent.parent / "infrastructure" / "step_function.json"
@@ -121,41 +122,6 @@ def test_publish_report_card_degraded_unchanged_downstream(states):
 # ---------------------------------------------------------------------------
 
 
-def _notify_target(states, data: dict) -> str:
-    """Evaluate the CheckShellRunNotify -> CheckGateDegradedNotify selection
-    with ASL short-circuit semantics against a partial payload. Flat
-    IsPresent-guarded And-rules only (no Or-in-And) — matches this SF's
-    established style throughout CheckGateDegradedNotify."""
-    def eval_rule(rule):
-        if "And" in rule:
-            return all(eval_rule(op) for op in rule["And"])
-        var = rule["Variable"].lstrip("$.")
-        present = var in data
-        if "IsPresent" in rule:
-            return present == rule["IsPresent"]
-        assert present, f"unguarded dereference of {var} in drill payload {data}"
-        return data[var] == rule["BooleanEquals"]
-
-    cur = "CheckShellRunNotify"
-    while states[cur]["Type"] in ("Choice", "Pass"):
-        if states[cur]["Type"] == "Pass":
-            # alpha-engine-config#5950: a normalizer Pass may sit between the
-            # gate and its notifier, flooring the optional diagnostic fields the
-            # notifier dereferences. It has no Choices, so it cannot change WHICH
-            # notifier is reached — walk through it rather than widening the
-            # allowed-target list, which would let a future Pass hide a wrong
-            # destination from this test.
-            cur = states[cur]["Next"]
-            continue
-        for rule in states[cur]["Choices"]:
-            if eval_rule(rule):
-                cur = rule["Next"]
-                break
-        else:
-            cur = states[cur]["Default"]
-    return cur
-
-
 _FLAG_COMBOS = [
     dict(zip(("gate_degraded", "health_check_degraded", "report_card_degraded"), bits))
     for bits in itertools.product([True, False], repeat=3)
@@ -171,7 +137,7 @@ def test_report_card_degraded_never_reaches_plain_notify_complete(states, combo)
     # A Choice payload only carries the flags that are actually set — an
     # absent flag is IsPresent-guarded, not present-as-false.
     payload = {k: True for k, v in combo.items() if v}
-    target = _notify_target(states, payload)
+    target = notify_target(states, payload)
     if combo["report_card_degraded"]:
         assert target != "NotifyComplete", (
             f"payload {payload} reached plain NotifyComplete — a ReportCard "
