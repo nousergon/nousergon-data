@@ -1354,6 +1354,16 @@ NEON_TRANSFER_OVERAGE_USD_PER_GB = 0.10
 NEON_COMPUTE_USD_PER_CU_HOUR = 0.106
 NEON_STORAGE_USD_PER_GB_MONTH = 0.35
 NEON_EXTRA_BRANCH_USD_PER_MONTH = 1.50
+# ``extra_branches_month`` is reported in BRANCH-HOURS of ALL child branches,
+# and the plan allowance is subtracted before billing (neon.com/docs/guides/
+# consumption-metrics: "branch-hours | branch-months | All child branches per
+# hour (subtract plan allowance before billing)"). Pricing the raw value as
+# branch-months overstated it ~730x: on 2026-11-07 crucible-state's 44
+# branch-hours (about one child branch for a day and a half) were billed as
+# $66 and paged the budget CRITICAL. Launch includes 10 branches per project;
+# one is the root, so 9 CHILD branches are free.
+NEON_HOURS_PER_MONTH = 730.0
+NEON_INCLUDED_CHILD_BRANCHES = 9
 
 # The consumption-history **v2** endpoints ARE available on Launch (verified
 # live 2026-07-31 against both fleet projects) — only the v1
@@ -1423,7 +1433,8 @@ def neon_consumption_v2(headers: dict, org_id: str, start: datetime,
     return out
 
 
-def price_neon_project(metrics: dict[str, float]) -> dict:
+def price_neon_project(metrics: dict[str, float],
+                       period_hours: float | None = None) -> dict:
     """Price ONE project's invoice-aligned metric bundle (pure — unit-tested).
 
     The 500 GB public-egress allowance is per PROJECT (neon.com/pricing):
@@ -1434,7 +1445,13 @@ def price_neon_project(metrics: dict[str, float]) -> dict:
     storage_gb_month = sum(metrics.get(m, 0.0) for m in NEON_STORAGE_METRICS
                            ) / NEON_BYTES_MONTH_PER_GB_MONTH
     transfer_gb = metrics.get(NEON_TRANSFER_METRIC, 0.0) / 1e9
-    extra_branch_months = metrics.get(NEON_BRANCHES_METRIC, 0.0)
+    # Branch-hours less the allowance over the hours measured, as months. With
+    # no period length the allowance is not applied (an overstatement, never
+    # an understatement).
+    branch_hours = metrics.get(NEON_BRANCHES_METRIC, 0.0)
+    allowance_hours = (NEON_INCLUDED_CHILD_BRANCHES * period_hours
+                       if period_hours is not None else 0.0)
+    extra_branch_months = max(0.0, branch_hours - allowance_hours) / NEON_HOURS_PER_MONTH
     compute_usd = compute_cu_hours * NEON_COMPUTE_USD_PER_CU_HOUR
     storage_usd = storage_gb_month * NEON_STORAGE_USD_PER_GB_MONTH
     transfer_usd = (max(0.0, transfer_gb - NEON_TRANSFER_FREE_GB)
@@ -1536,7 +1553,8 @@ def collect_neon(mw: dict, budgets: dict, secrets: dict) -> dict:
         bundle = metrics_by_project.get(
             proj["id"], {} if metrics_by_project
             else {NEON_TRANSFER_METRIC: proj["transfer_bytes"]})
-        priced = price_neon_project(bundle)
+        priced = price_neon_project(
+            bundle, period_hours=mw["elapsed_frac"] * mw["total_seconds"] / 3600.0)
         priced_bundles.append(bundle)
         per_project.append({"project": proj["name"], **priced})
         for k in totals:
