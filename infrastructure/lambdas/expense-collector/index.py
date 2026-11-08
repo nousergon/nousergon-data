@@ -104,6 +104,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
+from typing import Any, cast
 
 import boto3
 
@@ -430,7 +431,7 @@ def _stamp_funded_balance(row: dict, mw: dict, balance_usd: float | None,
     return row
 
 
-def _row(key: str, label: str, **kw) -> dict:
+def _row(key: str, label: str, **kw: Any) -> dict:  # pyright: ignore[reportExplicitAny, reportMissingTypeArgument, reportUnknownParameterType]  # free-form row fields
     base = {
         "key": key, "label": label, "status": "ok",
         "mtd_cost_usd": None, "projected_month_end_usd": None,
@@ -462,7 +463,7 @@ def _finish_usd_row(row: dict, mw: dict, budget_usd: float | None,
 # S3 helpers
 # ---------------------------------------------------------------------------
 
-def _s3_json(s3, key: str) -> dict | None:
+def _s3_json(s3: Any, key: str) -> dict | None:  # pyright: ignore[reportExplicitAny, reportMissingTypeArgument, reportUnknownParameterType]  # untyped SDK object; bare dicts pre-date the strict gate
     try:
         return json.loads(s3.get_object(Bucket=BUCKET, Key=key)["Body"].read())
     except Exception as exc:  # noqa: BLE001 — absence is an expected state here;
@@ -473,7 +474,7 @@ def _s3_json(s3, key: str) -> dict | None:
         return None
 
 
-def _put_json(s3, key: str, doc: dict, if_none_match: bool = False) -> bool:
+def _put_json(s3: Any, key: str, doc: dict, if_none_match: bool = False) -> bool:  # pyright: ignore[reportExplicitAny, reportMissingTypeArgument, reportUnknownParameterType]  # untyped SDK object; bare dicts pre-date the strict gate
     kwargs = {"Bucket": BUCKET, "Key": key, "ContentType": "application/json",
               "Body": json.dumps(doc, indent=2, default=str).encode()}
     if if_none_match:
@@ -501,7 +502,7 @@ def _alert_state_key(period: str) -> str:
     return f"{ALERT_STATE_PREFIX}{period}.json"
 
 
-def _load_alert_state(s3, period: str) -> dict:
+def _load_alert_state(s3: Any, period: str) -> dict:  # pyright: ignore[reportExplicitAny, reportMissingTypeArgument, reportUnknownParameterType]  # untyped SDK object; bare dicts pre-date the strict gate
     """Prior per-provider breached flags for THIS calendar-month period;
     ``{}`` (nothing armed) if absent, unreadable, or malformed — so a fresh
     month naturally starts with every provider re-armed. Best-effort: a read
@@ -522,7 +523,7 @@ def _load_alert_state(s3, period: str) -> dict:
     return data
 
 
-def _save_alert_state(s3, period: str, breached: dict[str, bool]) -> None:
+def _save_alert_state(s3: Any, period: str, breached: dict[str, bool]) -> None:  # pyright: ignore[reportExplicitAny]  # untyped SDK object
     """Persist this run's observed per-provider breached flags. Best-effort: a
     write failure only risks a duplicate alert next run (logged), never a
     missed breach (the breach itself already surfaced via Telegram)."""
@@ -565,7 +566,7 @@ def _alert_over_budget(row: dict, period: str) -> bool:
         return False
 
 
-def run_over_budget_alerts(s3, period: str, rows: list[dict]) -> dict:
+def run_over_budget_alerts(s3: Any, period: str, rows: list[dict]) -> dict:  # pyright: ignore[reportExplicitAny, reportMissingTypeArgument, reportUnknownParameterType]  # untyped SDK object; bare dicts pre-date the strict gate
     """Rising-edge Telegram alert pass over this run's rows. Fires once per
     provider per calendar month on the FIRST flip to ``pace == "over"``; stays
     quiet on sustained breach; re-arms (allows a new ping) the moment a row
@@ -644,7 +645,7 @@ def _is_depleting(row: dict) -> bool:
     return dtz is not None and dtz <= BALANCE_ALERT_DAYS
 
 
-def run_balance_depletion_alerts(s3, period: str, rows: list[dict]) -> dict:
+def run_balance_depletion_alerts(s3: Any, period: str, rows: list[dict]) -> dict:  # pyright: ignore[reportExplicitAny, reportMissingTypeArgument, reportUnknownParameterType]  # untyped SDK object; bare dicts pre-date the strict gate
     """Rising-edge alert pass for prepaid accounts approaching zero
     (config-I6613, from the 2026-08-05..08 DeepSeek exhaustion).
 
@@ -719,7 +720,7 @@ def _load_ssm(names: list[str]) -> dict[str, str]:
 # per-`system` daily series matches day for day; the only differences were
 # the export being three hours FRESHER.
 
-def _list_cur_period(s3, period: str) -> list[dict]:
+def _list_cur_period(s3: Any, period: str) -> list[dict]:  # pyright: ignore[reportExplicitAny, reportMissingTypeArgument, reportUnknownParameterType]  # untyped SDK object; bare dicts pre-date the strict gate
     """The parquet objects for one billing period (``YYYY-MM``), sorted."""
     prefix = f"{CUR_DATA_PREFIX}/BILLING_PERIOD={period}/"
     out: list[dict] = []
@@ -735,7 +736,7 @@ def _list_cur_period(s3, period: str) -> list[dict]:
         token = resp["NextContinuationToken"]
 
 
-def read_cur_period(s3, period: str, columns: tuple[str, ...]) -> dict | None:
+def read_cur_period(s3: Any, period: str, columns: tuple[str, ...]) -> dict | None:  # pyright: ignore[reportExplicitAny, reportMissingTypeArgument, reportUnknownParameterType]  # untyped SDK object; bare dicts pre-date the strict gate
     """Every line of one billing period, or None when the export has not
     written that period yet.
 
@@ -825,7 +826,7 @@ def _daily_by_system_window(now: datetime) -> tuple[str, str]:
     return start.isoformat(), today.isoformat()
 
 
-def collect_aws_daily_by_system(s3, now: datetime) -> dict:
+def collect_aws_daily_by_system(s3: Any, now: datetime) -> dict:  # pyright: ignore[reportExplicitAny, reportMissingTypeArgument, reportUnknownParameterType]  # untyped SDK object; bare dicts pre-date the strict gate
     """DAILY unblended cost per ``system`` tag value, from the export's
     ``resource_tags_user_system`` column (alpha-engine-config-I11707's series,
     I12168's source).
@@ -1033,7 +1034,7 @@ def build_cost_allocation(series: dict) -> dict:
     }
 
 
-def _newest_posted_day(s3, now: datetime) -> str | None:
+def _newest_posted_day(s3: Any, now: datetime) -> str | None:  # pyright: ignore[reportExplicitAny]  # untyped SDK object
     """The newest usage day in the open period carrying real usage (line type
     ``Usage``), before today."""
     period = now.strftime("%Y-%m")
@@ -1070,7 +1071,7 @@ def _unblended_by_service(rows: list[dict], start: str, end: str) -> dict[str, f
     return by_service
 
 
-def _attach_daily_by_system(row: dict, s3, now: datetime) -> None:
+def _attach_daily_by_system(row: dict, s3: Any, now: datetime) -> None:  # pyright: ignore[reportExplicitAny, reportMissingTypeArgument, reportUnknownParameterType]  # untyped SDK object; bare dicts pre-date the strict gate
     """Adds ``detail.daily_by_system`` to the AWS row, or
     ``detail.daily_by_system_error`` when the export could not answer.
 
@@ -1095,7 +1096,7 @@ def _attach_daily_by_system(row: dict, s3, now: datetime) -> None:
         row["detail"]["cost_allocation_error"] = f"{type(exc).__name__}: {exc}"[:300]
 
 
-def collect_aws(mw: dict, budgets: dict, s3=None) -> dict:
+def collect_aws(mw: dict, budgets: dict, s3: Any=None) -> dict:  # pyright: ignore[reportExplicitAny, reportMissingTypeArgument, reportUnknownParameterType]  # untyped SDK object; bare dicts pre-date the strict gate
     s3 = boto3.client("s3", region_name=REGION) if s3 is None else s3
     now = _now_utc()
     start = mw["start"].strftime("%Y-%m-%d")
@@ -1182,7 +1183,7 @@ def _bucket_in_month(bucket: dict, month_start: datetime) -> bool:
     return start >= month_start
 
 
-def collect_anthropic(mw: dict, budgets: dict, secrets: dict, s3, *,
+def collect_anthropic(mw: dict, budgets: dict, secrets: dict, s3: Any, *,  # pyright: ignore[reportExplicitAny, reportMissingTypeArgument, reportUnknownParameterType]  # untyped SDK object; bare dicts pre-date the strict gate
                       end: datetime | None = None, last_day: int | None = None) -> dict:
     """``end``/``last_day`` default to the live current-month read (open-ended
     Admin API window; fallback loop runs through "today"). Reconciliation
@@ -1354,6 +1355,16 @@ NEON_TRANSFER_OVERAGE_USD_PER_GB = 0.10
 NEON_COMPUTE_USD_PER_CU_HOUR = 0.106
 NEON_STORAGE_USD_PER_GB_MONTH = 0.35
 NEON_EXTRA_BRANCH_USD_PER_MONTH = 1.50
+# ``extra_branches_month`` is reported in BRANCH-HOURS of ALL child branches,
+# and the plan allowance is subtracted before billing (neon.com/docs/guides/
+# consumption-metrics: "branch-hours | branch-months | All child branches per
+# hour (subtract plan allowance before billing)"). Pricing the raw value as
+# branch-months overstated it ~730x: on 2026-11-07 crucible-state's 44
+# branch-hours (about one child branch for a day and a half) were billed as
+# $66 and paged the budget CRITICAL. Launch includes 10 branches per project;
+# one is the root, so 9 CHILD branches are free.
+NEON_HOURS_PER_MONTH = 730.0
+NEON_INCLUDED_CHILD_BRANCHES = 9
 
 # The consumption-history **v2** endpoints ARE available on Launch (verified
 # live 2026-07-31 against both fleet projects) — only the v1
@@ -1423,7 +1434,8 @@ def neon_consumption_v2(headers: dict, org_id: str, start: datetime,
     return out
 
 
-def price_neon_project(metrics: dict[str, float]) -> dict:
+def price_neon_project(metrics: dict[str, float],
+                       period_hours: float | None = None) -> dict[str, float]:
     """Price ONE project's invoice-aligned metric bundle (pure — unit-tested).
 
     The 500 GB public-egress allowance is per PROJECT (neon.com/pricing):
@@ -1434,7 +1446,13 @@ def price_neon_project(metrics: dict[str, float]) -> dict:
     storage_gb_month = sum(metrics.get(m, 0.0) for m in NEON_STORAGE_METRICS
                            ) / NEON_BYTES_MONTH_PER_GB_MONTH
     transfer_gb = metrics.get(NEON_TRANSFER_METRIC, 0.0) / 1e9
-    extra_branch_months = metrics.get(NEON_BRANCHES_METRIC, 0.0)
+    # Branch-hours less the allowance over the hours measured, as months. With
+    # no period length the allowance is not applied (an overstatement, never
+    # an understatement).
+    branch_hours = metrics.get(NEON_BRANCHES_METRIC, 0.0)
+    allowance_hours = (NEON_INCLUDED_CHILD_BRANCHES * period_hours
+                       if period_hours is not None else 0.0)
+    extra_branch_months = max(0.0, branch_hours - allowance_hours) / NEON_HOURS_PER_MONTH
     compute_usd = compute_cu_hours * NEON_COMPUTE_USD_PER_CU_HOUR
     storage_usd = storage_gb_month * NEON_STORAGE_USD_PER_GB_MONTH
     transfer_usd = (max(0.0, transfer_gb - NEON_TRANSFER_FREE_GB)
@@ -1522,6 +1540,9 @@ def collect_neon(mw: dict, budgets: dict, secrets: dict) -> dict:
             pricing_source = "projects_api_fallback"
             logger.warning("Neon consumption v2 unavailable for org %s: %s", org_id, exc)
 
+    # Hours of the month measured so far, for the per-project branch allowance.
+    measured_hours = (cast(float, mw["elapsed_frac"]) * cast(float, mw["total_seconds"])
+                      / 3600.0)
     per_project = []
     priced_bundles: list[dict[str, float]] = []
     totals = {"compute_cu_hours": 0.0, "compute_cost_usd": 0.0,
@@ -1536,7 +1557,8 @@ def collect_neon(mw: dict, budgets: dict, secrets: dict) -> dict:
         bundle = metrics_by_project.get(
             proj["id"], {} if metrics_by_project
             else {NEON_TRANSFER_METRIC: proj["transfer_bytes"]})
-        priced = price_neon_project(bundle)
+        priced = price_neon_project(
+            bundle, period_hours=measured_hours)
         priced_bundles.append(bundle)
         per_project.append({"project": proj["name"], **priced})
         for k in totals:
@@ -1845,7 +1867,7 @@ def _reconciliation_row(key: str, prior_doc: dict | None, actual_final: float | 
     }
 
 
-def reconcile_aws(prior_mw: dict, budgets: dict, prior_doc: dict | None, s3=None) -> dict:
+def reconcile_aws(prior_mw: dict, budgets: dict, prior_doc: dict | None, s3: Any=None) -> dict:  # pyright: ignore[reportExplicitAny, reportMissingTypeArgument, reportUnknownParameterType]  # untyped SDK object; bare dicts pre-date the strict gate
     """The closed month's FINAL AWS bill: every line of that billing period in
     the export, which AWS rewrites in place until the bill is final."""
     s3 = boto3.client("s3", region_name=REGION) if s3 is None else s3
@@ -1859,7 +1881,7 @@ def reconcile_aws(prior_mw: dict, budgets: dict, prior_doc: dict | None, s3=None
         note=f"billing export, refreshed {got['refreshed_at']:%Y-%m-%d %H:%MZ}")
 
 
-def reconcile_anthropic(prior_mw: dict, budgets: dict, secrets: dict, s3,
+def reconcile_anthropic(prior_mw: dict, budgets: dict, secrets: dict, s3: Any,  # pyright: ignore[reportExplicitAny, reportMissingTypeArgument, reportUnknownParameterType]  # untyped SDK object; bare dicts pre-date the strict gate
                         prior_doc: dict | None) -> dict:
     days = calendar.monthrange(prior_mw["start"].year, prior_mw["start"].month)[1]
     row = collect_anthropic({**prior_mw, "elapsed_frac": 1.0}, budgets, secrets, s3,
@@ -1867,7 +1889,7 @@ def reconcile_anthropic(prior_mw: dict, budgets: dict, secrets: dict, s3,
     return _reconciliation_row("anthropic_api", prior_doc, row.get("mtd_cost_usd"))
 
 
-def reconcile_counter_diff(s3, prior_period: str, current_period: str, key: str,
+def reconcile_counter_diff(s3: Any, prior_period: str, current_period: str, key: str,  # pyright: ignore[reportExplicitAny, reportUnknownParameterType]  # untyped SDK object
                            counter_key: str, prior_doc: dict | None) -> dict:
     """OpenRouter/DeepSeek: zero new HTTP calls. The current month's own
     month-start baseline (``expenses/baselines/{current_period}.json``,
@@ -1946,7 +1968,7 @@ def reconcile_github(prior_mw: dict, budgets: dict, secrets: dict, *, account: s
     return _reconciliation_row(key, prior_doc, row.get("mtd_cost_usd"))
 
 
-def run_reconciliation(s3, now: datetime, budgets: dict, secrets: dict) -> dict:
+def run_reconciliation(s3: Any, now: datetime, budgets: dict, secrets: dict) -> dict:  # pyright: ignore[reportExplicitAny, reportMissingTypeArgument, reportUnknownParameterType]  # untyped SDK object; bare dicts pre-date the strict gate
     """Month-close true-up entry point (``event["mode"] == "reconcile"``).
     Writes ``expenses/reconciliation/{prior-period}.json`` and returns a
     summary. Each provider is independently fenced (mirrors the ``fenced``
@@ -1956,7 +1978,7 @@ def run_reconciliation(s3, now: datetime, budgets: dict, secrets: dict) -> dict:
     prior_doc = _s3_json(s3, f"{MONTHLY_PREFIX}{prior_mw['period']}.json")
     providers: dict[str, dict] = {}
 
-    def fenced(key: str, fn) -> None:
+    def fenced(key: str, fn: Any) -> None:  # pyright: ignore[reportExplicitAny]  # adapter callable, mixed signatures
         try:
             providers[key] = fn()
         except Exception as exc:  # noqa: BLE001 — one provider's re-query outage
@@ -2033,7 +2055,7 @@ def read_counters(secrets: dict) -> tuple[dict, dict[str, str]]:
     return counters, errors
 
 
-def ensure_baseline(s3, period: str, counters: dict) -> dict:
+def ensure_baseline(s3: Any, period: str, counters: dict) -> dict:  # pyright: ignore[reportExplicitAny, reportMissingTypeArgument, reportUnknownParameterType]  # untyped SDK object; bare dicts pre-date the strict gate
     """First-run-of-month counter baseline (first-writer-wins). If the doc
     exists but lacks a counter we can now read (provider key added mid-month),
     it is backfilled in place — the new counter's MTD then accrues from now."""
@@ -2059,7 +2081,7 @@ def ensure_baseline(s3, period: str, counters: dict) -> dict:
     return existing
 
 
-def write_snapshot(s3, counters: dict) -> None:
+def write_snapshot(s3: Any, counters: dict) -> None:  # pyright: ignore[reportExplicitAny, reportMissingTypeArgument, reportUnknownParameterType]  # untyped SDK object; bare dicts pre-date the strict gate
     """First reading of each UTC day, kept for future trend charts. Best-effort:
     losing the first-writer race (412) is the designed outcome."""
     date_str = _now_utc().strftime("%Y-%m-%d")
@@ -2128,7 +2150,7 @@ def _dispatch_spend_monitor() -> dict:
         return {"dispatched": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
-def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
+def handler(event: dict, context: Any) -> dict:  # noqa: ARG001 — Lambda contract  # pyright: ignore[reportExplicitAny, reportMissingTypeArgument, reportUnknownParameterType]  # Lambda context object
     """Dispatches on ``event.get("mode")`` — one Lambda, two EventBridge
     Scheduler rules with different ``Input`` (this codebase's established
     scheduling pattern; see ``deploy.sh``'s ``SCHED_NAMES``/``SCHED_CRONS``/
@@ -2146,7 +2168,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     return _collect(event, context)
 
 
-def _reconcile(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
+def _reconcile(event: dict, context: Any) -> dict:  # noqa: ARG001 — Lambda contract  # pyright: ignore[reportExplicitAny, reportMissingTypeArgument, reportUnknownParameterType]  # Lambda context object
     now = _now_utc()
     s3 = boto3.client("s3", region_name=REGION)
     budgets = _s3_json(s3, BUDGETS_KEY) or {}
@@ -2154,7 +2176,7 @@ def _reconcile(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contrac
     return run_reconciliation(s3, now, budgets, secrets)
 
 
-def _collect(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
+def _collect(event: dict, context: Any) -> dict:  # noqa: ARG001 — Lambda contract  # pyright: ignore[reportExplicitAny, reportMissingTypeArgument, reportUnknownParameterType]  # Lambda context object
     now = _now_utc()
     mw = _month_window(now)
     s3 = boto3.client("s3", region_name=REGION)
@@ -2175,7 +2197,7 @@ def _collect(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
 
     rows: list[dict] = []
 
-    def fenced(key: str, label: str, fn) -> None:
+    def fenced(key: str, label: str, fn: Any) -> None:  # pyright: ignore[reportExplicitAny]  # adapter callable, mixed signatures
         # Adapter fence — one provider outage must not blank the others; the
         # failure's recording surface is this row's error field (+ CW logs).
         try:

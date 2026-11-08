@@ -349,10 +349,25 @@ class TestNeonPricing:
             {"public_network_transfer_bytes": 600_000_000_000})
         assert over["data_transfer_cost_usd"] == pytest.approx(10.0)
 
-    def test_extra_branches_priced(self):
-        priced = index.price_neon_project({"extra_branches_month": 2.0})
+    def test_extra_branches_are_branch_hours_not_months(self):
+        """730 branch-hours is one branch-month: $1.50 with no allowance."""
+        priced = index.price_neon_project({"extra_branches_month": 730.0})
+        assert priced["extra_branch_months"] == pytest.approx(1.0)
+        assert priced["extra_branches_cost_usd"] == pytest.approx(1.5)
+        assert priced["total_cost_usd"] == pytest.approx(1.5)
+
+    def test_november_crucible_state_is_inside_the_allowance(self):
+        """2026-11-07: 44 branch-hours over ~180 h was billed as $66."""
+        priced = index.price_neon_project({"extra_branches_month": 44.0},
+                                          period_hours=180.0)
+        assert priced["extra_branches_cost_usd"] == 0.0
+
+    def test_branches_above_the_allowance_are_billed(self):
+        """11 child branches all month: 2 over the 9 free, $3.00."""
+        priced = index.price_neon_project({"extra_branches_month": 11 * 730.0},
+                                          period_hours=730.0)
+        assert priced["extra_branch_months"] == pytest.approx(2.0)
         assert priced["extra_branches_cost_usd"] == pytest.approx(3.0)
-        assert priced["total_cost_usd"] == pytest.approx(3.0)
 
 
 class TestNeonPeriodPacing:
