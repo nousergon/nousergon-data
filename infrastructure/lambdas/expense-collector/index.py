@@ -104,6 +104,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
+from typing import cast
 
 import boto3
 
@@ -1434,7 +1435,7 @@ def neon_consumption_v2(headers: dict, org_id: str, start: datetime,
 
 
 def price_neon_project(metrics: dict[str, float],
-                       period_hours: float | None = None) -> dict:
+                       period_hours: float | None = None) -> dict[str, float]:
     """Price ONE project's invoice-aligned metric bundle (pure — unit-tested).
 
     The 500 GB public-egress allowance is per PROJECT (neon.com/pricing):
@@ -1539,6 +1540,9 @@ def collect_neon(mw: dict, budgets: dict, secrets: dict) -> dict:
             pricing_source = "projects_api_fallback"
             logger.warning("Neon consumption v2 unavailable for org %s: %s", org_id, exc)
 
+    # Hours of the month measured so far, for the per-project branch allowance.
+    measured_hours = (cast(float, mw["elapsed_frac"]) * cast(float, mw["total_seconds"])
+                      / 3600.0)
     per_project = []
     priced_bundles: list[dict[str, float]] = []
     totals = {"compute_cu_hours": 0.0, "compute_cost_usd": 0.0,
@@ -1554,7 +1558,7 @@ def collect_neon(mw: dict, budgets: dict, secrets: dict) -> dict:
             proj["id"], {} if metrics_by_project
             else {NEON_TRANSFER_METRIC: proj["transfer_bytes"]})
         priced = price_neon_project(
-            bundle, period_hours=mw["elapsed_frac"] * mw["total_seconds"] / 3600.0)
+            bundle, period_hours=measured_hours)
         priced_bundles.append(bundle)
         per_project.append({"project": proj["name"], **priced})
         for k in totals:
