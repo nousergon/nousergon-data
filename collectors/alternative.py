@@ -61,6 +61,7 @@ from typing import Optional
 
 import boto3
 
+from collectors.yahoo_session import YahooAuthError
 from dates import FutureBarError, assert_no_bar_after, clip_to_trading_day, history_window
 from nousergon_lib.secrets import get_secret
 import requests
@@ -639,6 +640,8 @@ def _process_one_ticker(
         # same fault. Propagate rather than recording one more per-ticker
         # "error" among ~900.
         raise
+    except YahooAuthError:
+        raise  # the session is gone for every ticker (alpha-engine-config-I13240)
     except Exception as e:
         scrubbed = _scrub_url_creds(e)
         logger.warning("Alternative data failed for %s: %s", ticker, scrubbed)
@@ -1686,8 +1689,8 @@ def _fetch_days_since_earnings(ticker: str, run_date: str) -> Optional[int]:
     Source: yfinance ``get_earnings_dates`` (report dates, not the fiscal
     period ends Finnhub ``/stock/earnings`` returns). Point-in-time: only a
     date on or before ``run_date`` with a reported EPS counts. ``None`` when
-    there is none or yfinance fails (WARN, never raises, like the other
-    per-ticker sub-collectors).
+    there is none or yfinance has a symbol-level failure (WARN). Persistent
+    Yahoo session failures propagate so the run fails loudly.
     """
     try:
         import pandas as pd
@@ -1717,6 +1720,8 @@ def _fetch_days_since_earnings(ticker: str, run_date: str) -> Optional[int]:
         if not dates:
             return None
         return (anchor - max(dates)).days
+    except YahooAuthError:
+        raise  # the session is gone for every ticker (alpha-engine-config-I13240)
     except Exception as e:  # noqa: BLE001 — yfinance raises opaque types
         logger.warning("yfinance earnings dates failed for %s: %s", ticker, e)
         return None
