@@ -1089,7 +1089,7 @@
           "action": "predict"
         }
       },
-      "TimeoutSeconds": 900,
+      "TimeoutSeconds": 420,
       "Retry": [
         {
           "ErrorEquals": [
@@ -1187,7 +1187,7 @@
           "tickers.$": "$.coverage_result.Payload.missing_tickers"
         }
       },
-      "TimeoutSeconds": 900,
+      "TimeoutSeconds": 420,
       "Retry": [
         {
           "ErrorEquals": [
