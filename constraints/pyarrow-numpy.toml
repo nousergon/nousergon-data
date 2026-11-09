@@ -71,7 +71,7 @@ pyarrow_needs_numpy2_from = "26"
 # ---------------------------------------------------------------------------
 [venvs.data]
 about = "Every venv built from nousergon-data requirements.txt: the data spot boxes, the v1 weekly DataPhase2 venv, metron-intraday, and the canary replay's data venv."
-pyarrow = ">=26"
+pyarrow = ">=26.0.1"
 numpy_below_2 = false
 
 [[venvs.data.surfaces]]
@@ -128,7 +128,7 @@ kind = "bootstrap"
 # ---------------------------------------------------------------------------
 [venvs.daily-news]
 about = "The standalone daily-news collector venv on the dashboard box."
-pyarrow = ">=25.0.1"
+pyarrow = ">=26.0.1"
 numpy_below_2 = false
 
 [[venvs.daily-news.surfaces]]
