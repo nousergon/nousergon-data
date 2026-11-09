@@ -109,7 +109,30 @@ _FUNCTION_TIMEOUTS_SEC = CODIFIED_FUNCTION_TIMEOUTS_SEC
 # after the 11-06 close; 11-08 is the Sunday of that window. If the two v1
 # definitions still exist on Mon 11-09, this fails again and the budgets are
 # chosen then. All nine remaining entries are v1 states; none was removed here.
-_KNOWN_UNBOUND_EXPIRY = "2026-11-08"
+#
+# Deadline moved 2026-11-08 -> 2026-11-22 (alpha-engine-config-I6897, red main
+# on Mon 2026-11-09, nousergon-data run 42569332635). The v1 definitions still
+# exist (both listed by `aws stepfunctions list-state-machines` 2026-11-09;
+# alpha-engine-config-I10655, the deletion, is still open), so the note above
+# fired as written and the budgets were looked at. Measured 2026-11-09:
+#   * SEVEN entries are weekly states on ne-weekly-freshness-pipeline
+#     (step_function.json): SignalsEnvelope, ChallengerShadow,
+#     EvalJudgeSubmitFirstSaturday, EvalJudgeSubmitWeekly, RationaleClustering,
+#     Counterfactual, DispatchWeeklyFreshnessSpot. Its only trigger,
+#     EventBridge rule alpha-engine-saturday, is State DISABLED (Brian's ruling
+#     2026-10-28, set live 15:08Z) and ZERO executions have started since: the
+#     newest is 2026-10-24 09:00Z (list-executions, 20 newest, all earlier).
+#     A machine nothing starts has no runtime to measure, and a budget chosen
+#     for it would be invented, so these are kept, not fixed.
+#   * TWO entries, PredictorInference and ReinvokePredictor, are on the daily
+#     machine ne-preopen-trading-pipeline, whose schedule alpha-engine-weekday
+#     is ENABLED, so they were FIXED rather than re-dated: see the note where
+#     they used to sit in the set below.
+# Near date, not a month: only the seven dead-trigger weekly states remain, and
+# they leave when I10655 deletes the weekly machine. If it still exists on Mon
+# 11-23 the weekly trigger is still off, and the answer is the deletion, not
+# another date.
+_KNOWN_UNBOUND_EXPIRY = "2026-11-22"
 
 _KNOWN_UNBOUND: frozenset[tuple[str, str]] = frozenset(
     {
@@ -124,8 +147,23 @@ _KNOWN_UNBOUND: frozenset[tuple[str, str]] = frozenset(
         ("step_function.json", "RationaleClustering"),
         ("step_function.json", "Counterfactual"),
         ("step_function.json", "DispatchWeeklyFreshnessSpot"),
-        ("step_function_daily.json", "PredictorInference"),
-        ("step_function_daily.json", "ReinvokePredictor"),
+        # PredictorInference and ReinvokePredictor LEFT this set on 2026-11-09
+        # (alpha-engine-config-I6897). Both invoke alpha-engine-predictor-
+        # inference (function Timeout 900) and tied it at 900 -- the RACE
+        # branch. Their state budget is now 420, below the function, so
+        # States.Timeout names the state. Measured (daily machine
+        # ne-preopen-trading-pipeline, whose alpha-engine-weekday schedule is
+        # ENABLED): 20 PredictorInference transits 2026-10-05..11-02, state
+        # duration p95 275s, max 277s, min 83s (the 11-02 83s run failed later,
+        # at CheckPredictorCoverage, not on a timeout); no States.Timeout. Lambda
+        # Duration metric for the function, daily max over 30 days: 276.9s.
+        # p95 x 1.5 is about 412s; 420 is that rounded up. ReinvokePredictor
+        # never ran in that window (same function, same `predict` action, but
+        # for the missing tickers only, so bounded above by the full run) and
+        # takes the same figure, as HealReProbe did. Since 2026-11-03 the
+        # schedule's input carries skip_predictor_inference=true, so the daily
+        # machine routes past both; the budget binds on a rerun without that
+        # flag. A timeout on either state is caught by States.ALL -> HandleFailure.
         # ProbeEODReconcilePrecondition and HealReProbe LEFT this set on
         # 2026-10-03 (alpha-engine-config-I6897). Both invoke
         # alpha-engine-eod-precondition-probe (function Timeout 30) and tied
