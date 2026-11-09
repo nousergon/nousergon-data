@@ -1504,3 +1504,74 @@ def test_a_stale_dedicated_box_acknowledgement_fails_the_run(tmp_path):
     assert stale, report.coverage_findings
     assert stale[0]["blocking"] is True
     assert report.outcome == ps.OUTCOME_FAILED
+
+
+# ── A retired stage is not run, and is never silent (alpha-engine-config-I13374) ─
+
+
+def _retired_result(report, stage="Backtester"):
+    return next(r for r in report.results if r["stage"] == stage)
+
+
+def test_a_retired_stage_is_not_run_and_is_reported_as_retired(tmp_path):
+    root = _fake_checkout(tmp_path)
+    scripts: list[str] = []
+
+    def runner(argv, **_kwargs):
+        scripts.append(argv[-1])
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
+
+    report = ps.sweep(SF_PATH, MANIFEST_PATH, str(root), "t", runner=runner)
+    row = _retired_result(report)
+    assert row["verdict"] == ps.RETIRED_VERDICT
+    assert "alpha-engine-config-I13374" in row["reason"]
+    assert row["acknowledged_reason"]
+    assert report.stages_retired == 1
+    assert scripts, "the other stages must still be swept"
+    assert not [x for x in scripts if "spot_backtester.sh" in x], (
+        "the retired stage's launcher must never be handed to the runner"
+    )
+
+
+def test_a_retired_stage_that_would_fail_does_not_fail_the_run(tmp_path):
+    """The point of the arc: the retired stage's failure no longer alerts. The
+    runner fails EVERY launcher it is handed; the retired stage is never handed
+    one, so it contributes no failure."""
+    root = _fake_checkout(tmp_path)
+    seen: list[str] = []
+
+    def runner(argv, **_kwargs):
+        seen.append(argv[-1])
+        return subprocess.CompletedProcess(args=argv, returncode=1, stdout="", stderr="boom")
+
+    report = ps.sweep(SF_PATH, MANIFEST_PATH, str(root), "t", runner=runner)
+    failed = {r["stage"] for r in report.results if r["verdict"] == ps.FAILED}
+    assert "Backtester" not in failed
+    assert _retired_result(report)["verdict"] == ps.RETIRED_VERDICT
+    assert len(report.results) == report.stages_declared
+
+
+def test_the_retirement_is_named_on_every_surface(tmp_path):
+    root = _fake_checkout(tmp_path)
+    report = ps.sweep(SF_PATH, MANIFEST_PATH, str(root), "t", runner=_completed(0))
+    findings = [f for f in report.coverage_findings if f.get("kind") == ps.FINDING_RETIRED]
+    assert [f["stage"] for f in findings] == ["Backtester"]
+    assert findings[0]["blocking"] is False
+    assert next(d for d in report.declared_stages if d["stage"] == "Backtester")["retired"]
+    subject, body = ps.render_notification(report)
+    assert "retired 1" in body and "RETIRED" in body and "Backtester" in body
+    assert "alpha-engine-config-I13374" in body
+
+
+def test_a_retired_entry_past_its_re_exam_date_fails_the_run(tmp_path):
+    root = _fake_checkout(tmp_path)
+    manifest = json.loads(MANIFEST_PATH.read_text())
+    manifest["retired_stages"]["Backtester"]["re_exam"] = "2026-11-08"
+    stale = tmp_path / "manifest_stale.json"
+    stale.write_text(json.dumps(manifest))
+    report = ps.sweep(SF_PATH, stale, str(root), "t", runner=_completed(0))
+    blocking = [f for f in report.coverage_findings
+                if f.get("kind") == ps.FINDING_MANIFEST_DISAGREEMENT
+                and "passed its re_exam" in f["finding"]]
+    assert blocking and blocking[0]["blocking"] is True
+    assert report.outcome == ps.OUTCOME_FAILED

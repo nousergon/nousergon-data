@@ -50,6 +50,11 @@ as a pass:
 * ``no_dry_path`` — the stage threads no ``$.preflight_args`` and is never
                     exercised at all. A verdict ROW, not just a counter: a count
                     published without its members is unactionable.
+* ``retired``     — a stage the pipeline still declares but a ruling retired,
+                    declared in ``retired_stages`` with ruling / since / tracker /
+                    re_exam. Never run, never silent: a verdict row, a counter
+                    and a non-blocking coverage finding on every run, and a
+                    BLOCKING finding once its re_exam date passes.
 * ``not_attempted`` — the run produced no verdict for a declared stage. The
                     invariant ``len(results) == stages_declared`` holds on every
                     report, and a stage that would have broken it is filled in
@@ -75,9 +80,10 @@ import re
 import subprocess
 import sys
 import traceback
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -92,6 +98,8 @@ from infrastructure.preflight_sweep_stages import (  # noqa: E402
     derive_stages,
     load_manifest,
     manifest_disagreement,
+    retired_stages,
+    retirement_conflicts,
     map_binding_disagreement,
     upstream_dependencies,
     upstream_dependency_disagreement,
@@ -103,6 +111,10 @@ from infrastructure.preflight_sweep_console import (  # noqa: E402
     load_cadence,
 )
 
+# Injected seams: the subprocess runner and the S3 prefix lister.
+Runner = Callable[..., subprocess.CompletedProcess[str]]
+Lister = Callable[[str], list[dict[str, Any]]]  # pyright: ignore[reportExplicitAny]
+
 # ── Verdict vocabulary (closed; mirrors validators/stage_output_sweep.py) ────
 PASSED = "passed"
 FAILED = "failed"
@@ -110,6 +122,13 @@ UNMEASURED = "unmeasured"
 UNSWEEPABLE_VERDICT = "unsweepable"
 NO_DRY_PATH_VERDICT = "no_dry_path"
 NOT_ATTEMPTED = "not_attempted"
+# A stage the pipeline still declares but a ruling has RETIRED: declared in the
+# manifest's `retired_stages` with its ruling, start date, tracker and a re-exam
+# date, never run by the sweep, and NAMED on every surface (verdict row,
+# non-blocking coverage finding, counter). Graded by manifest_disagreement, so an
+# entry for a vanished stage or past its re_exam date is a blocking finding.
+# alpha-engine-config-I13374.
+RETIRED_VERDICT = "retired"
 
 # ── Why a stage is unsweepable (closed; add by PR) ───────────────────────────
 # The distinction is load-bearing, not cosmetic. One of these is a defect in
@@ -139,6 +158,7 @@ FINDING_MAP_BINDING_DISAGREEMENT = "map_binding_disagreement"
 FINDING_UPSTREAM_DECLARATION = "upstream_declaration"
 FINDING_NO_DRY_PATH = "no_dry_path"
 FINDING_DEDICATED_BOX = "dedicated_box"
+FINDING_RETIRED = "retired"
 FINDING_MISSING_VERDICT = "missing_verdict"
 
 STREAK_STATE_KEY_SUFFIX = "unsweepable_streaks.json"
@@ -234,6 +254,8 @@ class SweepReport:
     # cannot grow without the declaration growing with it.
     stages_unsweepable_dedicated_box: int = 0
     stages_no_dry_path: int = 0
+    # Declared-retired stages (manifest `retired_stages`): not run, named.
+    stages_retired: int = 0
     # The subset of `stages_no_dry_path` with NO written acknowledgement in
     # preflight_sweep_manifest.json. The distinction decides whether the run
     # can ever be clean: a RATIFIED no-dry-path stage is a reviewed, permanent
@@ -269,14 +291,14 @@ class AwsSurface:
     """Every outward effect the sweep has. Injected so the driver can be
     tested without touching S3, CloudWatch or SNS."""
 
-    def __init__(self, region: str = DEFAULT_REGION, bucket: str = DEFAULT_BUCKET):
+    def __init__(self, region: str = DEFAULT_REGION, bucket: str = DEFAULT_BUCKET) -> None:
         self.region = region
         self.bucket = bucket
         self._s3 = None
         self._cw = None
         self._sns = None
 
-    def _client(self, name):
+    def _client(self, name: str) -> Any:  # pyright: ignore[reportExplicitAny]
         import boto3
 
         return boto3.client(name, region_name=self.region)
@@ -404,7 +426,7 @@ def run_stage(
     stage: Stage,
     checkout_root: str,
     timeout: int,
-    runner=subprocess.run,
+    runner: Runner = subprocess.run,
 ) -> StageResult:
     """Execute one stage's dry command. Never raises: a stage that could not be
     run is reported ``unmeasured``, which is neither a pass nor a defect."""
@@ -569,7 +591,7 @@ def _probe_bindings(bindings: dict[str, Any], mode: str) -> dict[str, Any]:
 
 
 def upstream_content(
-    prefix: str, ignore_subprefixes: list[str], lister
+    prefix: str, ignore_subprefixes: list[str], lister: Lister
 ) -> tuple[bool, dict[str, Any]]:
     """Is the declared upstream prefix populated with real content?
 
@@ -603,7 +625,7 @@ def upstream_content(
 
 
 def classify_upstream(
-    result: StageResult, declaration: dict[str, Any], bindings: dict[str, Any], lister
+    result: StageResult, declaration: dict[str, Any], bindings: dict[str, Any], lister: Lister | None
 ) -> StageResult:
     """Reclassify a FAILED stage whose declared same-day upstream is absent.
 
@@ -709,7 +731,7 @@ def find_recent_populated_upstream(
     template: str,
     base_bindings: dict[str, Any],
     ignore_subprefixes: list[str],
-    lister,
+    lister: Lister,
     max_age_days: int,
 ) -> tuple[str, dict] | None:
     """Walk backward from ``base_bindings['run_date']``, one day at a time, up
@@ -759,13 +781,13 @@ def remeasure_upstream_pending(
     result: StageResult,
     declaration: dict[str, Any],
     bindings: dict[str, Any],
-    lister,
+    lister: Lister | None,
     *,
     definition: dict,
     context: dict[str, Any],
     checkout_root: str,
     stage_timeout: int,
-    runner,
+    runner: Runner,
 ) -> StageResult:
     """``classify_upstream``, then — if that downgraded the stage to
     ``upstream_pending`` because TODAY's date is empty — actually MEASURE it
@@ -929,6 +951,7 @@ def render_notification(report: SweepReport) -> tuple[str, str]:
         report.stages_unsweepable
         + report.stages_unmeasured
         + report.stages_no_dry_path
+        + report.stages_retired
         + report.stages_not_attempted
     )
     if not report.measured:
@@ -947,6 +970,7 @@ def render_notification(report: SweepReport) -> tuple[str, str]:
             f"stages not covered ({report.stages_unsweepable_upstream_pending} awaiting "
             f"upstream / {report.stages_unsweepable_dedicated_box} dedicated box / "
             f"{report.stages_no_dry_path} no dry path / "
+            f"{report.stages_retired} retired / "
             f"{report.stages_unmeasured} unmeasured) — {report.run_id}"
         )
     else:
@@ -976,6 +1000,7 @@ def render_notification(report: SweepReport) -> tuple[str, str]:
         f"awaiting-upstream {report.stages_unsweepable_upstream_pending}, "
         f"dedicated-box {report.stages_unsweepable_dedicated_box}) | "
         f"no-dry-path {report.stages_no_dry_path} | "
+        f"retired {report.stages_retired} | "
         f"not-attempted {report.stages_not_attempted}",
         "",
     ]
@@ -1015,6 +1040,7 @@ def render_notification(report: SweepReport) -> tuple[str, str]:
         (UNSWEEPABLE_VERDICT, "UNSWEEPABLE"),
         (UNMEASURED, "UNMEASURED (not a pass, not a defect)"),
         (NO_DRY_PATH_VERDICT, "NO DRY PATH (declared, never exercised by the sweep)"),
+        (RETIRED_VERDICT, "RETIRED (declared, not run by the sweep)"),
         (NOT_ATTEMPTED, "NOT ATTEMPTED"),
     ):
         members = [r for r in report.results if r["verdict"] == verdict]
@@ -1071,7 +1097,7 @@ def sweep(
     concurrency: int = DEFAULT_CONCURRENCY,
     stage_timeout: int = DEFAULT_STAGE_TIMEOUT,
     aws: AwsSurface | None = None,
-    runner=subprocess.run,
+    runner: Runner = subprocess.run,
 ) -> SweepReport:
     started = dt.datetime.now(dt.timezone.utc)
     report = SweepReport(
@@ -1124,11 +1150,13 @@ def sweep(
         return report
 
     report.stages_declared = len(stages)
+    typed_manifest = cast("dict[str, object]", manifest)
     dedicated_box = {
         entry["stage"]: entry
         for entry in (manifest.get("dedicated_box_stages") or [])
         if isinstance(entry, dict) and entry.get("stage")
     }
+    retired = retired_stages(typed_manifest)
     report.stages_no_dry_path = sum(1 for s in stages if s.classification == NO_DRY_PATH)
     # The declared stage list, serialised — so `declared - swept` is auditable
     # from the report alone. A scalar nobody can expand is a count published
@@ -1143,6 +1171,7 @@ def sweep(
             # Carried on the declared row too, so `declared - swept` can be
             # reconciled from the report alone without opening the manifest.
             "dedicated_box_acknowledged": s.name in dedicated_box,
+            "retired": s.name in retired,
         }
         for s in stages
     ]
@@ -1160,7 +1189,40 @@ def sweep(
 
     results: list[StageResult] = []
     for stage in stages:
-        if stage.classification == UNSWEEPABLE:
+        if stage.name in retired and not retirement_conflicts(stage, typed_manifest):
+            # A DECLARED retirement: the stage is not run, and it is reported
+            # as retired -- a verdict row with the ruling, never an absence.
+            # (A retired entry on a no-dry-path or dedicated-box stage is a blocking
+            # manifest_disagreement finding and falls through to its own
+            # classification below, so a bad declaration hides nothing.)
+            decl = retired[stage.name]
+            text = (
+                f"RETIRED, not run: {decl['ruling']} (since {decl['since']}; tracker "
+                f"{decl['tracker']}; re-exam {decl['re_exam']})"
+            )
+            results.append(
+                StageResult(
+                    stage=stage.name,
+                    verdict=RETIRED_VERDICT,
+                    repo=stage.repo,
+                    launcher=stage.launcher,
+                    reason=text,
+                    acknowledged_reason=decl["ruling"],
+                )
+            )
+            report.coverage_findings.append(
+                cast(
+                    "dict[str, object]",
+                    _finding(
+                        FINDING_RETIRED,
+                        f"{stage.name} is {text}. The sweep does not exercise it, which "
+                        "is not the same as its being healthy.",
+                        blocking=False,
+                        stage=stage.name,
+                    ),
+                )
+            )
+        elif stage.classification == UNSWEEPABLE:
             # A DECLARED dedicated-box stage is unreachable from this box by
             # construction, not by defect. It gets its own kind, stays out of
             # the coverage-defect count and out of the streak, and is NAMED
@@ -1236,7 +1298,12 @@ def sweep(
                 )
             )
 
-    sweepable = [s for s in stages if s.classification == SWEEPABLE]
+    sweepable = [
+        s
+        for s in stages
+        if s.classification == SWEEPABLE
+        and not (s.name in retired and not retirement_conflicts(s, typed_manifest))
+    ]
     report.measured = True
 
     if sweepable:
@@ -1284,7 +1351,15 @@ def sweep(
     # defect. The stages this may apply to are DECLARED in the manifest, so a
     # reworded launcher error can never reclassify a real failure; the prefix
     # is still probed on the day, so the declaration alone can never hide one.
-    lister = (lambda prefix: aws.list_objects(prefix)) if aws is not None else None
+    lister: Lister | None = None
+    if aws is not None:
+        surface = aws
+
+        def _list_prefix(prefix: str) -> list[dict[str, Any]]:  # pyright: ignore[reportExplicitAny]
+            return surface.list_objects(prefix)
+
+        lister = _list_prefix
+
     for i, result in enumerate(results):
         if result.verdict != FAILED:
             continue
@@ -1374,6 +1449,7 @@ def sweep(
         and r.unsweepable_kind == UNSWEEPABLE_UPSTREAM_PENDING
     )
     report.stages_not_attempted = sum(1 for r in results if r.verdict == NOT_ATTEMPTED)
+    report.stages_retired = sum(1 for r in results if r.verdict == RETIRED_VERDICT)
 
     # ── Persistent-unsweepable streaks ───────────────────────────────────────
     report.unsweepable_streak_threshold_runs = streak_threshold_runs(manifest, cadence)
