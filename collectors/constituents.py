@@ -72,7 +72,7 @@ from pathlib import Path
 import boto3
 import pandas as pd
 import requests
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError  # pyright: ignore[reportMissingTypeStubs]  # botocore ships no stubs; matches daily_closes_fred_repair.py
 
 from validators import expectations
 

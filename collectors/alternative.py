@@ -53,11 +53,12 @@ import re
 import signal
 import time
 import threading
+from collections.abc import Generator
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import boto3
 
@@ -486,14 +487,14 @@ class _TickerHardTimeout(Exception):
 
 
 @contextmanager
-def _ticker_hard_timeout(seconds: int, ticker: str):
+def _ticker_hard_timeout(seconds: int, ticker: str) -> Generator[None]:
     """SIGALRM-based per-ticker hard wall-clock timeout.
 
     Raises ``_TickerHardTimeout`` on expiry. No-op (yields without arming)
     if SIGALRM is unavailable — not the main thread, or a non-POSIX platform.
     Matches the established pattern in weekly_collector._hard_timeout.
     """
-    def _handler(signum, frame):
+    def _handler(signum: int, frame: Any) -> None:  # pyright: ignore[reportExplicitAny]  # signal frame object
         raise _TickerHardTimeout(
             f"ticker {ticker} exceeded {seconds}s hard timeout"
         )
@@ -547,7 +548,7 @@ def _process_one_ticker(
     run_date: str,
     bucket: str,
     block_anomaly_types: list[dict],
-    s3,
+    s3: Any,  # pyright: ignore[reportExplicitAny]  # untyped SDK object
     s3_prefix: str,
 ) -> dict:
     """Fetch, validate, and write alternative data for a single ticker.
@@ -1072,7 +1073,7 @@ def _read_approved_scope() -> dict | None:
 
 
 def _assert_scope_stable(
-    s3, bucket: str, s3_prefix: str, run_date: str, n_tickers: int
+    s3: Any, bucket: str, s3_prefix: str, run_date: str, n_tickers: int  # pyright: ignore[reportExplicitAny]  # untyped SDK object
 ) -> None:
     """Compare this run's ticker count against a declared baseline.
 
@@ -1172,7 +1173,7 @@ def _assert_scope_stable(
 
 
 def _load_promoted_tickers(
-    s3, bucket: str, signals_key: str | None, run_date: str
+    s3: Any, bucket: str, signals_key: str | None, run_date: str  # pyright: ignore[reportExplicitAny]  # untyped SDK object
 ) -> list[str]:
     """Extract promoted tickers from the latest signals.json.
 
@@ -1246,7 +1247,7 @@ def _load_promoted_tickers(
     return sorted(tickers)
 
 
-def _get_latest_date(s3, bucket: str, s3_prefix: str) -> str | None:
+def _get_latest_date(s3: Any, bucket: str, s3_prefix: str) -> str | None:  # pyright: ignore[reportExplicitAny]  # untyped SDK object
     """Get the most recent weekly date from latest_weekly.json."""
     try:
         obj = s3.get_object(Bucket=bucket, Key=f"{s3_prefix}latest_weekly.json")
@@ -1575,7 +1576,7 @@ def _fetch_revisions(ticker: str, bucket: str, run_date: str) -> dict:
         if et is not None and not et.empty and "0y" in et.index:
             row = et.loc["0y"]
 
-            def _f(v):
+            def _f(v: Any) -> Optional[float]:  # pyright: ignore[reportExplicitAny]  # arbitrary yfinance cell
                 try:
                     if v is None:
                         return None

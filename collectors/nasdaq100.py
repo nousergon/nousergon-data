@@ -72,7 +72,7 @@ from typing import Any
 
 import boto3
 import requests
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError  # pyright: ignore[reportMissingTypeStubs]  # botocore ships no stubs; matches daily_closes_fred_repair.py
 
 logger = logging.getLogger(__name__)
 
