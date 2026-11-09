@@ -72,6 +72,7 @@ from typing import Any
 
 import boto3
 import requests
+from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
 
@@ -437,10 +438,12 @@ def collect(
 
 
 def load_from_s3(bucket: str, s3_prefix: str = "market_data/") -> dict | None:
-    """Load the latest NDX.json from S3. Returns None if not found."""
+    """Load the latest NDX.json from S3. Returns None if not found; other failures raise."""
     s3 = boto3.client("s3")
     try:
         resp = s3.get_object(Bucket=bucket, Key=f"{s3_prefix}index_constituents/NDX.json")
         return json.loads(resp["Body"].read())
-    except Exception:
-        return None
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] in {"NoSuchKey", "404", "NotFound"}:
+            return None
+        raise

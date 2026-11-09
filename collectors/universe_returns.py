@@ -61,6 +61,7 @@ from zoneinfo import ZoneInfo
 
 import boto3
 import pandas as pd
+from botocore.exceptions import ClientError
 from nousergon_lib.trading_calendar import add_trading_days as _add_trading_days
 from polygon_client import PolygonForbiddenError
 
@@ -435,13 +436,17 @@ def _trading_days_to_process(
 # -- Sector map loading ------------------------------------------------------
 
 def _load_sector_map(s3, bucket: str, key: str) -> dict[str, str] | None:
-    """Load ticker -> sector ETF mapping from S3."""
+    """Load ticker -> sector ETF mapping; None if not found, other failures raise."""
     try:
         obj = s3.get_object(Bucket=bucket, Key=key)
         return json.loads(obj["Body"].read())
     except Exception as e:
         logger.warning("Could not load sector_map from s3://%s/%s: %s", bucket, key, e)
-        return None
+        if isinstance(e, ClientError) and e.response["Error"]["Code"] in {
+            "NoSuchKey", "404", "NotFound",
+        }:
+            return None
+        raise
 
 
 # -- DB helpers ---------------------------------------------------------------
