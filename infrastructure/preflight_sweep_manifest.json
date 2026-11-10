@@ -57,6 +57,54 @@
       "since": "2026-11-07",
       "tracker": "alpha-engine-config-I13374",
       "re_exam": "2026-12-07"
+    },
+    "ParityParallel.PitParityLookahead": {
+      "ruling": "Brian 2026-11-10 (Director card 'Retire all 8'): the six v1 parity/evaluator preflight stages plus PredictorBacktest and PortfolioOptimizerBacktest retire with the v1 Backtester; the Crucible v2 weekly run replaced them",
+      "since": "2026-11-10",
+      "tracker": "alpha-engine-config-I13374",
+      "re_exam": "2026-12-07"
+    },
+    "ParityParallel.PitParityWalkforward": {
+      "ruling": "Brian 2026-11-10 (Director card 'Retire all 8'): the six v1 parity/evaluator preflight stages plus PredictorBacktest and PortfolioOptimizerBacktest retire with the v1 Backtester; the Crucible v2 weekly run replaced them",
+      "since": "2026-11-10",
+      "tracker": "alpha-engine-config-I13374",
+      "re_exam": "2026-12-07"
+    },
+    "PitParityCompare": {
+      "ruling": "Brian 2026-11-10 (Director card 'Retire all 8'): the six v1 parity/evaluator preflight stages plus PredictorBacktest and PortfolioOptimizerBacktest retire with the v1 Backtester; the Crucible v2 weekly run replaced them",
+      "since": "2026-11-10",
+      "tracker": "alpha-engine-config-I13374",
+      "re_exam": "2026-12-07"
+    },
+    "ParityParallel.ParityReplay": {
+      "ruling": "Brian 2026-11-10 (Director card 'Retire all 8'): the six v1 parity/evaluator preflight stages plus PredictorBacktest and PortfolioOptimizerBacktest retire with the v1 Backtester; the Crucible v2 weekly run replaced them",
+      "since": "2026-11-10",
+      "tracker": "alpha-engine-config-I13374",
+      "re_exam": "2026-12-07"
+    },
+    "EvaluatorDiagnostics": {
+      "ruling": "Brian 2026-11-10 (Director card 'Retire all 8'): the six v1 parity/evaluator preflight stages plus PredictorBacktest and PortfolioOptimizerBacktest retire with the v1 Backtester; the Crucible v2 weekly run replaced them",
+      "since": "2026-11-10",
+      "tracker": "alpha-engine-config-I13374",
+      "re_exam": "2026-12-07"
+    },
+    "EvaluatorOptimize": {
+      "ruling": "Brian 2026-11-10 (Director card 'Retire all 8'): the six v1 parity/evaluator preflight stages plus PredictorBacktest and PortfolioOptimizerBacktest retire with the v1 Backtester; the Crucible v2 weekly run replaced them",
+      "since": "2026-11-10",
+      "tracker": "alpha-engine-config-I13374",
+      "re_exam": "2026-12-07"
+    },
+    "PredictorBacktest": {
+      "ruling": "Brian 2026-11-10 (Director card 'Retire all 8'): the six v1 parity/evaluator preflight stages plus PredictorBacktest and PortfolioOptimizerBacktest retire with the v1 Backtester; the Crucible v2 weekly run replaced them",
+      "since": "2026-11-10",
+      "tracker": "alpha-engine-config-I13374",
+      "re_exam": "2026-12-07"
+    },
+    "PortfolioOptimizerBacktest": {
+      "ruling": "Brian 2026-11-10 (Director card 'Retire all 8'): the six v1 parity/evaluator preflight stages plus PredictorBacktest and PortfolioOptimizerBacktest retire with the v1 Backtester; the Crucible v2 weekly run replaced them",
+      "since": "2026-11-10",
+      "tracker": "alpha-engine-config-I13374",
+      "re_exam": "2026-12-07"
     }
   },
 

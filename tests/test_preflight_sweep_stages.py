@@ -540,14 +540,27 @@ def _retired(stage: str, **overrides) -> dict:
 def test_the_live_manifest_retires_the_v1_backtester_with_every_field(stages, manifest):
     """The exclusion lives in the manifest, with all four fields, and the
     definition still carries the stage -- it is retired, not removed."""
+    expected = {
+        "Backtester",
+        # Brian 2026-11-10, Director card "Retire all 8".
+        "ParityParallel.PitParityLookahead",
+        "ParityParallel.PitParityWalkforward",
+        "PitParityCompare",
+        "ParityParallel.ParityReplay",
+        "EvaluatorDiagnostics",
+        "EvaluatorOptimize",
+        "PredictorBacktest",
+        "PortfolioOptimizerBacktest",
+    }
     declared = manifest["retired_stages"]
-    assert set(declared) == {"Backtester"}
-    entry = declared["Backtester"]
-    for f in _RETIRED_FIELDS:
-        assert entry.get(f), f"retired_stages.Backtester.{f} is required"
-    assert entry["tracker"] == "alpha-engine-config-I13374"
-    assert "Backtester" in {s.name for s in stages}
-    assert retired_stages(manifest).keys() == {"Backtester"}
+    assert set(declared) == expected
+    names = {s.name for s in stages}
+    for stage, entry in declared.items():
+        for f in _RETIRED_FIELDS:
+            assert entry.get(f), f"retired_stages.{stage}.{f} is required"
+        assert entry["tracker"] == "alpha-engine-config-I13374"
+        assert stage in names, f"{stage} must still be in the definition (retired, not removed)"
+    assert retired_stages(manifest).keys() == expected
 
 
 def test_the_live_retirement_has_not_outlived_its_re_exam_date(stages, manifest):
