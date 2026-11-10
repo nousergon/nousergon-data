@@ -17,6 +17,12 @@ closing terminal (`_DAY_CLOSERS`). RUNNING, preflight and every other
 terminal send nothing to the chat; they stay on the alert bus and the
 console. A failure inside trading hours is caught as a critical by the
 Crucible v2 watchdogs, not here.
+
+The day's message counts only cadence runs (never a preflight shell or a
+``skip_*`` partial run), reports a SUCCEEDED run whose own report flagged a
+concern as not clean, and is claimed once per closer per day in the shared
+flow-doctor table so a re-run or a late duplicate cannot send a second one
+(alpha-engine-config-I13334 review findings, 2026-11-10).
 """
 
 from __future__ import annotations
@@ -26,6 +32,7 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
+from typing import Any, cast
 
 import boto3
 
@@ -325,10 +332,16 @@ def _build_message(
     detail: dict,
     describe_resp: dict | None = None,
     *,
-    sf_client=None,
-    s3_client=None,
-) -> tuple[str, bool, bool, bool, bool]:
-    """Return ``(text, silent, hollow_suspect, is_partial, needs_triage)``.
+    sf_client: Any = None,  # noqa: ANN401  # pyright: ignore[reportExplicitAny] — untyped boto3 client
+    s3_client: Any = None,  # noqa: ANN401  # pyright: ignore[reportExplicitAny] — untyped boto3 client
+) -> tuple[str, bool, bool, bool, bool, str | None]:
+    """Return ``(text, silent, hollow_suspect, is_partial, needs_triage,
+    artifact_concern)``.
+
+    ``artifact_concern`` names what the reconcile terminal's EOD artifact check
+    found wrong (``"eod artifacts missing"`` / ``"eod artifacts unverified"``),
+    or None when the check passed or did not apply. The day message reads it so
+    a run that SUCCEEDED without writing its artifacts never counts as clean.
 
     ``needs_triage`` is True when a weekly terminal carries issue bullets or a
     non-green Director verdict (see weekly_run_report.py). The handler then
@@ -368,12 +381,13 @@ def _build_message(
     hollow_suspect = False
     detailed_failure_cause: str | None = None
     needs_triage = False
+    artifact_concern: str | None = None
 
     lines = [f"{emoji} *{label} — {display_status}*"]
 
     if status == "RUNNING":
         lines.append(f"Execution: {exec_name}")
-        return "\n".join(lines), True, False, is_partial, False
+        return "\n".join(lines), True, False, is_partial, False, None
 
     duration = _format_duration(detail.get("startDate"), detail.get("stopDate"))
     if duration:
@@ -416,6 +430,10 @@ def _build_message(
         if sm_name == EOD_PIPELINE_NAME and (status == "SUCCEEDED" or is_degraded):
             artifact_status = verify_eod_artifacts(s3_client, run_date)
             lines.extend(format_eod_artifact_lines(artifact_status))
+            if artifact_status is None:
+                artifact_concern = "eod artifacts unverified"
+            elif not artifact_status.all_present:
+                artifact_concern = "eod artifacts missing"
 
         # Brian, 2026-10-24: a weekly "SUCCEEDED" must also list every step
         # that was less than perfect, each with its auto-fix, and the
@@ -483,7 +501,7 @@ def _build_message(
     # the cadence cycle it is named after did not fail.
     if is_partial:
         silent = True
-    return "\n".join(lines), silent, hollow_suspect, is_partial, needs_triage
+    return "\n".join(lines), silent, hollow_suspect, is_partial, needs_triage, artifact_concern
 
 
 _REPO_SHORT = {"alpha-engine-config": "aec", "nousergon-data": "data", "nous-ergon-ops": "ops"}
@@ -532,34 +550,193 @@ _DAY_WINDOW_S = 20 * 3600
 _PIPELINES_URL = "https://console.nousergon.ai/component"
 
 
-def _day_outcomes(sm_arn: str, *, sf_client, now_s: float) -> list[tuple[str, str]]:
-    """``[(label, status)]`` for each pipeline's latest run in the last 20 h.
+#: Shared flow-doctor DynamoDB table (``build_flow_doctor_config``'s store),
+#: which this role can already PutItem/GetItem. The two record kinds below use
+#: their own ``pk`` prefix and carry none of flow-doctor's index attributes
+#: (``flow_name`` / ``action_type`` / ``error_signature`` / ``entity``), so no
+#: flow-doctor query or scan ever sees them.
+_LEDGER_TABLE = "flow-doctor-store"
+_LEDGER_TTL_S = 14 * 86400
+
+
+def _ddb() -> Any:  # noqa: ANN401  # pyright: ignore[reportExplicitAny] — untyped boto3 client
+    return boto3.client("dynamodb", region_name=REGION)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+
+
+def _error_code(exc: Exception) -> str:
+    response: object = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        error: object = cast("dict[str, object]", response).get("Error")
+        if isinstance(error, dict):
+            return str(cast("dict[str, object]", error).get("Code") or "")
+    return ""
+
+
+def _ledger_item(pk: str, now_s: float, **fields: str) -> dict[str, dict[str, str]]:
+    item = {"pk": {"S": pk}, "sk": {"S": "META"},
+            "expires_at": {"N": str(int(now_s) + _LEDGER_TTL_S)}}
+    item.update({k: {"S": v} for k, v in fields.items()})
+    return item
+
+
+def _verdict_pk(execution_arn: str) -> str:
+    return f"{_FLOW_NAME}#run-verdict#{execution_arn}"
+
+
+def _put_verdict(execution_arn: str, concern: str) -> None:
+    """Remember what a run's own report found wrong, for the day message.
+
+    Only a run with a concern is written; an absent row means the report was
+    clean. Never raises: the per-run record must not fail on the ledger."""
+    if not execution_arn:
+        return
+    try:
+        _ddb().put_item(
+            TableName=_LEDGER_TABLE,
+            Item=_ledger_item(_verdict_pk(execution_arn),
+                              datetime.now(timezone.utc).timestamp(), concern=concern),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("run verdict not recorded for %s: %s", execution_arn, type(exc).__name__)
+
+
+def _read_verdict(execution_arn: str) -> str | None:
+    """The concern a run's report recorded, or None (clean, or unreadable)."""
+    if not execution_arn:
+        return None
+    try:
+        resp: object = _ddb().get_item(
+            TableName=_LEDGER_TABLE,
+            Key={"pk": {"S": _verdict_pk(execution_arn)}, "sk": {"S": "META"}},
+            ConsistentRead=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("run verdict unreadable for %s: %s", execution_arn, type(exc).__name__)
+        return None
+    item: object = cast("dict[str, object]", resp).get("Item") if isinstance(resp, dict) else None
+    if not isinstance(item, dict):
+        return None
+    concern: object = cast("dict[str, object]", item).get("concern")
+    if isinstance(concern, dict):
+        value: object = cast("dict[str, object]", concern).get("S")
+        return value if isinstance(value, str) and value else None
+    return None
+
+
+def _run_concern(
+    status: str, *, hollow_suspect: bool, needs_triage: bool, artifact_concern: str | None,
+) -> str | None:
+    """What a run's own report flagged that its raw ``status`` does not say."""
+    if status != "SUCCEEDED":
+        return None
+    concerns = [c for c in (
+        artifact_concern,
+        "hollow-suspect" if hollow_suspect else None,
+        "needs triage" if needs_triage else None,
+    ) if c]
+    return ", ".join(concerns) or None
+
+
+def _day_pk(key: str) -> str:
+    return f"{_FLOW_NAME}#day-message#{key}"
+
+
+def _claim_day(key: str, *, now_s: float) -> bool:
+    """Claim the day's one message. False when it was already sent.
+
+    A conditional put on a row that outlives flow-doctor's 1-minute signature
+    cooldown, so a closer re-run or a late duplicate terminal hours later is
+    refused. A row left by a send that failed (``state = failed``) may be
+    reclaimed. Any other store error fails OPEN: a day with no message reads
+    exactly like a day that never ran, which is worse than a second one."""
+    try:
+        _ddb().put_item(
+            TableName=_LEDGER_TABLE,
+            Item=_ledger_item(_day_pk(key), now_s, state="claimed"),
+            ConditionExpression="attribute_not_exists(pk) OR #st = :failed",
+            ExpressionAttributeNames={"#st": "state"},
+            ExpressionAttributeValues={":failed": {"S": "failed"}},
+        )
+    except Exception as exc:  # noqa: BLE001
+        if _error_code(exc) == "ConditionalCheckFailedException":
+            logger.info("day message %s already sent; not sending again", key)
+            return False
+        logger.warning("day-message claim unreadable (%s); sending anyway", type(exc).__name__)
+    return True
+
+
+def _release_day(key: str, *, now_s: float) -> None:
+    """Mark the claim failed so a later closer terminal may still send."""
+    try:
+        _ddb().put_item(TableName=_LEDGER_TABLE, Item=_ledger_item(_day_pk(key), now_s, state="failed"))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("day-message claim not released for %s: %s", key, type(exc).__name__)
+
+
+def _is_counted_run(machine_arn: str, execution_arn: str) -> bool:
+    """A run the day message counts: not a preflight shell, not a narrowed
+    partial run. The same tests ``_closes_day`` applies to the closer."""
+    describe_resp = cast("dict[str, object] | None", _describe_execution(execution_arn))
+    return not _is_preflight_execution(describe_resp) and not _is_partial_execution(
+        machine_arn, describe_resp)[0]
+
+
+def _day_outcomes(
+    sm_arn: str,
+    *,
+    sf_client: Any,  # noqa: ANN401  # pyright: ignore[reportExplicitAny] — untyped boto3 client
+    now_s: float,
+    concerns: dict[str, str] | None = None,
+) -> list[tuple[str, str]]:
+    """``[(label, status)]`` for each pipeline's latest COUNTED run in the last 20 h.
 
     Pipelines with no run in the window are left out, not counted as failed:
     a weekday has no weekly run and a Saturday has no trading runs. A list
     call that fails is reported as ``UNREADABLE`` so the day never reads as
-    cleaner than it was."""
+    cleaner than it was.
+
+    Preflight shells and partial verification runs (``skip_*`` flags with no
+    canonical ``pipeline_role``, e.g. ``director-verify-*``) are skipped, so a
+    later narrowed run never stands in for the cadence run in either direction.
+    A SUCCEEDED run whose own report flagged a concern (missing EOD artifacts,
+    hollow-suspect, weekly needs-triage) is reported with that concern, never
+    as a plain success. ``concerns`` maps execution ARN to a concern already
+    known in this invocation (the closer's own), ahead of the ledger."""
     prefix = sm_arn.rsplit(":", 1)[0]
+    known = concerns or {}
     out: list[tuple[str, str]] = []
     for name in _DAY_PIPELINES:
+        machine_arn = f"{prefix}:{name}"
         try:
-            resp = sf_client.list_executions(stateMachineArn=f"{prefix}:{name}", maxResults=10)
+            resp = sf_client.list_executions(stateMachineArn=machine_arn, maxResults=10)
         except Exception as exc:  # noqa: BLE001 — one unreadable machine must not drop the day
             logger.warning("list_executions %s failed: %s", name, type(exc).__name__)
             out.append((_SF_LABELS[name], "UNREADABLE"))
             continue
-        runs = [
-            e for e in resp.get("executions", [])
-            if now_s - _epoch_s(e.get("startDate")) <= _DAY_WINDOW_S
-            and not str(e.get("name", "")).startswith(("offcycle-shell", "preflight"))
-        ]
-        if runs:
-            latest = max(runs, key=lambda e: _epoch_s(e.get("startDate")))
-            out.append((_SF_LABELS[name], str(latest.get("status", "UNKNOWN"))))
+        runs = sorted(
+            (
+                e for e in resp.get("executions", [])
+                if now_s - _epoch_s(e.get("startDate")) <= _DAY_WINDOW_S
+                and not str(e.get("name", "")).startswith(("offcycle-shell", "preflight"))
+            ),
+            key=lambda e: _epoch_s(e.get("startDate")),
+            reverse=True,
+        )
+        for run in runs:
+            execution_arn = str(run.get("executionArn") or "")
+            if not _is_counted_run(machine_arn, execution_arn):
+                continue
+            status = str(run.get("status", "UNKNOWN"))
+            if status == "SUCCEEDED":
+                concern = known.get(execution_arn) or _read_verdict(execution_arn)
+                if concern:
+                    status = f"SUCCEEDED, {concern}"
+            out.append((_SF_LABELS[name], status))
+            break
     return out
 
 
-def _epoch_s(value) -> float:
+def _epoch_s(value: object) -> float:
     if isinstance(value, datetime):
         return value.timestamp()
     if isinstance(value, (int, float)):
@@ -592,12 +769,15 @@ def _record(text: str, *, silent: bool, severity: str, dedup_key: str) -> bool:
     )
 
 
-def handler(event: dict, context) -> dict:  # noqa: ARG001
+def handler(event: dict[str, object], context: object) -> dict[str, object]:  # noqa: ARG001
     """Record every run; send the chat ONE message a day (§7.2b)."""
     result = _record_run(event)
-    detail = event.get("detail") or {}
+    raw_detail = event.get("detail")
+    detail = cast("dict[str, object]", raw_detail) if isinstance(raw_detail, dict) else {}
     if _closes_day(detail):
-        result["day_message_sent"] = _send_day_message(detail)
+        concern = result.get("concern")
+        result["day_message_sent"] = _send_day_message(
+            detail, closer_concern=concern if isinstance(concern, str) else None)
     return result
 
 
@@ -610,22 +790,34 @@ def _closes_day(detail: dict) -> bool:
     return not _is_preflight_execution(describe_resp) and not _is_partial_execution(sm_arn, describe_resp)[0]
 
 
-def _send_day_message(detail: dict) -> bool:
-    sm_name = (detail.get("stateMachineArn") or "").rsplit(":", 1)[-1]
-    describe_resp = _describe_execution(detail.get("executionArn", ""))
-    run_date = parse_run_date_from_input((describe_resp or {}).get("input")) or \
-        parse_run_date_from_execution_name(detail.get("name", ""))
+def _send_day_message(detail: dict[str, object], *, closer_concern: str | None = None) -> bool:
+    sm_arn = str(detail.get("stateMachineArn") or "")
+    sm_name = sm_arn.rsplit(":", 1)[-1]
+    execution_arn = str(detail.get("executionArn") or "")
+    exec_name = str(detail.get("name") or "")
+    describe_resp = cast("dict[str, object] | None", _describe_execution(execution_arn))
+    raw_input = (describe_resp or {}).get("input")
+    run_date = parse_run_date_from_input(raw_input if isinstance(raw_input, str) else None) or \
+        parse_run_date_from_execution_name(exec_name)
+    now = datetime.now(timezone.utc)
+    # One message per closer per day. The run date names the day; a run with
+    # none falls back to the UTC calendar day, never to the execution name,
+    # which differs on every re-run and so would dedup nothing.
+    day_key = f"{sm_name}:{run_date or now.date().isoformat()}"
+    if not _claim_day(day_key, now_s=now.timestamp()):
+        return False
     outcomes = _day_outcomes(
-        detail.get("stateMachineArn", ""),
+        sm_arn,
         sf_client=boto3.client("stepfunctions", region_name=REGION),
-        now_s=datetime.now(timezone.utc).timestamp(),
+        now_s=now.timestamp(),
+        concerns={execution_arn: closer_concern} if execution_arn and closer_concern else None,
     )
     failed = any(st != "SUCCEEDED" for _, st in outcomes)
-    return notify_via_flow_doctor(
+    sent = notify_via_flow_doctor(
         day_message(run_date, outcomes),
         silent=False,
         severity="warning" if failed else "info",
-        dedup_key=f"{_FLOW_NAME}:day:{sm_name}:{run_date or detail.get('name', '')}",
+        dedup_key=f"{_FLOW_NAME}:day:{day_key}",
         flow_name=_FLOW_NAME,
         topics=PIPELINE_OBSERVER_TELEGRAM_TOPICS,
         db_basename=_DB_BASENAME,
@@ -634,13 +826,16 @@ def _send_day_message(detail: dict) -> bool:
         # (Brian's 2026-08-17 ruling, carried over).
         rate_limit_exempt_severities=_RATE_LIMIT_EXEMPT_SEVERITIES,
         guaranteed_topic=FleetTelegramTopic.PIPELINE,
-        context={"state_machine": sm_name, "execution": detail.get("name"), "day": run_date},
+        context={"state_machine": sm_name, "execution": exec_name, "day": run_date},
         # Matches playbooks.yaml's registered `sf_completion_telegram` class.
         source="flow-doctor:sf-telegram-notifier",
     )
+    if not sent:
+        _release_day(day_key, now_s=now.timestamp())
+    return sent
 
 
-def _record_run(event: dict) -> dict:
+def _record_run(event: dict) -> dict[str, object]:
     """The per-run report, built exactly as before 2026-11-06 and RECORDED
     (alert bus, tracked-only: /page/incidents and the nightly sweep), never
     sent to the chat (observability-policy §7.2b)."""
@@ -649,7 +844,7 @@ def _record_run(event: dict) -> dict:
     sm_name = (detail.get("stateMachineArn") or "").rsplit(":", 1)[-1]
     logger.info("SF status change: sf=%s status=%s", sm_name, status)
 
-    text, silent, hollow_suspect, is_partial, needs_triage = _build_message(detail)
+    text, silent, hollow_suspect, is_partial, needs_triage, artifact_concern = _build_message(detail)
     ok = _record(
         text,
         silent=silent,
@@ -660,6 +855,15 @@ def _record_run(event: dict) -> dict:
         ),
         dedup_key=_dedup_key(detail),
     )
+    # What this report flagged beyond its raw status, kept for the day message
+    # so a SUCCEEDED run with a problem never counts as a clean success there.
+    typed_detail = cast("dict[str, object]", detail)
+    concern = _run_concern(
+        str(typed_detail.get("status") or "UNKNOWN"), hollow_suspect=hollow_suspect,
+        needs_triage=needs_triage, artifact_concern=artifact_concern,
+    )
+    if concern and not is_partial:
+        _put_verdict(str(typed_detail.get("executionArn") or ""), concern)
 
     return {
         "status": status,
@@ -669,4 +873,5 @@ def _record_run(event: dict) -> dict:
         "recorded": ok,
         "silent": silent,
         "hollow_suspect": hollow_suspect,
+        "concern": concern,
     }
