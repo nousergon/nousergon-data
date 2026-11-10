@@ -841,9 +841,10 @@ def _send_day_message(detail: dict[str, object], *, closer_concern: str | None =
     # lost for good (cross-family review of nousergon-data#2459).
     sent = False
     try:
+        sf_client: Any = boto3.client("stepfunctions", region_name=REGION)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType, reportExplicitAny]
         outcomes = _day_outcomes(
             sm_arn,
-            sf_client=boto3.client("stepfunctions", region_name=REGION),
+            sf_client=sf_client,
             now_s=now.timestamp(),
             concerns={execution_arn: closer_concern} if execution_arn and closer_concern else None,
         )
