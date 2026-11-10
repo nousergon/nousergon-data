@@ -789,6 +789,26 @@ def _fake_checkout(root: pathlib.Path) -> pathlib.Path:
     return root
 
 
+_BACKTEST_CHAIN = ("PredictorBacktest", "PortfolioOptimizerBacktest")
+
+
+def _manifest_with_backtest_chain_live(tmp_path: pathlib.Path) -> pathlib.Path:
+    """The live manifest with the backtest chain NOT retired.
+
+    PredictorBacktest and PortfolioOptimizerBacktest are retired on the live
+    manifest (Brian 2026-11-10, alpha-engine-config-I13374), but their
+    upstream_artifact_dependencies stay declared, and the upstream-pending /
+    remeasure mechanism (alpha-engine-config-I10717) must keep its coverage for
+    the day a retirement is re-examined and lifted.
+    """
+    manifest = json.loads(MANIFEST_PATH.read_text())
+    for stage in _BACKTEST_CHAIN:
+        manifest["retired_stages"].pop(stage, None)
+    path = tmp_path / "manifest_backtest_chain_live.json"
+    path.write_text(json.dumps(manifest))
+    return path
+
+
 def test_the_weekday_case_remeasures_against_the_last_populated_instance(tmp_path):
     """The SOTA half of alpha-engine-config-I10717: the weekly SF has not run
     TODAY, but it wrote real content 3 days ago (last Saturday), which is well
@@ -827,7 +847,7 @@ def test_the_weekday_case_remeasures_against_the_last_populated_instance(tmp_pat
             {"Key": f"backtest/{historical_date}/predictor_sweep_df.parquet", "Size": 91234},
         ],
     })
-    report = ps.sweep(SF_PATH, MANIFEST_PATH, str(root), "t", aws=aws, runner=runner)
+    report = ps.sweep(SF_PATH, _manifest_with_backtest_chain_live(tmp_path), str(root), "t", aws=aws, runner=runner)
 
     assert report.stages_failed == 0
     assert report.stages_unsweepable_upstream_pending == 0
@@ -874,7 +894,7 @@ def test_the_weekday_case_stays_upstream_pending_when_nothing_is_populated_withi
         {"Key": f"backtest/{run_date}/.phases/preflight.json", "Size": 235},
         {"Key": f"backtest/{run_date}/.phases/runtime_smoke.json", "Size": 239},
     ]})
-    report = ps.sweep(SF_PATH, MANIFEST_PATH, str(root), "t", aws=aws, runner=runner)
+    report = ps.sweep(SF_PATH, _manifest_with_backtest_chain_live(tmp_path), str(root), "t", aws=aws, runner=runner)
 
     assert report.stages_failed == 0
     assert report.stages_unsweepable_upstream_pending == 2
@@ -924,7 +944,7 @@ def test_a_genuinely_broken_backtest_stage_still_fails_when_upstream_is_present(
         {"Key": f"backtest/{run_date}/.phases/preflight.json", "Size": 235},
         {"Key": f"backtest/{run_date}/results/backtest.parquet", "Size": 8123},
     ]})
-    report = ps.sweep(SF_PATH, MANIFEST_PATH, str(root), "t", aws=aws, runner=runner)
+    report = ps.sweep(SF_PATH, _manifest_with_backtest_chain_live(tmp_path), str(root), "t", aws=aws, runner=runner)
     failed = {r["stage"] for r in report.results if r["verdict"] == ps.FAILED}
     assert "PredictorBacktest" in failed
     assert report.outcome == ps.OUTCOME_FAILED
@@ -1509,6 +1529,20 @@ def test_a_stale_dedicated_box_acknowledgement_fails_the_run(tmp_path):
 # ── A retired stage is not run, and is never silent (alpha-engine-config-I13374) ─
 
 
+#: Brian 2026-11-07 (Backtester) and 2026-11-10 ("Retire all 8").
+RETIRED_STAGES = (
+    "Backtester",
+    "ParityParallel.PitParityLookahead",
+    "ParityParallel.PitParityWalkforward",
+    "PitParityCompare",
+    "ParityParallel.ParityReplay",
+    "EvaluatorDiagnostics",
+    "EvaluatorOptimize",
+    "PredictorBacktest",
+    "PortfolioOptimizerBacktest",
+)
+
+
 def _retired_result(report, stage="Backtester"):
     return next(r for r in report.results if r["stage"] == stage)
 
@@ -1526,11 +1560,13 @@ def test_a_retired_stage_is_not_run_and_is_reported_as_retired(tmp_path):
     assert row["verdict"] == ps.RETIRED_VERDICT
     assert "alpha-engine-config-I13374" in row["reason"]
     assert row["acknowledged_reason"]
-    assert report.stages_retired == 1
+    assert report.stages_retired == len(RETIRED_STAGES)
     assert scripts, "the other stages must still be swept"
     assert not [x for x in scripts if "spot_backtester.sh" in x], (
         "the retired stage's launcher must never be handed to the runner"
     )
+    for stage in RETIRED_STAGES:
+        assert _retired_result(report, stage)["verdict"] == ps.RETIRED_VERDICT, stage
 
 
 def test_a_retired_stage_that_would_fail_does_not_fail_the_run(tmp_path):
@@ -1555,11 +1591,14 @@ def test_the_retirement_is_named_on_every_surface(tmp_path):
     root = _fake_checkout(tmp_path)
     report = ps.sweep(SF_PATH, MANIFEST_PATH, str(root), "t", runner=_completed(0))
     findings = [f for f in report.coverage_findings if f.get("kind") == ps.FINDING_RETIRED]
-    assert [f["stage"] for f in findings] == ["Backtester"]
-    assert findings[0]["blocking"] is False
-    assert next(d for d in report.declared_stages if d["stage"] == "Backtester")["retired"]
+    assert sorted(f["stage"] for f in findings) == sorted(RETIRED_STAGES)
+    assert all(f["blocking"] is False for f in findings)
+    for stage in RETIRED_STAGES:
+        assert next(d for d in report.declared_stages if d["stage"] == stage)["retired"]
     subject, body = ps.render_notification(report)
-    assert "retired 1" in body and "RETIRED" in body and "Backtester" in body
+    assert f"retired {len(RETIRED_STAGES)}" in body and "RETIRED" in body
+    for stage in RETIRED_STAGES:
+        assert stage in body
     assert "alpha-engine-config-I13374" in body
 
 
