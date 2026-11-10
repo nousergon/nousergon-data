@@ -75,14 +75,26 @@ class _DDB:
 
 
 class _SF:
-    def __init__(self, by_name):
-        self.by_name = by_name
+    """``list_executions`` with real paging: ``page_size`` runs a page and a
+    ``nextToken`` while more remain, ignoring ``maxResults`` beyond it."""
 
-    def list_executions(self, stateMachineArn, maxResults):
+    def __init__(self, by_name, page_size=None):
+        self.by_name = by_name
+        self.page_size = page_size
+        self.calls = 0
+
+    def list_executions(self, stateMachineArn, maxResults, nextToken=None):
+        self.calls += 1
         name = stateMachineArn.rsplit(":", 1)[-1]
         if name == "boom":
             raise RuntimeError("x")
-        return {"executions": self.by_name.get(name, [])}
+        runs = self.by_name.get(name, [])
+        size = min(maxResults, self.page_size or maxResults)
+        start = int(nextToken or 0)
+        resp = {"executions": runs[start:start + size]}
+        if start + size < len(runs):
+            resp["nextToken"] = str(start + size)
+        return resp
 
 
 def _event(name, status):
@@ -257,3 +269,94 @@ def test_an_unreadable_claim_store_still_sends(mod, monkeypatch):
         raise RuntimeError("throttled")
     monkeypatch.setattr(mod._ddb_fake, "put_item", boom)
     assert mod._claim_day("k", now_s=0.0) is True
+
+
+# --- cross-family review of nousergon-data#2459 (2026-11-10) -----------------
+
+def test_a_send_that_raises_releases_the_claim_so_a_retry_can_still_send(mod, monkeypatch):
+    """HIGH: the claim was released only on a False return. A raise from
+    notify_event / send_raw left it claimed, and every later closer terminal
+    or Lambda retry was refused, so the day's message was lost for good."""
+    _all_green(mod)
+    attempts: list[str] = []
+
+    def flaky(text, **kw):
+        attempts.append(text)
+        if len(attempts) == 1:
+            raise RuntimeError("telegram send_raw blew up")
+        return True
+
+    monkeypatch.setattr(mod, "notify_via_flow_doctor", flaky)
+    detail = _event(_RECONCILE, "SUCCEEDED")["detail"]
+    with pytest.raises(RuntimeError, match="send_raw"):
+        mod._send_day_message(detail)
+    assert mod._send_day_message(detail) is True
+    assert len(attempts) == 2
+
+
+def test_a_raise_while_reading_outcomes_releases_the_claim_too(mod, monkeypatch):
+    _all_green(mod)
+    calls = {"n": 0}
+    real = mod._day_outcomes
+
+    def flaky(*a, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("describe blew up")
+        return real(*a, **kw)
+
+    monkeypatch.setattr(mod, "_day_outcomes", flaky)
+    detail = _event(_RECONCILE, "SUCCEEDED")["detail"]
+    with pytest.raises(RuntimeError):
+        mod._send_day_message(detail)
+    assert mod._send_day_message(detail) is True
+    assert len(mod._sent) == 1
+
+
+def test_a_delivered_message_keeps_its_claim(mod):
+    _all_green(mod)
+    detail = _event(_RECONCILE, "SUCCEEDED")["detail"]
+    assert mod._send_day_message(detail) is True
+    assert mod._send_day_message(detail) is False
+    assert len(mod._sent) == 1
+
+
+def _partials(mod, name, n, now):
+    runs = []
+    for i in range(n):
+        r = _run(name, "SUCCEEDED", datetime.fromtimestamp(now - 60 - i, tz=timezone.utc),
+                 run=f"director-verify-{i}")
+        mod._describes[r["executionArn"]] = _PARTIAL
+        runs.append(r)
+    return runs
+
+
+def test_the_cadence_run_behind_a_full_page_of_partials_is_still_counted(mod):
+    """MEDIUM: one 10-run page was read and nextToken ignored, so ten newer
+    partial runs hid the cadence run and the pipeline vanished from the day."""
+    now = datetime.now(timezone.utc).timestamp()
+    name = "ne-postclose-trading-pipeline"
+    cadence = _run(name, "FAILED", datetime.fromtimestamp(now - 3600, tz=timezone.utc),
+                   run="eod-2026-11-06")
+    sf = _SF({name: [*_partials(mod, name, 10, now), cadence]}, page_size=10)
+    assert mod._day_outcomes(ARN + _RECONCILE, sf_client=sf, now_s=now) == [
+        ("Post-close Trading SF", "FAILED")]
+
+
+def test_paging_stops_at_the_window_edge(mod):
+    now = datetime.now(timezone.utc).timestamp()
+    name = "ne-postclose-trading-pipeline"
+    old = [_run(name, "FAILED", datetime.fromtimestamp(now - 30 * 3600 - i, tz=timezone.utc),
+                run=f"old-{i}") for i in range(30)]
+    sf = _SF({name: [*_partials(mod, name, 5, now), *old]}, page_size=10)
+    assert mod._day_outcomes(ARN + _RECONCILE, sf_client=sf, now_s=now) == []
+    assert sf.calls == len(mod._DAY_PIPELINES)  # one page each: the first already left the window
+
+
+def test_running_out_of_pages_inside_the_window_reads_unreadable(mod, monkeypatch):
+    monkeypatch.setattr(mod, "_DAY_LIST_MAX_PAGES", 2)
+    now = datetime.now(timezone.utc).timestamp()
+    name = "ne-postclose-trading-pipeline"
+    sf = _SF({name: _partials(mod, name, 30, now)}, page_size=10)
+    assert mod._day_outcomes(ARN + _RECONCILE, sf_client=sf, now_s=now) == [
+        ("Post-close Trading SF", "UNREADABLE")]
