@@ -547,6 +547,9 @@ _DAY_CLOSERS: frozenset[str] = frozenset({
 #: plumbing, not a pipeline Brian reads about.
 _DAY_PIPELINES: tuple[str, ...] = tuple(n for n in _SF_LABELS if n != "alpha-engine-groom-dispatch")
 _DAY_WINDOW_S = 20 * 3600
+# Bound on list_executions pages walked per pipeline for the day message (100
+# runs a page). Exhausting it inside the window reads UNREADABLE, never absent.
+_DAY_LIST_MAX_PAGES = 5
 _PIPELINES_URL = "https://console.nousergon.ai/component"
 
 
@@ -708,17 +711,40 @@ def _day_outcomes(
     for name in _DAY_PIPELINES:
         machine_arn = f"{prefix}:{name}"
         try:
-            resp = sf_client.list_executions(stateMachineArn=machine_arn, maxResults=10)
+            status = _latest_counted_status(
+                machine_arn, sf_client=sf_client, now_s=now_s, known=known)
         except Exception as exc:  # noqa: BLE001 — one unreadable machine must not drop the day
-            logger.warning("list_executions %s failed: %s", name, type(exc).__name__)
+            logger.warning("day outcome for %s unreadable: %s", name, exc)
             out.append((_SF_LABELS[name], "UNREADABLE"))
             continue
+        if status is not None:
+            out.append((_SF_LABELS[name], status))
+    return out
+
+
+def _latest_counted_status(
+    machine_arn: str,
+    *,
+    sf_client: Any,  # noqa: ANN401  # pyright: ignore[reportExplicitAny] — untyped boto3 client
+    now_s: float,
+    known: dict[str, str],
+) -> str | None:
+    """Status of the machine's newest counted run inside the window, or None.
+
+    Pages through ``list_executions`` (newest first) until a counted run is
+    found, a page reaches past the window, or the listing ends. Reading one
+    page only let ten newer partial or preflight runs hide the cadence run, so
+    the pipeline silently dropped out of the day message. ``_DAY_LIST_MAX_PAGES``
+    bounds the walk; running out of pages inside the window raises, so the
+    pipeline reads ``UNREADABLE`` rather than absent."""
+    kwargs: dict[str, object] = {"stateMachineArn": machine_arn, "maxResults": 100}
+    for _ in range(_DAY_LIST_MAX_PAGES):
+        resp = sf_client.list_executions(**kwargs)
+        page = list(resp.get("executions", []))
+        in_window = [e for e in page if now_s - _epoch_s(e.get("startDate")) <= _DAY_WINDOW_S]
         runs = sorted(
-            (
-                e for e in resp.get("executions", [])
-                if now_s - _epoch_s(e.get("startDate")) <= _DAY_WINDOW_S
-                and not str(e.get("name", "")).startswith(("offcycle-shell", "preflight"))
-            ),
+            (e for e in in_window
+             if not str(e.get("name", "")).startswith(("offcycle-shell", "preflight"))),
             key=lambda e: _epoch_s(e.get("startDate")),
             reverse=True,
         )
@@ -731,9 +757,12 @@ def _day_outcomes(
                 concern = known.get(execution_arn) or _read_verdict(execution_arn)
                 if concern:
                     status = f"SUCCEEDED, {concern}"
-            out.append((_SF_LABELS[name], status))
-            break
-    return out
+            return status
+        token = resp.get("nextToken")
+        if not token or len(in_window) < len(page):
+            return None  # listing ended, or this page already reached past the window
+        kwargs["nextToken"] = token
+    raise RuntimeError(f"no counted run within {_DAY_LIST_MAX_PAGES} pages")
 
 
 def _epoch_s(value: object) -> float:
@@ -806,32 +835,40 @@ def _send_day_message(detail: dict[str, object], *, closer_concern: str | None =
     day_key = f"{sm_name}:{run_date or now.date().isoformat()}"
     if not _claim_day(day_key, now_s=now.timestamp()):
         return False
-    outcomes = _day_outcomes(
-        sm_arn,
-        sf_client=boto3.client("stepfunctions", region_name=REGION),
-        now_s=now.timestamp(),
-        concerns={execution_arn: closer_concern} if execution_arn and closer_concern else None,
-    )
-    failed = any(st != "SUCCEEDED" for _, st in outcomes)
-    sent = notify_via_flow_doctor(
-        day_message(run_date, outcomes),
-        silent=False,
-        severity="warning" if failed else "info",
-        dedup_key=f"{_FLOW_NAME}:day:{day_key}",
-        flow_name=_FLOW_NAME,
-        topics=PIPELINE_OBSERVER_TELEGRAM_TOPICS,
-        db_basename=_DB_BASENAME,
-        # Out of the shared daily budget, and guaranteed to land: a once-a-day
-        # result that is suppressed reads exactly like a day that never ran
-        # (Brian's 2026-08-17 ruling, carried over).
-        rate_limit_exempt_severities=_RATE_LIMIT_EXEMPT_SEVERITIES,
-        guaranteed_topic=FleetTelegramTopic.PIPELINE,
-        context={"state_machine": sm_name, "execution": exec_name, "day": run_date},
-        # Matches playbooks.yaml's registered `sf_completion_telegram` class.
-        source="flow-doctor:sf-telegram-notifier",
-    )
-    if not sent:
-        _release_day(day_key, now_s=now.timestamp())
+    # From here on the claim is held. Every way out that is not a delivered
+    # message must release it, a raise included: a claim left behind refuses
+    # every later closer terminal and Lambda retry, and the day's message is
+    # lost for good (cross-family review of nousergon-data#2459).
+    sent = False
+    try:
+        sf_client: Any = boto3.client("stepfunctions", region_name=REGION)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType, reportExplicitAny]
+        outcomes = _day_outcomes(
+            sm_arn,
+            sf_client=sf_client,
+            now_s=now.timestamp(),
+            concerns={execution_arn: closer_concern} if execution_arn and closer_concern else None,
+        )
+        failed = any(st != "SUCCEEDED" for _, st in outcomes)
+        sent = notify_via_flow_doctor(
+            day_message(run_date, outcomes),
+            silent=False,
+            severity="warning" if failed else "info",
+            dedup_key=f"{_FLOW_NAME}:day:{day_key}",
+            flow_name=_FLOW_NAME,
+            topics=PIPELINE_OBSERVER_TELEGRAM_TOPICS,
+            db_basename=_DB_BASENAME,
+            # Out of the shared daily budget, and guaranteed to land: a once-a-day
+            # result that is suppressed reads exactly like a day that never ran
+            # (Brian's 2026-08-17 ruling, carried over).
+            rate_limit_exempt_severities=_RATE_LIMIT_EXEMPT_SEVERITIES,
+            guaranteed_topic=FleetTelegramTopic.PIPELINE,
+            context={"state_machine": sm_name, "execution": exec_name, "day": run_date},
+            # Matches playbooks.yaml's registered `sf_completion_telegram` class.
+            source="flow-doctor:sf-telegram-notifier",
+        )
+    finally:
+        if not sent:
+            _release_day(day_key, now_s=now.timestamp())
     return sent
 
 
