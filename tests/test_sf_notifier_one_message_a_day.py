@@ -39,8 +39,39 @@ def mod(monkeypatch):
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
     m._sent, m._emitted = sent, emitted
-    monkeypatch.setattr(m, "_describe_execution", lambda arn: {"input": "{}"})
+    m._describes = {}
+    monkeypatch.setattr(m, "_describe_execution",
+                        lambda arn: m._describes.get(arn, {"input": "{}"}))
+    m._ddb_fake = _DDB()
+    m._sf_fake = _SF({})
+    monkeypatch.setattr(m.boto3, "client",
+                        lambda name, *a, **k: m._ddb_fake if name == "dynamodb" else m._sf_fake)
     return m
+
+
+class _ConditionalCheckFailed(Exception):
+    response = {"Error": {"Code": "ConditionalCheckFailedException"}}
+
+
+class _DDB:
+    """The two DynamoDB calls the notifier makes, with real condition semantics
+    for the one ConditionExpression it uses."""
+
+    def __init__(self):
+        self.items: dict[str, dict] = {}
+
+    def put_item(self, TableName, Item, ConditionExpression=None, **kw):
+        pk = Item["pk"]["S"]
+        if ConditionExpression:
+            assert ConditionExpression == "attribute_not_exists(pk) OR #st = :failed"
+            prior = self.items.get(pk)
+            if prior is not None and prior.get("state", {}).get("S") != "failed":
+                raise _ConditionalCheckFailed()
+        self.items[pk] = Item
+
+    def get_item(self, TableName, Key, **kw):
+        item = self.items.get(Key["pk"]["S"])
+        return {"Item": item} if item else {}
 
 
 class _SF:
@@ -84,7 +115,7 @@ def test_the_closer_sends_one_message_naming_the_day(mod, monkeypatch):
         "ne-postclose-trading-pipeline": [{"name": "b", "status": "FAILED", "startDate": now}],
         "ne-postclose-reconcile-pipeline": [{"name": "c", "status": "SUCCEEDED", "startDate": now}],
     })
-    monkeypatch.setattr(mod.boto3, "client", lambda *a, **k: sf)
+    mod._sf_fake = sf
     mod.handler(_event("ne-postclose-reconcile-pipeline", "SUCCEEDED"), None)
     assert len(mod._sent) == 1
     text = mod._sent[0]["text"]
@@ -105,3 +136,124 @@ def test_runs_outside_the_window_and_preflights_are_not_counted(mod):
               "ne-postclose-trading-pipeline": [{"name": "preflight-1", "status": "FAILED",
                                                  "startDate": datetime.now(timezone.utc)}]})
     assert mod._day_outcomes(ARN + "ne-postclose-reconcile-pipeline", sf_client=sf, now_s=now) == []
+
+
+# --- alpha-engine-config-I13334 review findings (2026-11-10) -----------------
+
+_PARTIAL = {"input": '{"skip_collect": true, "skip_reconcile": true}'}
+_RECONCILE = "ne-postclose-reconcile-pipeline"
+
+
+def _run(name, status, start, *, run=None):
+    return {"name": run or f"{name}-run", "status": status, "startDate": start,
+            "executionArn": f"arn:x:{name}:{run or 'run'}"}
+
+
+@pytest.mark.parametrize("canonical,partial", [("FAILED", "SUCCEEDED"), ("SUCCEEDED", "FAILED")])
+def test_a_later_partial_run_never_stands_in_for_the_cadence_run(mod, canonical, partial):
+    """dc97b6c5e22be24e: a later director-verify-* run (skip_* flags, no
+    pipeline_role) replaced the canonical run's outcome, in either direction."""
+    now = datetime.now(timezone.utc).timestamp()
+    early = datetime.fromtimestamp(now - 3600, tz=timezone.utc)
+    late = datetime.fromtimestamp(now - 60, tz=timezone.utc)
+    name = "ne-postclose-trading-pipeline"
+    verify = _run(name, partial, late, run="director-verify-20261106T210000Z")
+    mod._describes[verify["executionArn"]] = _PARTIAL
+    sf = _SF({name: [verify, _run(name, canonical, early, run="eod-2026-11-06")]})
+    assert mod._day_outcomes(ARN + _RECONCILE, sf_client=sf, now_s=now) == [
+        ("Post-close Trading SF", canonical)]
+
+
+def test_a_shell_run_is_not_counted_either(mod):
+    now = datetime.now(timezone.utc).timestamp()
+    name = "ne-preopen-trading-pipeline"
+    shell = _run(name, "FAILED", datetime.fromtimestamp(now - 60, tz=timezone.utc), run="manual-1")
+    mod._describes[shell["executionArn"]] = {"input": '{"shell_run": true}'}
+    sf = _SF({name: [shell]})
+    assert mod._day_outcomes(ARN + _RECONCILE, sf_client=sf, now_s=now) == []
+
+
+def _reconcile_succeeded_missing_artifacts(mod, monkeypatch):
+    monkeypatch.setattr(mod, "verify_eod_artifacts", lambda s3, run_date: types.SimpleNamespace(
+        all_present=False, completion_marker_present=True, pnl_row_present=False,
+        run_date=run_date))
+    monkeypatch.setattr(mod, "format_eod_artifact_lines", lambda st: ["⚠️ *ARTIFACT(S) MISSING*"])
+    monkeypatch.setattr(mod, "build_execution_digest", lambda **kw: ([], False, None))
+    monkeypatch.setattr(mod, "terminal_resolution_line", lambda *a: None)
+
+
+def test_a_reconcile_that_succeeded_without_its_artifacts_is_not_clean(mod, monkeypatch):
+    """7f7bc35fc4f871f8: the per-run report flags missing EOD artifacts, but the
+    day message read only the raw status and said all N succeeded."""
+    _reconcile_succeeded_missing_artifacts(mod, monkeypatch)
+    now = datetime.now(timezone.utc)
+    mod._sf_fake = _SF({
+        "ne-preopen-trading-pipeline": [_run("ne-preopen-trading-pipeline", "SUCCEEDED", now)],
+        _RECONCILE: [{"name": f"{_RECONCILE}-2026-11-06", "status": "SUCCEEDED",
+                      "startDate": now, "executionArn": f"arn:x:{_RECONCILE}:1"}],
+    })
+    mod.handler(_event(_RECONCILE, "SUCCEEDED"), None)
+    assert len(mod._sent) == 1
+    text = mod._sent[0]["text"]
+    assert "all 2 succeeded" not in text
+    assert "1 of 2 succeeded" in text
+    assert "Post-close Reconcile SF (succeeded, eod artifacts missing)" in text
+    assert mod._sent[0]["severity"] == "warning"
+
+
+def test_an_earlier_hollow_success_is_not_clean_on_the_day(mod, monkeypatch):
+    """Same finding, for a run whose concern was recorded by an earlier
+    invocation (a hollow pre-open success): the closer reads the ledger."""
+    monkeypatch.setattr(mod, "build_execution_digest", lambda **kw: ([], True, None))
+    monkeypatch.setattr(mod, "terminal_resolution_line", lambda *a: None)
+    mod.handler(_event("ne-preopen-trading-pipeline", "SUCCEEDED"), None)
+    now = datetime.now(timezone.utc).timestamp()
+    sf = _SF({"ne-preopen-trading-pipeline": [{
+        "name": "x", "status": "SUCCEEDED", "startDate": now,
+        "executionArn": "arn:x:ne-preopen-trading-pipeline:1"}]})
+    assert mod._day_outcomes(ARN + _RECONCILE, sf_client=sf, now_s=now) == [
+        ("Pre-open Trading SF", "SUCCEEDED, hollow-suspect")]
+
+
+def _all_green(mod):
+    now = datetime.now(timezone.utc)
+    mod._sf_fake = _SF({_RECONCILE: [{"name": "c", "status": "SUCCEEDED", "startDate": now,
+                                      "executionArn": f"arn:x:{_RECONCILE}:1"}]})
+    return now
+
+
+def test_a_closer_rerun_later_the_same_day_sends_nothing(mod, monkeypatch):
+    """273e2edd886bfd5b: the per-day dedup_key only lived as long as
+    flow-doctor's 1-minute cooldown; a re-run hours later sent a second message."""
+    monkeypatch.setattr(mod, "build_execution_digest", lambda **kw: ([], False, None))
+    monkeypatch.setattr(mod, "verify_eod_artifacts", lambda s3, run_date: types.SimpleNamespace(
+        all_present=True, run_date=run_date))
+    monkeypatch.setattr(mod, "format_eod_artifact_lines", lambda st: [])
+    _all_green(mod)
+    first = mod.handler(_event(_RECONCILE, "SUCCEEDED"), None)
+    rerun = _event(_RECONCILE, "FAILED")
+    rerun["detail"]["executionArn"] = f"arn:x:{_RECONCILE}:2"
+    second = mod.handler(rerun, None)
+    assert first["day_message_sent"] is True and second["day_message_sent"] is False
+    assert len(mod._sent) == 1
+
+
+def test_a_failed_send_can_be_retried_by_a_later_closer(mod, monkeypatch):
+    monkeypatch.setattr(mod, "build_execution_digest", lambda **kw: ([], False, None))
+    monkeypatch.setattr(mod, "verify_eod_artifacts", lambda s3, run_date: types.SimpleNamespace(
+        all_present=True, run_date=run_date))
+    monkeypatch.setattr(mod, "format_eod_artifact_lines", lambda st: [])
+    _all_green(mod)
+    attempts: list[str] = []
+    monkeypatch.setattr(mod, "notify_via_flow_doctor",
+                        lambda text, **kw: attempts.append(text) or len(attempts) > 1)
+    assert mod.handler(_event(_RECONCILE, "SUCCEEDED"), None)["day_message_sent"] is False
+    assert mod.handler(_event(_RECONCILE, "SUCCEEDED"), None)["day_message_sent"] is True
+    assert len(attempts) == 2
+
+
+def test_an_unreadable_claim_store_still_sends(mod, monkeypatch):
+    def boom(**kw):
+        raise RuntimeError("throttled")
+    monkeypatch.setattr(mod._ddb_fake, "put_item", boom)
+    assert mod._claim_day("k", now_s=0.0) is True
