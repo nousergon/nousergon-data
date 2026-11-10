@@ -72,6 +72,7 @@ from pathlib import Path
 import boto3
 import pandas as pd
 import requests
+from botocore.exceptions import ClientError  # pyright: ignore[reportMissingTypeStubs]  # botocore ships no stubs; matches daily_closes_fred_repair.py
 
 from validators import expectations
 
@@ -1420,7 +1421,10 @@ def _build_sub_sector_etf_map(
 
 
 def load_from_s3(bucket: str, s3_prefix: str = "market_data/") -> dict | None:
-    """Load the latest constituents.json from S3. Returns None if not found."""
+    """Load the latest constituents.json from S3.
+
+    Return None if not found or the pointer has no date; other failures raise.
+    """
     s3 = boto3.client("s3")
     try:
         resp = s3.get_object(Bucket=bucket, Key=f"{s3_prefix}latest_weekly.json")
@@ -1430,5 +1434,7 @@ def load_from_s3(bucket: str, s3_prefix: str = "market_data/") -> dict | None:
             return None
         resp = s3.get_object(Bucket=bucket, Key=f"{s3_prefix}weekly/{date}/constituents.json")
         return json.loads(resp["Body"].read())
-    except Exception:
-        return None
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] in {"NoSuchKey", "404", "NotFound"}:
+            return None
+        raise

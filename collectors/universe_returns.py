@@ -57,10 +57,12 @@ import sqlite3
 import tempfile
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import boto3
 import pandas as pd
+from botocore.exceptions import ClientError  # pyright: ignore[reportMissingTypeStubs]  # botocore ships no stubs; matches daily_closes_fred_repair.py
 from nousergon_lib.trading_calendar import add_trading_days as _add_trading_days
 from polygon_client import PolygonForbiddenError
 
@@ -434,14 +436,18 @@ def _trading_days_to_process(
 
 # -- Sector map loading ------------------------------------------------------
 
-def _load_sector_map(s3, bucket: str, key: str) -> dict[str, str] | None:
-    """Load ticker -> sector ETF mapping from S3."""
+def _load_sector_map(s3: Any, bucket: str, key: str) -> dict[str, str] | None:  # pyright: ignore[reportExplicitAny]  # untyped SDK object
+    """Load ticker -> sector ETF mapping; None if not found, other failures raise."""
     try:
         obj = s3.get_object(Bucket=bucket, Key=key)
         return json.loads(obj["Body"].read())
     except Exception as e:
         logger.warning("Could not load sector_map from s3://%s/%s: %s", bucket, key, e)
-        return None
+        if isinstance(e, ClientError) and e.response["Error"]["Code"] in {  # pyright: ignore[reportUnknownMemberType]
+            "NoSuchKey", "404", "NotFound",
+        }:
+            return None
+        raise
 
 
 # -- DB helpers ---------------------------------------------------------------
@@ -656,7 +662,7 @@ def _insert_rows(db_path: str, rows: list[dict]) -> int:
 _BEFORE_EOD_MARKER = "before end of day"
 
 
-def _grouped_daily_or_empty(polygon_client, date_str: str, *, today: date) -> dict:
+def _grouped_daily_or_empty(polygon_client: Any, date_str: str, *, today: date) -> dict:  # pyright: ignore[reportExplicitAny, reportMissingTypeArgument]  # untyped client; bare dict pre-dates the strict gate
     """`get_grouped_daily`, tolerating only the before-EOD 403 for a session
     that has not closed yet.
 
@@ -686,7 +692,7 @@ def _grouped_daily_or_empty(polygon_client, date_str: str, *, today: date) -> di
 
 def _build_rows_for_date(
     eval_date: str,
-    polygon_client,
+    polygon_client: Any,  # pyright: ignore[reportExplicitAny]  # untyped client
     sector_map: dict[str, str] | None,
     *,
     today: date | None = None,

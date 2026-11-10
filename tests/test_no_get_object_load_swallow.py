@@ -37,7 +37,7 @@ _TREES = ("features", "builders", "collectors")
 _NOT_FOUND_TYPES = ("NoSuchKey", "NotFound", "FileNotFoundError", "KeyError")
 
 # Measured 2026-10-30 against main 4994b1eb. Shrink-only; see the module docstring.
-# The first fourteen return None.
+# The first eleven return None.
 GRANDFATHERED: frozenset[tuple[str, str]] = frozenset(
     {
         ("features/compute.py", "_expected_alternative_count"),
@@ -45,15 +45,12 @@ GRANDFATHERED: frozenset[tuple[str, str]] = frozenset(
         ("features/reader.py", "read_registry"),
         ("collectors/alternative.py", "load_from_s3"),
         ("collectors/alternative.py", "_get_latest_date"),
-        ("collectors/constituents.py", "load_from_s3"),
         ("collectors/crypto_balances.py", "_read_json"),
         ("collectors/daily_closes.py", "_read_earlier_root_file"),
         ("collectors/historical_constituents.py", "closes"),
         ("collectors/metron_market_data.py", "_read_json"),
-        ("collectors/nasdaq100.py", "load_from_s3"),
         ("collectors/price_cache_holes.py", "_read_daily_closes"),
         ("collectors/price_cache_holes.py", "_read_cached"),
-        ("collectors/universe_returns.py", "_load_sector_map"),
         # The four below return an EMPTY CONTAINER, the severe I10923 shape.
         # features/compute.py::_load_cached_alternative left in
         # alpha-engine-config-I12879: it now raises AlternativeCoverageError.
