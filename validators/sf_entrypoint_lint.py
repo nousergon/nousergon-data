@@ -83,7 +83,9 @@ SCHEMA_VERSION = 1
 # step-functions/data-collection.asl.json (the four ne-data-collection-* state
 # machines) second, 2026-10-24: the smallest remaining baseline (3 + 6), exact
 # on main. Enforcing changes no definition; it only stops the count rising.
+# step_function_daily.json third, 2026-11-10: smallest remaining baseline, exact on main; enforcing changes no definition.
 ENFORCED_DEFINITIONS: frozenset[str] = frozenset({
+    "infrastructure/step_function_daily.json",
     "infrastructure/step_function_groom.json",
     "infrastructure/step-functions/data-collection.asl.json",
 })
