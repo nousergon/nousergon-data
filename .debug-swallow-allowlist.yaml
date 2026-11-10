@@ -10,7 +10,7 @@ schema_version: 1
 # RECORD-LOUD), never allowlisted — see alpha-engine-config-I10226.
 entries:
   - path: collectors/alternative.py
-    line: 1640
+    line: 1644
     reason: >-
       (a) failure mode swallowed: s3.get_object against
       archive/revisions/{date}.json fails/404s for every checked date.
@@ -37,7 +37,7 @@ entries:
     expires: "2027-03-10"
     tracking: alpha-engine-config-I10226
   - path: features/compute.py
-    line: 1407
+    line: 1422
     reason: >-
       (a) failure mode swallowed: the exact-date S3 fundamentals key missing
       or unreadable. (c) recording surface: none needed at this step —

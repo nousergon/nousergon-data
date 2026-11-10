@@ -13,8 +13,10 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from collectors import alternative
+from collectors.yahoo_session import YahooAuthError
 from features.compute import _alt_entry_from_payload
 
 
@@ -59,6 +61,30 @@ def test_yfinance_failure_is_none_not_raise():
     mod = MagicMock()
     mod.Ticker.return_value.get_earnings_dates.side_effect = RuntimeError("429")
     assert _days(mod) is None
+
+
+def test_yahoo_auth_failure_propagates():
+    mod = _yf_with_dates([])
+    with patch("collectors.yahoo_session.call_yahoo", side_effect=YahooAuthError("session rejected")):
+        with pytest.raises(YahooAuthError, match="session rejected"):
+            _days(mod)
+
+
+def test_empty_earnings_frame_is_none():
+    assert _days(_yf_with_dates([])) is None
+
+
+def test_yahoo_auth_failure_propagates_through_ticker_worker():
+    s3 = MagicMock()
+    with (
+        patch.object(alternative, "_fetch_analyst", return_value={}),
+        patch.object(alternative, "_fetch_revisions", return_value={}),
+        patch("collectors.yahoo_session.call_yahoo", side_effect=YahooAuthError("session rejected")),
+        patch.dict("sys.modules", {"yfinance": _yf_with_dates([])}),
+    ):
+        with pytest.raises(YahooAuthError, match="session rejected"):
+            alternative._process_one_ticker("AAPL", "2026-10-30", "bucket", [], s3, "")
+    s3.put_object.assert_not_called()
 
 
 def test_consumer_absent_is_none_not_zero():

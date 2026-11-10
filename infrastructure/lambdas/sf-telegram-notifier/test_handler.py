@@ -155,7 +155,7 @@ def reset_send_message(monkeypatch):
         lambda text, *, silent, severity, dedup_key: _telegram_mod.send_message(
             text, disable_notification=silent),
     )
-    monkeypatch.setattr(index, "_send_day_message", lambda detail: False)
+    monkeypatch.setattr(index, "_send_day_message", lambda detail, **_kw: False)
     yield sf
 
 
@@ -551,7 +551,7 @@ class TestPartialRunsDoNotPageAsCadenceFailures:
             "skip_evaluator": True,
             "skip_post_eval": False,
         })}
-        text, silent, _hollow, is_partial, _triage = index._build_message(
+        text, silent, _hollow, is_partial, _triage, _concern = index._build_message(
             self._detail(), describe
         )
         assert is_partial is True
@@ -566,7 +566,7 @@ class TestPartialRunsDoNotPageAsCadenceFailures:
             "run_date": "2026-08-03",
             "skip_data_phase1": True,
         })}
-        text, silent, _hollow, is_partial, _triage = index._build_message(
+        text, silent, _hollow, is_partial, _triage, _concern = index._build_message(
             self._detail("weekly-2026-08-03"), describe
         )
         assert is_partial is False
@@ -575,7 +575,7 @@ class TestPartialRunsDoNotPageAsCadenceFailures:
 
     def test_full_run_with_no_skips_is_not_partial(self):
         describe = {"input": json.dumps({"run_date": "2026-08-03"})}
-        _text, silent, _hollow, is_partial, _triage = index._build_message(
+        _text, silent, _hollow, is_partial, _triage, _concern = index._build_message(
             self._detail("abc-123"), describe
         )
         assert is_partial is False
@@ -583,7 +583,7 @@ class TestPartialRunsDoNotPageAsCadenceFailures:
 
     def test_unparseable_input_is_not_treated_as_partial(self):
         """Absence of evidence is never evidence of a narrowed run."""
-        _text, silent, _hollow, is_partial, _triage = index._build_message(
+        _text, silent, _hollow, is_partial, _triage, _concern = index._build_message(
             self._detail("abc-123"), {"input": "not json"}
         )
         assert is_partial is False

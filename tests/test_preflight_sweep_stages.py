@@ -16,6 +16,7 @@ Two obligations shape this file:
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import pathlib
 
@@ -34,6 +35,8 @@ from infrastructure.preflight_sweep_stages import (
     load_manifest,
     manifest_disagreement,
     map_binding_disagreement,
+    retired_stage_disagreement,
+    retired_stages,
     upstream_dependencies,
     upstream_dependency_disagreement,
 )
@@ -515,3 +518,112 @@ def test_a_stage_acknowledged_in_both_blocks_is_a_contradiction(stages):
     }
     findings = manifest_disagreement(stages, both)
     assert any("contradictory claims" in f for f in findings)
+
+
+# ── Retired stages are DECLARED, DATED and graded (alpha-engine-config-I13374) ─
+
+_RETIRED_FIELDS = ("ruling", "since", "tracker", "re_exam")
+_TODAY = dt.date(2026, 11, 9)
+
+
+def _retired(stage: str, **overrides) -> dict:
+    entry = {
+        "ruling": "Brian 2026-11-07: retire it",
+        "since": "2026-11-07",
+        "tracker": "alpha-engine-config-I13374",
+        "re_exam": "2026-12-07",
+    }
+    entry.update(overrides)
+    return {"retired_stages": {stage: entry}}
+
+
+def test_the_live_manifest_retires_the_v1_backtester_with_every_field(stages, manifest):
+    """The exclusion lives in the manifest, with all four fields, and the
+    definition still carries the stage -- it is retired, not removed."""
+    declared = manifest["retired_stages"]
+    assert set(declared) == {"Backtester"}
+    entry = declared["Backtester"]
+    for f in _RETIRED_FIELDS:
+        assert entry.get(f), f"retired_stages.Backtester.{f} is required"
+    assert entry["tracker"] == "alpha-engine-config-I13374"
+    assert "Backtester" in {s.name for s in stages}
+    assert retired_stages(manifest).keys() == {"Backtester"}
+
+
+def test_the_live_retirement_has_not_outlived_its_re_exam_date(stages, manifest):
+    """The backstop: once re_exam passes, THIS test (and the sweep itself, as a
+    blocking finding) goes red until someone re-examines the retirement."""
+    assert retired_stage_disagreement(stages, manifest) == []
+
+
+def test_every_derived_stage_is_swept_or_declared_somewhere(stages, manifest):
+    """The stage-coverage rule (alpha-engine-config-I12351) with retirement as
+    a fourth declared home: a derived stage is swept, or acknowledged no-dry-path,
+    dedicated-box, or retired -- never absent."""
+    homes = (
+        {e["stage"] for e in manifest["no_dry_path_stages"]}
+        | {e["stage"] for e in manifest["dedicated_box_stages"]}
+        | set(manifest["retired_stages"])
+    )
+    swept_or_sweepable = {
+        s.name for s in stages if s.classification != NO_DRY_PATH
+    } - homes
+    assert not {s.name for s in stages if s.classification == NO_DRY_PATH} - homes
+    # Every declared home names a real stage.
+    assert homes <= {s.name for s in stages}
+    assert swept_or_sweepable, "retirement must not have emptied the sweep"
+
+
+@pytest.mark.parametrize("missing", _RETIRED_FIELDS)
+def test_a_retired_entry_missing_a_field_is_a_blocking_finding_and_arms_nothing(
+    stages, missing
+):
+    decl = _retired("Backtester")
+    del decl["retired_stages"]["Backtester"][missing]
+    findings = retired_stage_disagreement(stages, decl, today=_TODAY)
+    assert any(missing in f and "DROPPED" in f for f in findings), findings
+    assert retired_stages(decl) == {}
+
+
+def test_a_retired_entry_with_an_unparseable_date_is_a_finding(stages):
+    findings = retired_stage_disagreement(
+        stages, _retired("Backtester", re_exam="soon"), today=_TODAY
+    )
+    assert any("not an ISO" in f for f in findings), findings
+
+
+def test_a_retired_entry_for_a_stage_the_definition_lost_is_a_finding(stages):
+    findings = retired_stage_disagreement(
+        stages, _retired("NoSuchStage"), today=_TODAY
+    )
+    assert any("NoSuchStage" in f and "does not contain" in f for f in findings)
+
+
+def test_a_retired_entry_past_its_re_exam_date_is_a_finding(stages):
+    findings = retired_stage_disagreement(
+        stages, _retired("Backtester", re_exam="2026-11-08"), today=_TODAY
+    )
+    assert any("passed its re_exam" in f and "Backtester" in f for f in findings)
+
+
+def test_a_retired_entry_due_today_is_not_yet_a_finding(stages):
+    assert retired_stage_disagreement(
+        stages, _retired("Backtester", re_exam=_TODAY.isoformat()), today=_TODAY
+    ) == []
+
+
+def test_retiring_a_stage_that_is_already_declared_elsewhere_is_a_contradiction(stages):
+    no_dry = next(s for s in stages if s.classification is NO_DRY_PATH)
+    findings = retired_stage_disagreement(
+        stages, _retired(no_dry.name), today=_TODAY
+    )
+    assert any("contradictory" in f for f in findings), findings
+
+
+def test_manifest_disagreement_carries_the_retired_findings(stages, manifest):
+    """The retired grading is part of the one agreement check callers already
+    run (sweep, --derive-only, CI), not a separate opt-in."""
+    stale = {**manifest, **_retired("Backtester", re_exam="2020-01-01")}
+    assert any(
+        "passed its re_exam" in f for f in manifest_disagreement(stages, stale)
+    )

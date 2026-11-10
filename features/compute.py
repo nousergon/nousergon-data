@@ -38,6 +38,8 @@ import math
 import sys
 import time
 from datetime import datetime, timezone
+from collections.abc import Callable
+from typing import Any
 from pathlib import Path
 from typing import cast
 
@@ -380,7 +382,9 @@ class ReferenceMapUnavailable(RuntimeError):
     """
 
 
-def _load_sector_map(s3, bucket: str) -> dict[str, str]:
+def _load_sector_map(
+    s3: Any, bucket: str,  # pyright: ignore[reportExplicitAny] - untyped S3 SDK / recording client
+) -> dict[str, str]:
     """Load ticker -> sector ETF mapping from S3.
 
     Raises :class:`ReferenceMapUnavailable` on any failure
@@ -401,7 +405,9 @@ def _load_sector_map(s3, bucket: str) -> dict[str, str]:
         ) from exc
 
 
-def _load_sub_sector_etf_map(s3, bucket: str) -> dict[str, str]:
+def _load_sub_sector_etf_map(
+    s3: Any, bucket: str,  # pyright: ignore[reportExplicitAny] - untyped S3 SDK / recording client
+) -> dict[str, str]:
     """Load ticker -> sub-sector benchmark ETF mapping from S3 (config#934).
 
     Raises :class:`ReferenceMapUnavailable` on any failure
@@ -518,7 +524,8 @@ def _report_missing_daily_closes(
 
 
 def _load_delta_from_daily_closes(
-    s3, bucket: str, start_date: pd.Timestamp, end_date: pd.Timestamp,
+    s3: Any,  # pyright: ignore[reportExplicitAny] - untyped S3 SDK / recording client
+    bucket: str, start_date: pd.Timestamp, end_date: pd.Timestamp,
 ) -> dict[str, list[dict]]:
     """
     Load daily_closes parquets for every trading day in (start_date, end_date].
@@ -613,7 +620,9 @@ def _load_delta_from_daily_closes(
     return ticker_rows
 
 
-def _build_registry(s3, bucket: str):
+def _build_registry(
+    s3: Any, bucket: str,  # pyright: ignore[reportExplicitAny] - untyped S3 SDK / recording client
+) -> ca.CorporateActionRegistry | None:
     """Construct a ``CorporateActionRegistry`` from an S3 client + bucket, or
     ``None`` when no usable client is available.
 
@@ -636,7 +645,8 @@ def _build_registry(s3, bucket: str):
 
 
 def _detect_split_actions(
-    start_date, end_date, registry, *, run_id: str,
+    start_date: pd.Timestamp, end_date: pd.Timestamp,
+    registry: ca.CorporateActionRegistry | None, *, run_id: str,
 ) -> dict[str, list]:
     """AUTHORITATIVELY detect splits executing in ``[start_date, end_date]`` via
     polygon, persist each in the registry (write-if-absent), and group them by
@@ -811,8 +821,9 @@ def _fill_vwap_from_same_basis_delta(
 
 
 def _apply_daily_delta(
-    s3, bucket: str, date_str: str, price_data: dict[str, pd.DataFrame],
-    *, registry=None, override_base: bool = True,
+    s3: Any,  # pyright: ignore[reportExplicitAny] - untyped S3 SDK / recording client
+    bucket: str, date_str: str, price_data: dict[str, pd.DataFrame],
+    *, registry: ca.CorporateActionRegistry | None = None, override_base: bool = True,
 ) -> tuple[dict[str, pd.DataFrame], set[str]]:
     """
     Append daily_closes delta rows to price DataFrames.
@@ -918,7 +929,7 @@ def _apply_daily_delta(
     registered_splits: dict[str, list] = {}
     if registry is not None:
         actions_by_ticker = _detect_split_actions(
-            slim_last_date, today, registry,
+            slim_last_date, today, registry,  # pyright: ignore[reportUnknownArgumentType] - pandas normalize() is partially unknown
             run_id=f"apply_daily_delta:{date_str}",
         )
         try:
@@ -1066,7 +1077,9 @@ class ActionJumpAudit:
     suspected: dict[str, list[tuple[str, float]]]
 
 
-def _explaining_split(actions: list, jump_date: pd.Timestamp, ret: float):
+def _explaining_split(
+    actions: list[ca.CorporateAction], jump_date: pd.Timestamp, ret: float,
+) -> ca.CorporateAction | None:
     """Return the registered split action that EXPLAINS an un-flattened jump at
     ``jump_date`` (daily return ``ret``), or ``None``.
 
@@ -1097,7 +1110,7 @@ def _explaining_split(actions: list, jump_date: pd.Timestamp, ret: float):
 
 def audit_action_jumps(
     price_data: dict[str, pd.DataFrame],
-    registry,
+    registry: ca.CorporateActionRegistry | None,
     *,
     screen_threshold: float = _ACTION_JUMP_SCREEN_THRESHOLD,
 ) -> ActionJumpAudit:
@@ -1118,7 +1131,7 @@ def audit_action_jumps(
     be ``None`` — then no action can explain anything and every residual is
     ``suspected``.
     """
-    splits_by_ticker: dict[str, list] = {}
+    splits_by_ticker: dict[str, list[ca.CorporateAction]] = {}
     if registry is not None:
         try:
             for action in registry.list_actions(types=["split"]):
@@ -1217,14 +1230,14 @@ def _utc_moment() -> str:
 
 
 def _load_price_source(
-    s3,
+    s3: Any,  # pyright: ignore[reportExplicitAny] - untyped S3 SDK / recording client
     bucket: str,
     *,
     end: "pd.Timestamp | None" = None,
     before: "pd.Timestamp | None" = None,
     recorder: "InputRecorder | None" = None,
-    library_reader=None,
-) -> dict | None:
+    library_reader: Callable[..., dict[str, pd.DataFrame]] | None = None,
+) -> dict[str, pd.DataFrame] | None:
     """The ~full-universe price+macro symbol set from ArcticDB.
 
     Wave-4 terminal state (predictor/price_cache_slim deleted). This feeds
@@ -1315,14 +1328,14 @@ def _load_price_source(
 
 
 def _load_prices_and_macro(
-    s3,
+    s3: Any,  # pyright: ignore[reportExplicitAny] - untyped S3 SDK / recording client
     bucket: str,
     date_str: str,
     *,
-    registry_client=_SAME_CLIENT,
+    registry_client: Any = _SAME_CLIENT,  # pyright: ignore[reportExplicitAny] - S3 SDK client, None, or sentinel
     recorder: "InputRecorder | None" = None,
     exclude_trading_day_arctic_rows: bool = False,
-    price_source_loader=None,
+    price_source_loader: Callable[..., dict[str, pd.DataFrame] | None] | None = None,
 ) -> tuple[dict[str, pd.DataFrame], dict[str, pd.Series]]:
     """
     Load price data and macro series — ArcticDB primary, slim fallback
@@ -1393,7 +1406,9 @@ def _load_prices_and_macro(
     return price_data, macro
 
 
-def _load_cached_fundamentals(s3, bucket: str, date_str: str) -> dict[str, dict]:
+def _load_cached_fundamentals(
+    s3: Any, bucket: str, date_str: str,  # pyright: ignore[reportExplicitAny] - untyped S3 SDK / recording client
+) -> dict[str, dict[str, Any]]:  # pyright: ignore[reportExplicitAny] - cached fundamentals JSON
     """Load cached fundamental data from S3 (written by prior inference)."""
     # Try exact date, then scan for most recent
     for key in [
@@ -1560,7 +1575,9 @@ def _alt_entry_from_payload(ticker_data: dict) -> dict:
     }
 
 
-def _load_cached_alternative(s3, bucket: str) -> AlternativeLoad:
+def _load_cached_alternative(
+    s3: Any, bucket: str,  # pyright: ignore[reportExplicitAny] - untyped S3 SDK / recording client
+) -> AlternativeLoad:
     """Load cached alternative data from the most recent DataPhase2 output.
 
     Reads EVERY object under the partition, and reconciles what it loaded
@@ -1681,7 +1698,9 @@ def _load_cached_alternative(s3, bucket: str) -> AlternativeLoad:
         ) from exc
 
 
-def _expected_alternative_count(s3, bucket: str, prefix: str) -> int | None:
+def _expected_alternative_count(
+    s3: Any, bucket: str, prefix: str,  # pyright: ignore[reportExplicitAny] - untyped S3 SDK / recording client
+) -> int | None:
     """``tickers_succeeded`` from DataPhase2's manifest, or None if unreadable.
 
     The producer writes the manifest BEFORE its own quality gate can raise, so
@@ -1753,11 +1772,11 @@ def build_feature_frame(
     date_str: str,
     bucket: str,
     *,
-    s3,
-    registry_client=_SAME_CLIENT,
+    s3: Any,  # pyright: ignore[reportExplicitAny] - untyped S3 SDK / recording client
+    registry_client: Any = _SAME_CLIENT,  # pyright: ignore[reportExplicitAny] - S3 SDK client, None, or sentinel
     recorder: "InputRecorder | None" = None,
     exclude_trading_day_arctic_rows: bool = False,
-    price_source_loader=None,
+    price_source_loader: Callable[..., dict[str, pd.DataFrame] | None] | None = None,
 ) -> FeatureBuild:
     """Load every input and compute the full feature frame — everything but the write.
 
@@ -2417,7 +2436,7 @@ def compute_and_write(
 
 # ── CLI entry point ──────────────────────────────────────────────────────────
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(
         description="Compute and write feature store snapshots to S3",
     )

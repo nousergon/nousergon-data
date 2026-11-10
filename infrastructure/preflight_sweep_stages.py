@@ -64,12 +64,14 @@ definition is picked up without editing this file.
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
 import re
+from collections.abc import Iterator
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from infrastructure.sf_commands import UnresolvedReference, render_commands
 
@@ -166,7 +168,10 @@ class Stage:
 # ── Definition walking ───────────────────────────────────────────────────────
 
 
-def _iter_send_command_states(states: dict, prefix: str = ""):
+def _iter_send_command_states(
+    states: dict[str, Any],  # pyright: ignore[reportExplicitAny]
+    prefix: str = "",
+) -> Iterator[tuple[str, dict[str, Any]]]:  # pyright: ignore[reportExplicitAny]
     """Yield ``(qualified_name, state)`` for every ssm:sendCommand Task,
     descending into Parallel branches and Map item processors.
 
@@ -260,7 +265,7 @@ def _execution_timeout(state: dict) -> int | None:
 # ── Binding derivation ───────────────────────────────────────────────────────
 
 
-def _iter_strings(node: Any):
+def _iter_strings(node: Any) -> Iterator[str]:
     """Every string leaf of a parsed-JSON subtree, in document order.
 
     The intrinsics are scanned as the RAW strings they are in the definition.
@@ -673,6 +678,142 @@ def upstream_dependency_disagreement(stages: list[Stage], manifest: dict) -> lis
     return findings
 
 
+# ── Retired stages ───────────────────────────────────────────────────────────
+
+#: Every field a ``retired_stages`` entry must carry. An entry missing one is a
+#: blocking finding, not a half-applied skip: a retirement with no ruling, no
+#: start date, no tracker or no re-examination date is an exclusion nobody can
+#: age, which is the silent exclusion this manifest exists to prevent.
+_REQUIRED_RETIRED_FIELDS = ("ruling", "since", "tracker", "re_exam")
+
+
+def retired_stages(manifest: dict[str, object]) -> dict[str, dict[str, str]]:
+    """The DECLARED retired stages, keyed by stage name.
+
+    ``retired_stages`` is a map: stage name -> {ruling, since, tracker,
+    re_exam}. A stage here is NOT run by the sweep and is REPORTED as retired
+    on every surface (verdict row, non-blocking coverage finding, counter)
+    -- never silently dropped from the denominator. Only well-formed entries are
+    returned; a malformed one is reported by ``retired_stage_disagreement`` and
+    arms nothing, so a half-written declaration cannot skip a stage.
+    """
+    out: dict[str, dict[str, str]] = {}
+    raw = manifest.get("retired_stages")
+    if not isinstance(raw, dict):
+        return out
+    for name, entry in cast("dict[object, object]", raw).items():
+        if not isinstance(name, str) or _retired_entry_problems(entry):
+            continue
+        out[name] = cast("dict[str, str]", entry)
+    return out
+
+
+def _parse_iso_date(value: object) -> dt.date | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return dt.date.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _retired_entry_problems(entry: object) -> list[str]:
+    if not isinstance(entry, dict):
+        return ["is not an object"]
+    fields = cast("dict[str, object]", entry)
+    problems = [f"is missing {f}" for f in _REQUIRED_RETIRED_FIELDS if not fields.get(f)]
+    for f in ("since", "re_exam"):
+        value = fields.get(f)
+        if value and _parse_iso_date(value) is None:
+            problems.append(f"has {f}={value!r}, which is not an ISO YYYY-MM-DD date")
+    return problems
+
+
+def retirement_conflicts(stage: Stage, manifest: dict[str, object]) -> bool:
+    """A stage with no dry path, or acknowledged as dedicated-box, is already
+    accounted for. Checked against the DEFINITION-level classification and the
+    manifest, never against the sweep box's checkout: an UNSWEEPABLE stage whose
+    launcher merely is not cloned here is exactly the stage a retirement may
+    legitimately cover."""
+    if stage.classification == NO_DRY_PATH:
+        return True
+    raw = manifest.get("dedicated_box_stages")
+    if not isinstance(raw, list):
+        return False
+    dedicated = {
+        cast("dict[str, object]", e).get("stage")
+        for e in cast("list[object]", raw)
+        if isinstance(e, dict)
+    }
+    return stage.name in dedicated
+
+
+def retired_stage_disagreement(
+    stages: list[Stage], manifest: dict[str, object], today: dt.date | None = None
+) -> list[str]:
+    """Differences between the declared retired stages and the pipeline.
+
+    Every finding is blocking, and each closes a way a retirement could become
+    a silent exclusion:
+
+    * a malformed entry (missing ruling / since / tracker / re_exam, or a date
+      that does not parse) -- it is DROPPED, so the stage would still be swept;
+    * an entry naming a stage the definition no longer has -- the retirement
+      outlived its cause (the stage was removed: drop the entry);
+    * an entry naming a stage with no dry path or acknowledged as dedicated-box
+      -- it is already covered by ``no_dry_path_stages`` /
+      ``dedicated_box_stages`` and a second claim about the same stage is
+      contradictory;
+    * an entry whose ``re_exam`` date is in the past -- a retirement is a
+      dated decision, and one nobody re-examined must go loud rather than age
+      into permanence (an event-shaped trigger fires only if somebody notices).
+    """
+    today = today or dt.datetime.now(dt.timezone.utc).date()
+    by_name = {s.name: s for s in stages}
+    findings: list[str] = []
+    raw = manifest.get("retired_stages")
+    if raw is None:
+        return findings
+    if not isinstance(raw, dict):
+        return [
+            "retired_stages must be a map of stage name -> {ruling, since, tracker, "
+            f"re_exam}}, got {type(raw).__name__} -- it declares nothing and arms nothing"
+        ]
+    for name, entry in cast("dict[str, object]", raw).items():
+        problems = _retired_entry_problems(entry)
+        if problems:
+            findings.append(
+                f"retired_stages entry for {name!r} " + "; ".join(problems)
+                + " -- it is DROPPED, so the stage would still be swept (and alert)"
+            )
+            continue
+        stage = by_name.get(name)
+        if stage is None:
+            findings.append(
+                f"manifest retires stage {name!r}, which the definition does not "
+                "contain (renamed or removed) -- drop the stale entry"
+            )
+            continue
+        if retirement_conflicts(stage, manifest):
+            findings.append(
+                f"manifest retires stage {name!r}, but it is already accounted for as "
+                f"{'no_dry_path' if stage.classification == NO_DRY_PATH else 'a dedicated-box stage'}"
+                " -- a second claim about the same stage is contradictory; retire only a "
+                "stage the sweep would otherwise run"
+            )
+        fields = cast("dict[str, str]", entry)
+        re_exam = _parse_iso_date(fields["re_exam"])
+        if re_exam is not None and re_exam < today:
+            findings.append(
+                f"retired stage {name!r} passed its re_exam date {fields['re_exam']} "
+                f"(today {today.isoformat()}; ruling: {fields['ruling']}; tracker "
+                f"{fields['tracker']}) -- re-examine it: either the stage is gone "
+                "(remove it from step_function.json and drop the entry) or the retirement "
+                "stands (cut a new dated entry); an undated exclusion is a silent one"
+            )
+    return findings
+
+
 def manifest_disagreement(stages: list[Stage], manifest: dict) -> list[str]:
     """Differences between the derived no-dry-path set and the manifest.
 
@@ -735,6 +876,7 @@ def manifest_disagreement(stages: list[Stage], manifest: dict) -> list[str]:
             "entry: an acknowledgement that outlives its cause is a silent exclusion, "
             "and while it stands the sweep claims a gap it no longer has"
         )
+    findings += retired_stage_disagreement(stages, cast("dict[str, object]", manifest))
     for name in sorted(dedicated & acknowledged):
         findings.append(
             f"stage {name!r} is acknowledged in BOTH no_dry_path_stages and "
