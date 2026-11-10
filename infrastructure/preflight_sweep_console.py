@@ -60,7 +60,7 @@ import datetime as dt
 import json
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 # The fleet check-result envelope's own status vocabulary, read by the
 # console's checks-envelope adapter. Anything outside it renders UNREPORTED —
@@ -109,6 +109,11 @@ _VERDICT_TO_STATUS = {
     # it is why the row exists at all rather than the stage being absent from
     # the console (alpha-engine-config#7324).
     "no_dry_path": ENVELOPE_ATTENTION,
+    # A stage a ruling RETIRED (manifest `retired_stages`): declared, dated and
+    # not run. Not green -- nothing measures it -- and not an error: the gap is a
+    # reviewed decision, and a past re_exam date raises its own blocking finding.
+    # alpha-engine-config-I13374.
+    "retired": ENVELOPE_ATTENTION,
 }
 
 # An `unsweepable` stage has two very different causes, and the console must
@@ -255,6 +260,7 @@ def rollup_envelope(
     """
     declared = int(report.get("stages_declared", 0))
     no_dry_path = int(report.get("stages_no_dry_path", 0))
+    retired = int(report.get("stages_retired", 0) or 0)
     # The denominator the sweep is accountable for: every stage the definition
     # declares, MINUS the ones acknowledged in preflight_sweep_manifest.json as
     # having no dry path at all. That subtraction is the only one permitted,
@@ -295,7 +301,7 @@ def rollup_envelope(
         or unobserved
     ):
         status = ENVELOPE_ERROR
-    elif report.get("stages_unmeasured") or upstream_pending or dedicated_box or no_dry_path:
+    elif report.get("stages_unmeasured") or upstream_pending or dedicated_box or no_dry_path or retired:
         # Nothing is broken, but the sweep did not cover everything it declares.
         # Rendering that green is the failure mode this component exists to
         # avoid: "no data" is never green (principles.md §2.7).
@@ -326,6 +332,12 @@ def rollup_envelope(
         "stages_unsweepable_upstream_pending": upstream_pending,
         "stages_unsweepable_dedicated_box": dedicated_box,
         "stages_no_dry_path": no_dry_path,
+        "stages_retired": retired,
+        "retired_stages": [
+            r.get("stage")
+            for r in cast("list[dict[str, object]]", results)
+            if r.get("verdict") == "retired"
+        ],
         "stages_not_attempted": report.get("stages_not_attempted", 0),
         # Named, not counted: which stages have no dry path, and which have
         # been unsweepable long enough to be a finding in their own right.
@@ -358,6 +370,7 @@ def rollup_envelope(
             f"{upstream_pending} awaiting upstream, "
             f"{dedicated_box} on a dedicated box the sweep cannot reach, "
             f"{no_dry_path} with no dry path, "
+            f"{retired} retired, "
             f"{unobserved} unobserved of {expected} expected "
             f"({declared} declared, {no_dry_path} acknowledged as having no dry path). "
             + _PRECONDITION_SCOPE
