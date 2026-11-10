@@ -119,12 +119,13 @@ def test_every_alert_class_declares_its_chat_class_and_the_tier_follows(rows):
 
 
 def test_the_daily_digests_are_the_only_scheduled_chat_messages(rows):
-    """§7.2b: one order-book row and the pipelines rows are the only
+    """§7.2b: the order-book rows and the pipelines rows are the only
     notify-silent (non-email) rows; anything else there is a chat message
-    outside the four classes."""
+    outside the four classes. The v2 market open/close notices are order-book
+    rows by Brian's explicit ask (alpha-engine-config-I12024)."""
     silent = sorted(r["class"] for r in rows
                     if r["tier"] == "notify-silent" and r["class"] != "fleet_email_digests")
-    assert silent == sorted(["crucible_v2_morning_report",
+    assert silent == sorted(["crucible_v2_morning_report", "crucible_v2_market_open_close",
                              "data_collection_daily_report", "sf_completion_telegram"])
 
 

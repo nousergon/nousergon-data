@@ -1688,6 +1688,28 @@ alert_classes:
     # ruling, not an incident.
     tier: notify-silent
     chat: order-book
+  - class: crucible_v2_market_open_close
+    # alpha-engine-config-I12024 (Brian 2026-11-10: "I want to receive Telegram
+    # alerts when the market opens and when the market closes, along with the
+    # status of the order book and all of the related infrastructure"). Two
+    # notices a trading day from the trading box, crucible-executor
+    # executor/v2_market_alert.py on its own timers (09:40 and 16:07 ET):
+    # the order book and what came up at the open; the orders, the session's
+    # stop and the broker's open orders at the close. Each goes straight
+    # through krepis.telegram.send_message (never flow-doctor, so its daily cap
+    # cannot hold them) with KREPIS_EVENT_SOURCE set to this source in its
+    # systemd unit, so send_message's intake hook attributes every send here.
+    # A problem the notice finds rides the same once-a-day message as a
+    # Problem line with Impact / Auto-fix / You; a failed SEND pages through
+    # executor_trader_unit_failed, not this row.
+    source: "crucible-executor/v2-market-alert"
+    severities: [info]
+    intake: bus
+    response: drain-queue
+    # DECLARED notify-silent, chat order-book: the daily order-book / trading
+    # class of §7.2b, the same disposition as crucible_v2_morning_report.
+    tier: notify-silent
+    chat: order-book
 
   # ── data plane (nousergon-data) ──
   - class: data_collection_daily_report
