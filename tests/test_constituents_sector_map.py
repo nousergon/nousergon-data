@@ -889,9 +889,9 @@ def test_txcp_is_declared_financials_after_the_tcbi_rename() -> None:
     """2026-11-09: Texas Capital (TCBI) became TXCP on its move to TXSE and
     was withheld as an unclassifiable new member (alpha-engine-config-I13417)."""
     tickers = ["TXCP"]
-    sector_map: dict = {}
-    etf_map: dict = {}
-    fallback = {"TXCP": {"source": "yfinance", "error": "no GICS mapping"}}
+    sector_map: dict[str, str] = {}
+    etf_map: dict[str, str] = {}
+    fallback: dict[str, dict[str, str]] = {"TXCP": {"source": "yfinance", "error": "no GICS mapping"}}
     constituents._apply_sector_overrides(tickers, sector_map, etf_map, fallback, today="2026-11-12")
     assert sector_map == {"TXCP": "Financials"}
     assert etf_map == {"TXCP": constituents.GICS_TO_ETF["Financials"]}
