@@ -1711,6 +1711,31 @@ alert_classes:
     tier: notify-silent
     chat: order-book
 
+  - class: crucible_v2_session_watchdog
+    # alpha-engine-config-I12024 (Brian 2026-11-11: no holds -- fix it and keep
+    # trading the same day, without him). crucible-executor
+    # executor/v2_session_watchdog.py, every five minutes in the trading
+    # window on the trading box, restarts a dead or stalled v2 session up to
+    # its daily cap and stops a restarted one at the 16:05 hard stop. Each
+    # notice goes straight through krepis.telegram.send_message via
+    # notifier.send_trading_notice (never flow-doctor) with KREPIS_EVENT_SOURCE
+    # set to this source in its systemd unit. `info` = restarted / hard-stopped;
+    # `warning` = out of restarts, or deliberately not restarted (operator
+    # stop, kill switch, money-path chain) -- the message names the exact
+    # start command. A failed SEND exits non-zero and pages through the
+    # unit-failure path, not this row.
+    source: "crucible-executor/v2-session-watchdog"
+    severities: [info, warning]
+    intake: bus
+    response: drain-queue
+    # DECLARED notify-silent, chat order-book: the same trading-day disposition
+    # as crucible_v2_market_open_close. The schema has no per-severity tier;
+    # paging the "out of restarts" warning separately would be an
+    # episode_overrides entry, which is a routing decision for the Decision
+    # Queue, not this row.
+    tier: notify-silent
+    chat: order-book
+
   # ── data plane (nousergon-data) ──
   - class: data_collection_daily_report
     # alpha-engine-config-I12473. data_gate/report.py::deliver publishes the
