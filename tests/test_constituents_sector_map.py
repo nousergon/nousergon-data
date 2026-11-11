@@ -870,3 +870,29 @@ def test_vylr_override_is_ignored_outside_its_segments(today) -> None:
     sector_map: dict[str, str] = {}
     constituents._apply_sector_overrides(["VYLR"], sector_map, {}, {}, today=today)
     assert sector_map == {}
+
+
+def test_declared_overrides_are_well_formed() -> None:
+    """Every declared segment names a GICS sector the ETF map knows, with an
+    ordered ISO date range — a typo here would raise KeyError mid-run."""
+    import datetime as _dt
+
+    for ticker, segments in constituents._SECTOR_OVERRIDES.items():
+        assert segments, ticker
+        for gics, valid_from, valid_through, why in segments:
+            assert gics in constituents.GICS_TO_ETF, (ticker, gics)
+            assert _dt.date.fromisoformat(valid_from) <= _dt.date.fromisoformat(valid_through)
+            assert why.strip(), ticker
+
+
+def test_txcp_is_declared_financials_after_the_tcbi_rename() -> None:
+    """2026-11-09: Texas Capital (TCBI) became TXCP on its move to TXSE and
+    was withheld as an unclassifiable new member (alpha-engine-config-I13417)."""
+    tickers = ["TXCP"]
+    sector_map: dict = {}
+    etf_map: dict = {}
+    fallback = {"TXCP": {"source": "yfinance", "error": "no GICS mapping"}}
+    constituents._apply_sector_overrides(tickers, sector_map, etf_map, fallback, today="2026-11-12")
+    assert sector_map == {"TXCP": "Financials"}
+    assert etf_map == {"TXCP": constituents.GICS_TO_ETF["Financials"]}
+    assert fallback["TXCP"]["source"] == "declared_override"
