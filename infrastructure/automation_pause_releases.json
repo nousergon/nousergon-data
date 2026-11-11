@@ -26,9 +26,9 @@
     "release_when": "Brian rules on alpha-engine-config-I12715: delete with the v1 path at Crucible v2 phase 4 (alpha-engine-config-I9760), re-enable, or keep paused with a new re-exam. The issue that paused it (I6617, the 2026-08-07 ruling) is closed, so nothing else owns the switch back on."
   },
   "events:alpha-engine-eod-success-friday-shell-trigger": {
-    "issue": "alpha-engine-config-I9751",
+    "issue": "alpha-engine-config-I12715",
     "re_exam": "2026-12-02",
-    "release_when": "Brian's 2026-09-01 ruling (alpha-engine-config-I9751 item 3) holds the old weekly to one run a week for the duration of the v2 build. Re-enabling needs a fresh ruling; otherwise it is deleted with the v1 path."
+    "release_when": "Brian rules on alpha-engine-config-I12715: delete with the v1 path at Crucible v2 phase 4 (alpha-engine-config-I9760), re-enable, or keep paused with a new re-exam. The pausing ruling (2026-09-01, alpha-engine-config-I9751 item 3: old weekly at one run a week during the v2 build) is recorded on a closed issue, so nothing else owns the switch back on."
   },
   "events:alpha-engine-groom-sf-failure": {
     "issue": "alpha-engine-config-I12794",
