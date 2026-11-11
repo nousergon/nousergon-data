@@ -22,7 +22,7 @@ operator (ROADMAP follow-on for dashboard tile).
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Mapping
 
 SCHEMA_VERSION = "1.0.0"
 
@@ -65,7 +65,7 @@ RESOLUTION_TYPES: frozenset[str] = frozenset({
 _INCIDENT_REQUIRED = ("event_id", "ts_utc", "event_type", "severity", "subsystem", "summary")
 
 
-def validate_entry(entry: dict) -> list[str]:
+def validate_entry(entry: Mapping[str, object]) -> list[str]:
     """Return a list of validation errors for ``entry`` (empty = valid).
 
     Checks:
@@ -109,7 +109,7 @@ def validate_entry(entry: dict) -> list[str]:
 
 
 def _check_in_set(
-    entry: dict,
+    entry: Mapping[str, object],
     field: str,
     allowed: frozenset[str],
     errors: list[str],
@@ -135,6 +135,6 @@ def _check_in_set(
         )
 
 
-def is_valid(entry: dict) -> bool:
+def is_valid(entry: Mapping[str, object]) -> bool:
     """True iff ``validate_entry(entry)`` returns no errors."""
     return not validate_entry(entry)
