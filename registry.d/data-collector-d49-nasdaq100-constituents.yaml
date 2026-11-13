@@ -13,18 +13,11 @@ owning_repo: nousergon-data
 substrate: step-functions
 origin: ne-data-collection-panel
 owner: brian
-lifecycle: pending
+lifecycle: in-service
 parent_component: ne-data-collection-panel
 parent_component_reason: D49 runs as states inside the 'ne-data-collection-panel' state machine, so no
   discoverer can see this unit's own id; presence is judged on the state machine, never on the unit (alpha-engine-config-I12664).
   Derived from the unit descriptor's trigger.owner.
-lifecycle_owner: brian
-lifecycle_reexam: '2026-11-12'
-pending_since: '2026-10-29'
-promotes_when: the D49 unit descriptor's own successor (ne-data-collection-panel (alpha-engine-config-I11306);
-  no v1 predecessor, because v1 never published NDX membership) goes live
-lifecycle_reason: 'Generated from registry.d/units/D49-*.yaml (P-08): the unit descriptor itself declares
-  lifecycle: pending.'
 authority_tier: t1
 authority_tier_reason: 'A deterministic collector with no judgment: D49''s own code path (collectors/nasdaq100.py:328)
   writes only the key templates its unit descriptor names in writes[]. No branching on model output; no

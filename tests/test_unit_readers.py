@@ -194,7 +194,7 @@ def test_a_declared_off_row_on_a_pending_unit_is_not_parked(units):
         row["declared_off"] = {"since": "2026-10-02", "reason": "not scheduled yet"}
     store = EmptyStore()
     store.artifact_registry_source = _registry_source({"artifacts": rows, "grandfathered_paths": []})
-    unit = _unit(units, "D48")
+    unit = _unit(units, "D48", lifecycle="pending")
     assert unit.lifecycle == "pending"
     reading = unit_readers.read_artifact_registry(store, unit)
     assert reading.met, reading.detail
