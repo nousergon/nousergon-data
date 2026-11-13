@@ -31,6 +31,7 @@ _REPO = Path(__file__).resolve().parent.parent
 _RUNNER = (_REPO / "scripts" / "run_daily_news_standalone.sh").read_text()
 _INSTALLER = (_REPO / "infrastructure" / "install-daily-news.sh").read_text()
 _REQS = (_REPO / "requirements-daily-news.txt").read_text()
+_MAIN_REQS = (_REPO / "requirements.txt").read_text()
 
 
 def test_requirements_carry_the_rag_ingest_deps():
@@ -60,8 +61,13 @@ def test_requirements_carry_the_rag_ingest_deps():
         "the daily-news chain needs flow-doctor for krepis.logging's error handler "
         f"— requested extras: {sorted(_requested)}"
     )
-    assert "voyageai>=0.5.0" in _REQS, (
-        "voyageai has no lib extra; it mirrors requirements.txt's own pin"
+    # The pin is read from requirements.txt rather than spelled here, so a
+    # Dependabot bump of both files (the mirror kept) does not fail this test.
+    _main_pin = re.search(r"^voyageai\S*", _MAIN_REQS, re.M)
+    assert _main_pin, "requirements.txt must pin voyageai"
+    assert re.search(rf"^{re.escape(_main_pin.group(0))}$", _REQS, re.M), (
+        "voyageai has no lib extra; it mirrors requirements.txt's own pin "
+        f"({_main_pin.group(0)})"
     )
 
 
