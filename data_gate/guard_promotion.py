@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import datetime as dt
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypedDict, cast
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from data_gate.descriptors import Unit
@@ -79,6 +79,17 @@ RISK_TIERS: dict[str, str] = {
         "the guard maps to a descriptor guard class"
     ),
 }
+
+
+class _GuardRecord(TypedDict, total=False):
+    verdict: object
+    guard: object
+    name: object
+
+
+class _Manifest(TypedDict, total=False):
+    trigger: object
+    guards: list[_GuardRecord]
 
 
 @dataclass(frozen=True)
@@ -258,7 +269,10 @@ def read_promotion(
             latest = cs.cycles[0]
             verdicts = [
                 str(g.get("verdict"))
-                for _key, doc in latest.manifests.get(unit_id, [])
+                # Cycle manifests are decoded JSON and are untyped at this boundary.
+                for _key, doc in cast(
+                    dict[str, list[tuple[str, _Manifest]]], latest.manifests
+                ).get(unit_id, [])
                 if doc.get("trigger") == "scheduled"
                 for g in (doc.get("guards") or [])
                 if str(g.get("guard") or g.get("name") or "") == promotion.name

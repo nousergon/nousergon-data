@@ -22,6 +22,7 @@ import ast
 import fnmatch
 import pathlib
 from dataclasses import dataclass, field
+from typing import NotRequired, TypedDict, cast
 
 import yaml
 
@@ -30,6 +31,29 @@ from data_gate.descriptors import REPO_ROOT, Unit
 __all__ = ["InventoryReading", "WriterInventory", "load_inventory_scope", "scan"]
 
 SCOPE_PATH = REPO_ROOT / "data_gate" / "config" / "writer_inventory.yaml"
+
+
+class _PathParents(TypedDict):
+    path: str
+    parent_units: list[str]
+
+
+class _ExcludedPath(TypedDict):
+    glob: str
+
+
+class _UnverifiableUnit(TypedDict):
+    unit: str
+    reason: str
+
+
+class _InventoryDocument(TypedDict):
+    roots: list[str]
+    write_calls: NotRequired[dict[str, list[str]]]
+    shared_writers: NotRequired[list[_PathParents]]
+    excluded_paths: NotRequired[list[_ExcludedPath]]
+    extra_paths: NotRequired[list[_PathParents]]
+    no_python_write_site: NotRequired[list[_UnverifiableUnit]]
 
 
 @dataclass(frozen=True)
@@ -45,7 +69,10 @@ class WriterInventory:
 
 
 def load_inventory_scope(path: pathlib.Path | None = None) -> WriterInventory:
-    document = yaml.safe_load((path or SCOPE_PATH).read_text(encoding="utf-8"))
+    # PyYAML returns an untyped object at this configuration-file boundary.
+    document = cast(
+        _InventoryDocument, yaml.safe_load((path or SCOPE_PATH).read_text(encoding="utf-8"))
+    )
     calls: set[str] = set()
     for group in (document.get("write_calls") or {}).values():
         calls.update(group)

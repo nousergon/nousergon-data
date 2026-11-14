@@ -40,9 +40,9 @@ from __future__ import annotations
 import argparse
 import collections
 import json
-import pathlib
 import sys
-from typing import Any, Iterable
+from collections.abc import Iterable, Mapping
+from typing import Protocol, cast
 
 from data_gate.descriptors import REPO_ROOT, Unit, load_units
 from data_gate.sources import GATE_ROLE
@@ -51,8 +51,8 @@ from data_gate.unit_readers import (
     SimulateRow,
     ThrottledSimulation,
     UnattributableSimulation,
-    _error_code,
-    _simulate_one,
+    _error_code,  # pyright: ignore[reportPrivateUsage] - no public error-code helper exists
+    _simulate_one,  # pyright: ignore[reportPrivateUsage, reportUnknownVariableType] - untyped private reader helper
     identity_plan,
     load_identities,
 )
@@ -65,7 +65,15 @@ GRANT_SID = "DataGateSimulateWriterIdentities"
 REGENERATE = "python -m data_gate.simulate_plan roles --write"
 
 
-def board_plan(units: Iterable[Unit] | None = None, config: dict[str, Any] | None = None) -> list[SimulateRow]:
+class IamSimulator(Protocol):
+    def simulate_principal_policy(self, **kwargs: object) -> Mapping[str, object]: ...
+
+
+class Boto3Module(Protocol):
+    def client(self, service_name: str) -> object: ...
+
+
+def board_plan(units: Iterable[Unit] | None = None, config: dict[str, object] | None = None) -> list[SimulateRow]:
     """Every simulate call one full board read makes, in call order."""
     config = config if config is not None else load_identities()
     rows: list[SimulateRow] = []
@@ -82,7 +90,7 @@ def simulated_roles(rows: Iterable[SimulateRow]) -> dict[str, list[str]]:
     return {role: sorted(units) for role, units in sorted(by_role.items())}
 
 
-def roles_document(units: Iterable[Unit] | None = None, config: dict[str, Any] | None = None) -> dict[str, Any]:
+def roles_document(units: Iterable[Unit] | None = None, config: dict[str, object] | None = None) -> dict[str, object]:
     config = config if config is not None else load_identities()
     rows = board_plan(units, config)
     account = str(config["account_id"])
@@ -110,11 +118,11 @@ def roles_document(units: Iterable[Unit] | None = None, config: dict[str, Any] |
     }
 
 
-def render(document: dict[str, Any]) -> str:
+def render(document: Mapping[str, object]) -> str:
     return json.dumps(document, indent=2, sort_keys=False) + "\n"
 
 
-def run_live(rows: list[SimulateRow], client) -> list[tuple[SimulateRow, str]]:
+def run_live(rows: list[SimulateRow], client: IamSimulator) -> list[tuple[SimulateRow, str]]:
     """``[(row, decision)]`` against live IAM. A call that fails is recorded by its error code."""
     account_by_role: dict[str, str] = {}
     out: list[tuple[SimulateRow, str]] = []
@@ -132,7 +140,7 @@ def run_live(rows: list[SimulateRow], client) -> list[tuple[SimulateRow, str]]:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="data_gate.simulate_plan", description=__doc__.split("\n\n")[0])
+    parser = argparse.ArgumentParser(prog="data_gate.simulate_plan", description=cast(str, __doc__).split("\n\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
     rows = sub.add_parser("rows", help="print every simulate row one board read makes")
     rows.add_argument("--json", action="store_true")
@@ -170,10 +178,10 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         sys.stdout.write(text)
         return 0
-    import boto3  # deferred: `rows`/`roles` must run without AWS libraries configured
+    import boto3  # pyright: ignore[reportMissingTypeStubs]  # deferred: `rows`/`roles` must run without AWS libraries configured
 
     plan = [row for row in board_plan() if not args.role or row.role in args.role]
-    results = run_live(plan, boto3.client("iam"))
+    results = run_live(plan, cast(IamSimulator, cast(Boto3Module, boto3).client("iam")))
     tally: collections.Counter[tuple[str, str]] = collections.Counter()
     for row, decision in results:
         tally[(row.role, decision)] += 1
