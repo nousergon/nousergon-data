@@ -62,7 +62,6 @@ from weekly_run_report import (
 )
 from nousergon_lib.flow_doctor_fleet import (
     FleetTelegramTopic,
-    PIPELINE_OBSERVER_TELEGRAM_TOPICS,
 )
 
 logger = logging.getLogger()
@@ -70,6 +69,13 @@ logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
 REGION = os.environ.get("AWS_REGION", "us-east-1")
 _FLOW_NAME = "sf-telegram-notifier"
+# The one daily pipelines message goes to ONE topic, whatever the outcome.
+# It used to fan out to PIPELINE_OBSERVER_TELEGRAM_TOPICS, whose per-topic
+# severity filters split the outcomes: an all-green day (info) reached only
+# the Pipeline topic, a day with a failure (warning) reached Pipeline AND
+# Ops health. Brian 2026-11-14: whatever gets one outcome gets the other.
+# Pipeline accepts both info and warning, so both outcomes land there alone.
+_DAY_MESSAGE_TOPICS: tuple[FleetTelegramTopic, ...] = (FleetTelegramTopic.PIPELINE,)
 _DB_BASENAME = "flow_doctor_sf_telegram_notifier"
 
 _SF_LABELS: dict[str, str] = {
@@ -134,7 +140,7 @@ def build_flow_doctor_config_for_tests() -> dict:
     """Expose config builder for fleet wiring contract tests."""
     return build_flow_doctor_config(
         _FLOW_NAME,
-        PIPELINE_OBSERVER_TELEGRAM_TOPICS,
+        _DAY_MESSAGE_TOPICS,
         db_basename=_DB_BASENAME,
         rate_limit_exempt_severities=_RATE_LIMIT_EXEMPT_SEVERITIES,
     )
@@ -855,7 +861,7 @@ def _send_day_message(detail: dict[str, object], *, closer_concern: str | None =
             severity="warning" if failed else "info",
             dedup_key=f"{_FLOW_NAME}:day:{day_key}",
             flow_name=_FLOW_NAME,
-            topics=PIPELINE_OBSERVER_TELEGRAM_TOPICS,
+            topics=_DAY_MESSAGE_TOPICS,
             db_basename=_DB_BASENAME,
             # Out of the shared daily budget, and guaranteed to land: a once-a-day
             # result that is suppressed reads exactly like a day that never ran
