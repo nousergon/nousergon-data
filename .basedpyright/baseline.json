@@ -115118,6 +115118,14 @@
             {
                 "code": "reportUnknownVariableType",
                 "range": {
+                    "startColumn": 37,
+                    "endColumn": 62,
+                    "lineCount": 1
+                }
+            },
+            {
+                "code": "reportUnknownVariableType",
+                "range": {
                     "startColumn": 8,
                     "endColumn": 12,
                     "lineCount": 1
@@ -248574,6 +248582,14 @@
                 "range": {
                     "startColumn": 67,
                     "endColumn": 82,
+                    "lineCount": 1
+                }
+            },
+            {
+                "code": "reportUnknownVariableType",
+                "range": {
+                    "startColumn": 33,
+                    "endColumn": 58,
                     "lineCount": 1
                 }
             },
