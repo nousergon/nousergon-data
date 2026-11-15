@@ -24,13 +24,18 @@ from __future__ import annotations
 import json
 import sys
 from datetime import datetime, timezone
+from typing import Any, Iterator, cast
+
+# A raw JSON object: a Step Functions history event, execution, definition or
+# state. Its values are whatever the JSON held.
+_Json = dict[str, Any]  # pyright: ignore[reportExplicitAny] — raw JSON object
 
 
 # ---------------------------------------------------------------------------
 # Execution-history parsing (pure functions — unit-tested over fixtures)
 # ---------------------------------------------------------------------------
 
-def entered_states(events: list[dict]) -> set:
+def entered_states(events: list[dict]) -> set[str]:
     return {
         e["stateEnteredEventDetails"]["name"]
         for e in events
@@ -38,7 +43,7 @@ def entered_states(events: list[dict]) -> set:
     }
 
 
-def execution_input(events: list[dict]) -> dict:
+def execution_input(events: list[dict]) -> _Json:
     for e in events:
         d = e.get("executionStartedEventDetails")
         if d is not None:
@@ -46,7 +51,7 @@ def execution_input(events: list[dict]) -> dict:
     raise SystemExit("FATAL: history carries no ExecutionStarted event — cannot recover the original input.")
 
 
-def initialize_input_output(events: list[dict]) -> dict | None:
+def initialize_input_output(events: list[dict]) -> _Json | None:
     """The merged object an ``InitializeInput`` Pass state emitted — the
     authoritative source of the run_date every subsequent stage actually
     keyed its artifacts on, for the SFs that have one (weekly, daily). The
@@ -63,7 +68,7 @@ def initialize_input_output(events: list[dict]) -> dict | None:
     return None
 
 
-def apply_normalized_run_date_output(events: list[dict]) -> dict | None:
+def apply_normalized_run_date_output(events: list[dict]) -> _Json | None:
     """The merged object ``ApplyNormalizedRunDate`` emitted after
     ``NormalizeRunDates`` — the cycle's TRADING day on ``$.run_date``
     (alpha-engine-config-I8809). This is the key every artifact prefix and
@@ -155,41 +160,43 @@ def derive_calendar_date(events: list[dict], start_time: datetime | None) -> tup
 # Role-gating verification against a live SF definition
 # ---------------------------------------------------------------------------
 
-def _walk_states(states: dict):
+def _walk_states(states: _Json) -> Iterator[tuple[str, _Json]]:
     for name, state in states.items():
         yield name, state
         if state.get("Type") == "Parallel":
             for branch in state.get("Branches", []):
                 yield from _walk_states(branch.get("States", {}))
         if state.get("Type") == "Map":
-            it = state.get("Iterator") or state.get("ItemProcessor") or {}
+            it: _Json = state.get("Iterator") or state.get("ItemProcessor") or {}
             yield from _walk_states(it.get("States", {}))
 
 
-def _rule_role_values(rule: dict) -> tuple[bool, set]:
+def _rule_role_values(rule: _Json) -> tuple[bool, set[str]]:
     """Return (references_pipeline_role, {StringEquals values on it})."""
     refs = False
-    values: set = set()
+    values: set[str] = set()
 
-    def rec(node):
+    def rec(node: object) -> None:
         nonlocal refs
         if isinstance(node, dict):
-            if node.get("Variable") == "$.pipeline_role":
+            rule_node = cast("_Json", node)
+            if rule_node.get("Variable") == "$.pipeline_role":
                 refs = True
-                if "StringEquals" in node:
-                    values.add(node["StringEquals"])
+                if "StringEquals" in rule_node:
+                    values.add(rule_node["StringEquals"])
             for key in ("And", "Or"):
-                for sub in node.get(key, []) or []:
+                subs: list[object] = rule_node.get(key, []) or []
+                for sub in subs:
                     rec(sub)
-            if "Not" in node:
-                rec(node["Not"])
+            if "Not" in rule_node:
+                rec(rule_node["Not"])
 
     rec(rule)
     return refs, values
 
 
 def verify_skip_flags_live(
-    definition: dict,
+    definition: _Json,
     role: str,
     *,
     sf_label: str = "the weekly SF",
@@ -210,7 +217,7 @@ def verify_skip_flags_live(
     tests/test_weekly_sf_rerun.py, which only asserts the 'role gating'
     substring) are unaffected by this parameterization.
     """
-    offenders = []
+    offenders: list[tuple[str, list[str]]] = []
     for name, state in _walk_states(definition.get("States", {})):
         if not name.startswith("CheckSkip") or state.get("Type") != "Choice":
             continue
@@ -233,10 +240,14 @@ def verify_skip_flags_live(
 # AWS plumbing (thin, injectable, read-only)
 # ---------------------------------------------------------------------------
 
-def fetch_history(sf, execution_arn: str) -> list[dict]:
-    events, token = [], None
+def fetch_history(
+    sf: Any,  # pyright: ignore[reportExplicitAny] — untyped boto3 client
+    execution_arn: str,
+) -> list[_Json]:
+    events: list[_Json] = []
+    token: str | None = None
     while True:
-        kwargs = {"executionArn": execution_arn, "maxResults": 1000}
+        kwargs: dict[str, str | int] = {"executionArn": execution_arn, "maxResults": 1000}
         if token:
             kwargs["nextToken"] = token
         resp = sf.get_execution_history(**kwargs)
@@ -246,10 +257,16 @@ def fetch_history(sf, execution_arn: str) -> list[dict]:
             return events
 
 
-def list_all_executions(sf, sm_arn: str, status_filter: str | None = None, cap: int = 1000) -> list[dict]:
-    out, token = [], None
+def list_all_executions(
+    sf: Any,  # pyright: ignore[reportExplicitAny] — untyped boto3 client
+    sm_arn: str,
+    status_filter: str | None = None,
+    cap: int = 1000,
+) -> list[_Json]:
+    out: list[_Json] = []
+    token: str | None = None
     while len(out) < cap:
-        kwargs = {"stateMachineArn": sm_arn, "maxResults": 200}
+        kwargs: dict[str, str | int] = {"stateMachineArn": sm_arn, "maxResults": 200}
         if status_filter:
             kwargs["statusFilter"] = status_filter
         if token:
@@ -262,7 +279,10 @@ def list_all_executions(sf, sm_arn: str, status_filter: str | None = None, cap: 
     return out[:cap]
 
 
-def effective_run_date_of(sf, execution: dict) -> str:
+def effective_run_date_of(
+    sf: Any,  # pyright: ignore[reportExplicitAny] — untyped boto3 client
+    execution: _Json,
+) -> str:
     """Best-effort run_date of a (typically RUNNING) execution, for the
     same-run_date double-writer guard every rerun helper's ``--start`` path
     runs before dispatch. Falls back to the UTC date of the execution's own

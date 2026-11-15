@@ -148,12 +148,17 @@ def manifest_key(report_day: dt.date) -> str:
 #: is (correctly) not granted on `arcticdb/*`.
 _ARCTICDB_PREFIXES = ("arcticdb/", "arcticdb:")
 
+# A raw JSON object: a parity report or adjudication record body, a manifest
+# entry, or an S3 response field. Its values are whatever the JSON held.
+_Json = dict[str, Any]  # pyright: ignore[reportExplicitAny] — raw JSON object
+_JsonMap = Mapping[str, Any]  # pyright: ignore[reportExplicitAny] — raw JSON object, read-only
 
-def _is_s3_object_key(key: Any) -> bool:
+
+def _is_s3_object_key(key: object) -> bool:
     return isinstance(key, str) and bool(key) and not key.startswith(_ARCTICDB_PREFIXES)
 
 
-def report_references(report: Mapping[str, Any], report_key: str) -> list[Reference]:
+def report_references(report: _JsonMap, report_key: str) -> list[Reference]:
     """Every object version a report's EXCEPTIONS compared.
 
     Per non-passing S3 row: v1's live key (by the manifest version id the
@@ -172,31 +177,34 @@ def report_references(report: Mapping[str, Any], report_key: str) -> list[Refere
         vid = version_id if isinstance(version_id, str) and version_id and version_id != "null" else None
         out.append(Reference(str(key), vid, None if vid else as_of, f"{report_key}#{why}"))
 
-    for row in report.get("keys") or []:
+    rows: list[_Json] = report.get("keys") or []
+    for row in rows:
         key = row.get("key")
         verdict = str(row.get("verdict") or "")
         if verdict and verdict not in _PASSING and row.get("comparator") != "arcticdb":
             add(key, (row.get("live_version") or {}).get("manifest_version_id"), f"{key}:live")
             add(row.get("shadow_key"), None, f"{key}:shadow")
-        prior = row.get("prior_day_settled") or {}
+        prior: _Json = row.get("prior_day_settled") or {}
         if prior.get("available") and prior.get("settled") is False:
             add(prior.get("key"), None, f"{key}:prior_day_settled.live")
             add(prior.get("shadow_key"), None, f"{key}:prior_day_settled.shadow")
     return out
 
 
-def record_references(record: Mapping[str, Any], record_key: str) -> list[Reference]:
+def record_references(record: _JsonMap, record_key: str) -> list[Reference]:
     """Every version an adjudication record cites: each settling input's v1
     ``source_key``@``source_version_id``, and a v1-later settled read's own."""
     out: list[Reference] = []
-    for entry in record.get("exceptions") or []:
+    entries: list[_Json] = record.get("exceptions") or []
+    for entry in entries:
         exc_key = entry.get("key")
-        for item in entry.get("inputs") or []:
+        items: list[_Json] = entry.get("inputs") or []
+        for item in items:
             ident = item.get("id")
             if _is_s3_object_key(item.get("source_key")) and item.get("source_version_id"):
                 out.append(Reference(item["source_key"], str(item["source_version_id"]), None,
                                      f"{record_key}#{exc_key}:{ident}:v1_read"))
-            settled = item.get("settled") or {}
+            settled: _Json = item.get("settled") or {}
             if _is_s3_object_key(settled.get("source_key")) and settled.get("source_version_id"):
                 out.append(Reference(settled["source_key"], str(settled["source_version_id"]), None,
                                      f"{record_key}#{exc_key}:{ident}:settled"))
@@ -209,11 +217,11 @@ class EvidenceVault(Protocol):
 
     dry_run: bool
 
-    def list_versions(self, key: str) -> list[dict]: ...
-    def head_version(self, key: str, version_id: str) -> dict: ...
+    def list_versions(self, key: str) -> list[_Json]: ...
+    def head_version(self, key: str, version_id: str) -> _Json: ...
     def list_retained(self, prefix: str) -> set[str]: ...
-    def head_retained(self, key: str) -> dict: ...
-    def copy_version(self, source_key: str, version_id: str, dest_key: str, metadata: dict) -> dict: ...
+    def head_retained(self, key: str) -> _Json: ...
+    def copy_version(self, source_key: str, version_id: str, dest_key: str, metadata: dict[str, str]) -> _Json: ...
     def get_retained(self, key: str) -> bytes | None: ...
     def put_retained(self, key: str, payload: bytes) -> None: ...
 
@@ -221,22 +229,29 @@ class EvidenceVault(Protocol):
 class S3EvidenceVault:
     """`EvidenceVault` over the data_collection store's own bucket."""
 
-    def __init__(self, client, bucket: str, store_prefix: str, *, dry_run: bool = False) -> None:
+    def __init__(
+        self,
+        client: Any,  # pyright: ignore[reportExplicitAny] — untyped boto3 client
+        bucket: str,
+        store_prefix: str,
+        *,
+        dry_run: bool = False,
+    ) -> None:
         self.client = client
         self.bucket = bucket
         self.store_prefix = store_prefix.strip("/")
         self.dry_run = dry_run
 
     @classmethod
-    def for_store(cls, store) -> "S3EvidenceVault":
+    def for_store(cls, store: Any) -> "S3EvidenceVault":  # pyright: ignore[reportExplicitAny] — an S3Store; its client is an untyped boto3 client
         return cls(store.client, store.bucket, store.prefix, dry_run=bool(getattr(store, "dry_run", False)))
 
     def _full(self, key: str) -> str:
         return f"{self.store_prefix}/{key}" if self.store_prefix else key
 
-    def list_versions(self, key: str) -> list[dict]:
-        out: list[dict] = []
-        kwargs = {"Bucket": self.bucket, "Prefix": key}
+    def list_versions(self, key: str) -> list[_Json]:
+        out: list[_Json] = []
+        kwargs: dict[str, str] = {"Bucket": self.bucket, "Prefix": key}
         while True:
             page = self.client.list_object_versions(**kwargs)
             for item in page.get("Versions") or []:
@@ -247,7 +262,7 @@ class S3EvidenceVault:
                 return out
             kwargs.update(KeyMarker=page["NextKeyMarker"], VersionIdMarker=page["NextVersionIdMarker"])
 
-    def head_version(self, key: str, version_id: str) -> dict:
+    def head_version(self, key: str, version_id: str) -> _Json:
         resp = self.client.head_object(Bucket=self.bucket, Key=key, VersionId=version_id)
         return {"ETag": str(resp.get("ETag") or "").strip('"'), "Size": resp.get("ContentLength"),
                 "LastModified": resp.get("LastModified")}
@@ -261,11 +276,11 @@ class S3EvidenceVault:
                 out.add(item["Key"][cut:])
         return out
 
-    def head_retained(self, key: str) -> dict:
+    def head_retained(self, key: str) -> _Json:
         resp = self.client.head_object(Bucket=self.bucket, Key=self._full(key))
         return {"ETag": str(resp.get("ETag") or "").strip('"'), "Metadata": dict(resp.get("Metadata") or {})}
 
-    def copy_version(self, source_key: str, version_id: str, dest_key: str, metadata: dict) -> dict:
+    def copy_version(self, source_key: str, version_id: str, dest_key: str, metadata: dict[str, str]) -> _Json:
         resp = self.client.copy_object(
             Bucket=self.bucket,
             Key=self._full(dest_key),
@@ -290,7 +305,7 @@ class S3EvidenceVault:
         self.client.put_object(Bucket=self.bucket, Key=self._full(key), Body=payload, ContentType="application/json")
 
 
-def _iso(value: Any) -> str | None:
+def _iso(value: object) -> str | None:
     if isinstance(value, dt.datetime):
         if value.tzinfo is None:
             value = value.replace(tzinfo=dt.timezone.utc)
@@ -305,13 +320,13 @@ def _parse_utc(value: str) -> dt.datetime:
     return parsed.astimezone(dt.timezone.utc)
 
 
-def _as_utc(value: Any) -> dt.datetime:
+def _as_utc(value: object) -> dt.datetime:
     if isinstance(value, dt.datetime):
         return value if value.tzinfo else value.replace(tzinfo=dt.timezone.utc)
     return _parse_utc(str(value))
 
 
-def _comparable(manifest: Mapping[str, Any] | None) -> Any:
+def _comparable(manifest: _JsonMap | None) -> _Json | None:
     if not manifest:
         return None
     return {k: v for k, v in manifest.items() if k != "updated_utc"}
@@ -341,7 +356,7 @@ def preserve(
     resolutions: dict[tuple[str, str], str] = {
         (r["source_key"], r["as_of_utc"]): r["version_id"] for r in (previous or {}).get("resolutions") or []
     }
-    objects: dict[tuple[str, str], dict] = {
+    objects: dict[tuple[str, str], _Json] = {
         (o["source_key"], o["source_version_id"]): dict(o) for o in (previous or {}).get("objects") or []
     }
 
@@ -396,7 +411,7 @@ def preserve(
                 failures.append(f"{dest}: present but unreadable: {type(exc).__name__}: {exc}")
                 continue
             meta_vid = held["Metadata"].get(META_SOURCE_VERSION_ID)
-            source: dict | None = None
+            source: _Json | None = None
             if meta_vid is not None:
                 if meta_vid != vid:
                     failures.append(f"{dest}: retained copy says source-version-id {meta_vid!r}, not {vid!r}")
@@ -488,7 +503,7 @@ def preserve(
 
 
 def preserve_graded_parity(
-    store,
+    store: Any,  # pyright: ignore[reportExplicitAny] — a data_gate store; S3-only attributes are probed with hasattr
     *,
     trading_day: dt.date,
     vault: EvidenceVault | None = None,
