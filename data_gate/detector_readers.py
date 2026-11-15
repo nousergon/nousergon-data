@@ -52,7 +52,8 @@ Same three-way honesty as every reader in this package:
 from __future__ import annotations
 
 import datetime as dt
-from typing import Any
+from collections.abc import Iterable, Mapping, Sequence
+from typing import TypeGuard, cast
 
 from nousergon_lib.gates import read_store_document
 
@@ -102,20 +103,28 @@ def receipt_key(unit: Unit, kind: str) -> str:
     return RECEIPT_KEY.format(unit_id=unit.unit_id, kind=kind)
 
 
-def _row_id(entry: Any) -> str:
+def _is_json_object(value: object) -> TypeGuard[dict[str, object]]:
+    """``isinstance(value, dict)``: a decoded JSON/YAML mapping, keyed by field name."""
+    return isinstance(value, dict)
+
+
+def _row_id(entry: object) -> str:
     """`feature_store_freshness_sentinel (indirect, depends_on)` -> the id."""
     text = str(entry).strip()
     return text.split()[0].rstrip(",") if text else ""
 
 
-def _as_list(value: Any) -> list[str]:
+def _as_list(value: object) -> list[str]:
     if value is None or value == "":
         return []
-    values = value if isinstance(value, (list, tuple)) else [value]
+    # A list/tuple out of the descriptor YAML: its items are whatever YAML decoded.
+    values: Sequence[object] = (
+        cast("Sequence[object]", value) if isinstance(value, (list, tuple)) else [value]
+    )
     return [str(v).strip() for v in values if str(v).strip()]
 
 
-def expected_subjects(unit: Unit, detector: dict[str, Any]) -> tuple[str, ...]:
+def expected_subjects(unit: Unit, detector: Mapping[str, object]) -> tuple[str, ...]:
     """The subjects a receipt for ``detector`` may name. Empty: none is checkable.
 
     An explicit ``subject:`` on the detector entry always wins, for every family:
@@ -126,13 +135,14 @@ def expected_subjects(unit: Unit, detector: dict[str, Any]) -> tuple[str, ...]:
         return tuple(declared)
     rule = DETECTOR_FAMILIES.get(str(detector.get("kind") or ""))
     if rule == _SUBJECT_FROM_REGISTRY_ROWS:
-        return tuple(r for r in (_row_id(e) for e in unit.raw.get("registry_rows") or []) if r)
+        rows: Iterable[object] = unit.raw.get("registry_rows") or []
+        return tuple(r for r in (_row_id(e) for e in rows) if r)
     if rule == _SUBJECT_FROM_VIA:
         return tuple(_as_list(detector.get("via")))
     return ()
 
 
-def _parse_utc(stamp: Any) -> dt.datetime | None:
+def _parse_utc(stamp: object) -> dt.datetime | None:
     if not stamp:
         return None
     try:
@@ -142,14 +152,16 @@ def _parse_utc(stamp: Any) -> dt.datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.timezone.utc)
 
 
-def _receipt_problems(unit: Unit, kind: str, document: dict[str, Any], subjects: tuple[str, ...]) -> list[str]:
+def _receipt_problems(unit: Unit, kind: str, document: Mapping[str, object], subjects: tuple[str, ...]) -> list[str]:
     """Every way ``document`` fails to prove induce -> fire on the right subject -> clear."""
     problems: list[str] = []
     if document.get("schema") != RECEIPT_SCHEMA:
         problems.append(f"schema {document.get('schema')!r}, expected {RECEIPT_SCHEMA!r}")
     if str(document.get("unit_id") or "") != unit.unit_id:
         problems.append(f"unit_id {document.get('unit_id')!r} is not {unit.unit_id!r}")
-    recorded_kind = str((document.get("detector") or {}).get("kind") or "")
+    # Read unchecked, as it always was: a non-mapping `detector` raises here.
+    recorded_detector = cast("Mapping[str, object]", document.get("detector") or {})
+    recorded_kind = str(recorded_detector.get("kind") or "")
     if recorded_kind != kind:
         problems.append(f"detector.kind {recorded_kind!r} is not {kind!r}")
     outcome = str(document.get("outcome") or "")
@@ -158,10 +170,10 @@ def _receipt_problems(unit: Unit, kind: str, document: dict[str, Any], subjects:
             f"outcome {outcome!r}: only an `induced` record is evidence the detector fired"
         )
 
-    blocks = {name: document.get(name) for name in ("induced", "fired", "cleared")}
+    blocks: dict[str, object] = {name: document.get(name) for name in ("induced", "fired", "cleared")}
     stamps: dict[str, dt.datetime] = {}
     for name, block in blocks.items():
-        if not isinstance(block, dict):
+        if not _is_json_object(block):
             problems.append(f"no `{name}` record (§9.1 records all three: induced, fired, cleared)")
             continue
         at = _parse_utc(block.get("at"))
@@ -170,9 +182,9 @@ def _receipt_problems(unit: Unit, kind: str, document: dict[str, Any], subjects:
         else:
             stamps[name] = at
     induced, fired, cleared = blocks["induced"], blocks["fired"], blocks["cleared"]
-    if isinstance(induced, dict) and not str(induced.get("condition") or "").strip():
+    if _is_json_object(induced) and not str(induced.get("condition") or "").strip():
         problems.append("`induced.condition` is empty: the record does not say what was broken")
-    if isinstance(fired, dict):
+    if _is_json_object(fired):
         if not str(fired.get("evidence") or "").strip():
             problems.append("`fired.evidence` is empty: nothing shows the alert arrived")
         subject = str(fired.get("subject") or "").strip()
@@ -180,7 +192,7 @@ def _receipt_problems(unit: Unit, kind: str, document: dict[str, Any], subjects:
             problems.append("`fired.subject` is empty: the alert's subject was not recorded")
         elif subject not in subjects:
             problems.append(f"fired on subject {subject!r}, which is not {unit.unit_id}'s ({list(subjects)})")
-    if isinstance(cleared, dict) and not str(cleared.get("evidence") or "").strip():
+    if _is_json_object(cleared) and not str(cleared.get("evidence") or "").strip():
         problems.append("`cleared.evidence` is empty: nothing shows the detector stood down")
     if "induced" in stamps and "fired" in stamps and stamps["fired"] < stamps["induced"]:
         problems.append("fired before the fault was induced: the alert was not caused by it")
@@ -189,7 +201,7 @@ def _receipt_problems(unit: Unit, kind: str, document: dict[str, Any], subjects:
     return problems
 
 
-def _read_one(store: GateStore, unit: Unit, detector: dict[str, Any]) -> Reading:
+def _read_one(store: GateStore, unit: Unit, detector: Mapping[str, object]) -> Reading:
     """One declared detector's receipt."""
     kind = str(detector.get("kind") or "").strip()
     key = receipt_key(unit, kind or "<undeclared-kind>")
@@ -226,7 +238,8 @@ def _read_one(store: GateStore, unit: Unit, detector: dict[str, Any]) -> Reading
         )
     document = read.document or {}
     subjects = expected_subjects(unit, detector)
-    as_of = str((document.get("cleared") or {}).get("at") or "") if isinstance(document.get("cleared"), dict) else ""
+    cleared = document.get("cleared")
+    as_of = str((cleared or {}).get("at") or "") if _is_json_object(cleared) else ""
     if not subjects:
         return Reading(
             met=False,
@@ -276,7 +289,8 @@ def read_detector(store: GateStore, unit: Unit) -> Reading:
     excluded = partial_exclusion_reading(unit, "detector")
     if excluded is not None:
         return excluded
-    detectors = [d for d in (unit.raw.get("detectors") or []) if isinstance(d, dict)]
+    declared: Iterable[object] = unit.raw.get("detectors") or []
+    detectors = [d for d in declared if _is_json_object(d)]
     ref = f"registry.d/units/{unit.path.name}"
     if not detectors:
         return Reading(

@@ -28,7 +28,7 @@ import yaml
 
 from data_gate.descriptors import REPO_ROOT, Unit
 
-__all__ = ["InventoryReading", "WriterInventory", "load_inventory_scope", "scan"]
+__all__ = ["InventoryReading", "WriterInventory", "declared_code_files", "load_inventory_scope", "scan"]
 
 SCOPE_PATH = REPO_ROOT / "data_gate" / "config" / "writer_inventory.yaml"
 
@@ -129,7 +129,7 @@ def _write_calls_in(source: str, scope: WriterInventory) -> list[str]:
     return found
 
 
-def _declared_code_files(unit: Unit) -> list[str]:
+def declared_code_files(unit: Unit) -> list[str]:
     """The in-repo Python files a descriptor's ``code_path`` names.
 
     ``code_path`` is human prose with `path:line` entries separated by commas —
@@ -154,7 +154,7 @@ def scan(units: list[Unit], scope: WriterInventory | None = None) -> InventoryRe
 
     claimed: dict[str, list[str]] = {}
     for unit in units:
-        for file in _declared_code_files(unit):
+        for file in declared_code_files(unit):
             claimed.setdefault(file, []).append(unit.unit_id)
     for mapping in (scope.shared_writers, scope.extra_paths):
         for path, parents in mapping.items():
@@ -199,7 +199,7 @@ def scan(units: list[Unit], scope: WriterInventory | None = None) -> InventoryRe
         if unit.unit_id in scope.no_python_write_site:
             reading.units_unverifiable[unit.unit_id] = scope.no_python_write_site[unit.unit_id]
             continue
-        files = _declared_code_files(unit)
+        files = declared_code_files(unit)
         if not files:
             reading.units_unverifiable[unit.unit_id] = (
                 "its code_path names no in-repo Python file, so an AST scan cannot check "
