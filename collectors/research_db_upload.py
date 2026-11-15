@@ -35,6 +35,7 @@ stop being backed up without any run going red.
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 log = logging.getLogger(__name__)
 
@@ -52,7 +53,7 @@ def backup_key(run_date: str) -> str:
     return BACKUP_KEY_TEMPLATE.format(date=run_date)
 
 
-def upload_research_db(s3, db_path: str, bucket: str, run_date: str) -> dict:
+def upload_research_db(s3: Any, db_path: str, bucket: str, run_date: str) -> dict[str, str]:  # pyright: ignore[reportExplicitAny]  # untyped boto3 S3 client (no stubs); a Protocol rejects the caller's client
     """Upload ``db_path`` to BOTH the live pointer and the dated backup.
 
     Raises on either failure — see the module docstring. Returns the two keys
