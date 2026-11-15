@@ -51,11 +51,12 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from typing import Any
 
 import requests
 
-from nousergon_lib.http_retry import request_with_retry
-from nousergon_lib.secrets import get_secret
+from krepis.http_retry import request_with_retry  # pyright: ignore[reportUnknownVariableType]  # krepis annotates its `params` as a bare `dict`
+from krepis.secrets import get_secret
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +75,7 @@ _FINNHUB_MAX_ATTEMPTS = 3
 _TIMEOUT = 10
 
 
-def finnhub_get(endpoint: str, params: dict | None = None) -> dict | list:
+def finnhub_get(endpoint: str, params: dict[str, str] | None = None) -> dict[str, Any] | list[Any]:  # pyright: ignore[reportExplicitAny]  # raw Finnhub JSON body
     """Rate-limited Finnhub GET with bounded transient-error retry.
 
     Returns the parsed JSON response (dict for object-shaped endpoints,

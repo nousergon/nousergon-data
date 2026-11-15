@@ -99,7 +99,7 @@ class GateDecision:
     agreement_bps: Optional[float]         # observed max pairwise spread in bps (None if <2 usable)
     tolerance_bps: float
     provenance: str                        # compact audit string for L4 surfacing
-    discrepancy: Optional[dict] = field(default=None)  # populated on QUARANTINE for the discrepancy lake
+    discrepancy: Optional[dict[str, object]] = field(default=None)  # populated on QUARANTINE for the discrepancy lake
 
     @property
     def flagged(self) -> bool:
@@ -185,7 +185,7 @@ def evaluate(
             ),
         )
 
-    prices = [c.price for c in usable]  # all > 0 by ``usable``
+    prices = [c.price for c in usable if c.price is not None]  # all > 0 by ``usable``
     spread_bps = _pairwise_max_bps(prices)
     detail = " ".join(f"{c.source}={c.price:.4f}" for c in usable)
 
@@ -205,7 +205,7 @@ def evaluate(
     # Disagreement beyond tolerance — QUARANTINE. We deliberately do NOT pick a
     # source; emitting None forces the caller to flag/hold rather than build NAV
     # on an unreconciled single-source outlier (the config#1276 failure class).
-    discrepancy = {
+    discrepancy: dict[str, object] = {
         "ticker": ticker,
         "date": date,
         "spread_bps": round(spread_bps, 4),

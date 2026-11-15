@@ -40,7 +40,6 @@ is what the production fetch_data wiring (PR F) will call.
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import logging
@@ -243,12 +242,6 @@ class AsyncNewsAggregator:
 
         sem = self._semaphore_for(source.name)
 
-        async def _call():
-            async with sem:
-                return await anyio.to_thread.run_sync(
-                    source.fetch, tickers, lambda: hours,
-                )
-
         # tenacity AsyncRetrying — wraps the call with exp backoff.
         # We retry on any non-RetryError exception. Authentication
         # errors propagate after final attempt (loud failure).
@@ -295,6 +288,6 @@ class AsyncNewsAggregator:
         """Run one adapter under the per-vendor semaphore. Adapters are
         sync; offload to thread via anyio."""
         async with sem:
-            def _call_with_hours():
+            def _call_with_hours() -> list[NewsArticle]:
                 return source.fetch(tickers, hours=hours)
             return await anyio.to_thread.run_sync(_call_with_hours)
