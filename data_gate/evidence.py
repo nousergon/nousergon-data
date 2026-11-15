@@ -29,6 +29,7 @@ import datetime as dt
 import json
 import pathlib
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
 from nousergon_lib.gates import LADDER_KEY, DocumentRead, GateStore, read_store_document
@@ -49,6 +50,9 @@ from data_gate.cadence import (
     unit_cadence,
 )
 from data_gate.descriptors import REPO_ROOT, Unit
+
+if TYPE_CHECKING:
+    from data_gate.parity_adjudication import Adjudication
 
 __all__ = [
     "BASE_REQUIREMENTS",
@@ -79,6 +83,7 @@ __all__ = [
     "read_run_record",
     "read_stack_check_live",
     "manifests_since",
+    "parse_utc",
     "STACK_CHECK_LIVE_SCHEMA",
     "STACK_CHECK_LIVE_MAX_AGE",
 ]
@@ -480,7 +485,7 @@ def _probe_written_at(document: dict) -> dt.datetime | None:
     (`collectors/arctic_probe.py::build_probe_record`); ``as_of`` is accepted for
     records that predate that name."""
     stamp = document.get("as_of_utc") or document.get("as_of")
-    return _parse_utc(stamp) if stamp else None
+    return parse_utc(stamp) if stamp else None
 
 
 def _probe_after_run(
@@ -680,7 +685,7 @@ def _cadence_note(cadence: Cadence) -> str:
     )
 
 
-def _parse_utc(stamp: object) -> dt.datetime | None:
+def parse_utc(stamp: object) -> dt.datetime | None:
     try:
         parsed = dt.datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
     except ValueError:
@@ -750,7 +755,7 @@ def manifests_since(
     docs, problems = _read_keys(store, sorted(keys))
     selected: list[tuple[str, dict]] = []
     for key, doc in docs:
-        started = _parse_utc(doc.get("started"))
+        started = parse_utc(doc.get("started"))
         folder = _day_folder(key)
         if started is not None:
             if since <= started <= as_of:
@@ -1006,7 +1011,7 @@ def read_run_record(
         probe_day = dt.date.fromisoformat(recorded[-1]) if recorded else trading_day
     except ValueError:
         probe_day = trading_day
-    finishes = [f for m in manifests if (f := _parse_utc(m.get("finished"))) is not None]
+    finishes = [f for m in manifests if (f := parse_utc(m.get("finished"))) is not None]
     probe = _read_arctic_probe(
         store,
         unit,
@@ -1225,7 +1230,7 @@ def read_pit(store: GateStore, unit: Unit, *, trading_day: dt.date, now: dt.date
     failing: list[str] = []
     finishes: list[dt.datetime] = []
     for manifest in cycle.manifests:
-        finished = _parse_utc(manifest.get("finished"))
+        finished = parse_utc(manifest.get("finished"))
         if finished is not None:
             finishes.append(finished)
         stamps = {}
@@ -1796,7 +1801,7 @@ def read_stack_check_live(store: GateStore, *, now: dt.datetime | None = None) -
             unmeasurable=True,
             **common,
         )
-    stamp = _parse_utc(as_of) if as_of else None
+    stamp = parse_utc(as_of) if as_of else None
     if stamp is None or now - stamp > STACK_CHECK_LIVE_MAX_AGE:
         return Reading(
             met=False,
@@ -2319,7 +2324,7 @@ def read_parity(store: GateStore, *, trading_day: dt.date) -> Reading:
     )
 
 
-def _read_parity_adjudication(store: GateStore, report_key: str, report_day: dt.date, report: dict):
+def _read_parity_adjudication(store: GateStore, report_key: str, report_day: dt.date, report: dict) -> Adjudication | None:
     """The graded newest adjudication record for ``report_key``, or ``None`` if none exists.
 
     A record that cannot be listed or read is graded INVALID, never skipped —
