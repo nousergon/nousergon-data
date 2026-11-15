@@ -84,7 +84,9 @@ import subprocess
 import sys
 import time
 from datetime import UTC, datetime
+from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import Any, cast
 
 import boto3
 import yaml
@@ -92,6 +94,9 @@ import yaml
 HERE = Path(__file__).parent.resolve()
 sys.path.insert(0, str(HERE))
 import automation_pause as ap  # noqa: E402
+
+# Manifest JSON, registry YAML and AWS CLI/boto3 responses are untyped JSON.
+JsonDict = dict[str, Any]  # pyright: ignore[reportExplicitAny]  # raw manifest / registry / AWS response JSON
 
 REGION = ap.REGION
 REGISTRY_BUCKET = "alpha-engine-research"
@@ -132,7 +137,7 @@ logger = logging.getLogger(__name__)
 
 # ── register 3: live AWS ─────────────────────────────────────────────────────
 
-def _aws_json(args: list[str]) -> dict:
+def _aws_json(args: list[str]) -> JsonDict:
     proc = subprocess.run(
         ["aws"] + args + ["--region", REGION, "--output", "json"],
         capture_output=True, text=True, check=False,
@@ -145,7 +150,7 @@ def _aws_json(args: list[str]) -> dict:
     return json.loads(proc.stdout)
 
 
-def live_triggers() -> list[dict]:
+def live_triggers() -> list[JsonDict]:
     """Every trigger in the account, both surfaces, with its live state.
 
     `aws events list-rule*` and `aws scheduler list-schedules` are DISJOINT
@@ -166,7 +171,7 @@ def live_triggers() -> list[dict]:
     check over the manifest that governs which fleet automation may run — was
     itself down for two days.
     """
-    out: list[dict] = []
+    out: list[JsonDict] = []
     for page in _paginate(["events", "list-rules"], "Rules"):
         # `event_driven`: a rule with an EventPattern and no ScheduleExpression
         # fires only when its event occurs, so its target's silence is not
@@ -182,7 +187,7 @@ def live_triggers() -> list[dict]:
     return sorted(out, key=lambda t: (t["surface"], t["name"]))
 
 
-def _paginate(cmd: list[str], key: str):
+def _paginate(cmd: list[str], key: str) -> Iterator[JsonDict]:
     token: str | None = None
     while True:
         args = list(cmd)
@@ -201,7 +206,7 @@ def _paginate(cmd: list[str], key: str):
 SETTLE_POLL_SECONDS = 30
 
 
-def _join_key(t: dict) -> tuple[str, str]:
+def _join_key(t: JsonDict) -> tuple[str, str]:
     """(surface, name-as-a-finding-names-it) — the qualified ``group/name`` for a
     Scheduler schedule outside the default group, as direction A reports it."""
     group = t.get("group") if t["surface"] == "scheduler" else None
@@ -209,9 +214,11 @@ def _join_key(t: dict) -> tuple[str, str]:
     return t["surface"], name
 
 
-def settle(first: list[dict], findings: list[dict], budget_s: float, *,
-           enumerate_=None, sleep=time.sleep, clock=time.monotonic,
-           poll_s: float = SETTLE_POLL_SECONDS) -> list[dict] | None:
+def settle(first: list[JsonDict], findings: list[JsonDict], budget_s: float, *,
+           enumerate_: Callable[[], list[JsonDict]] | None = None,
+           sleep: Callable[[float], None] = time.sleep,
+           clock: Callable[[], float] = time.monotonic,
+           poll_s: float = SETTLE_POLL_SECONDS) -> list[JsonDict] | None:
     """A fresh live snapshot if a trigger named by a finding MOVED within
     ``budget_s``, else None (alpha-engine-config-I7118 follow-up, 2026-10-03).
 
@@ -238,7 +245,7 @@ def settle(first: list[dict], findings: list[dict], budget_s: float, *,
         return None
     before = {k: v for k, v in ((_join_key(t), t["state"]) for t in first) if k in watched}
     deadline = clock() + budget_s
-    fresh: list[dict] | None = None
+    fresh: list[JsonDict] | None = None
     while clock() < deadline:
         sleep(poll_s)
         snap = enumerate_()
@@ -285,7 +292,7 @@ def sf_invoked_functions() -> set[str]:
 INVOCATION_WINDOW_DAYS = 14
 
 
-def window_start(manifest: dict, days: int = INVOCATION_WINDOW_DAYS):
+def window_start(manifest: JsonDict, days: int = INVOCATION_WINDOW_DAYS) -> datetime:
     """The earliest instant an invocation may count as evidence.
 
     **A trailing window alone is wrong, and measurably so.** The declarations
@@ -311,7 +318,7 @@ def window_start(manifest: dict, days: int = INVOCATION_WINDOW_DAYS):
     return max(trailing, ruled + datetime.timedelta(days=1))
 
 
-def lambda_invocations(function_name: str, since=None) -> float:
+def lambda_invocations(function_name: str, since: datetime | None = None) -> float:
     """AWS/Lambda Invocations for a function over the trailing window.
 
     **This is why direction C is not a trigger-map inference.** Measured
@@ -349,7 +356,7 @@ def _is_state_machine(arn: str) -> bool:
     return bool(arn) and arn.startswith("arn:aws:states:") and ":stateMachine:" in arn
 
 
-def states_executions(state_machine_arn: str, since=None) -> float:
+def states_executions(state_machine_arn: str, since: datetime | None = None) -> float:
     """AWS/States ExecutionsStarted for a state machine over the trailing window.
 
     The Step Functions counterpart of `lambda_invocations`. A Scheduler schedule
@@ -424,7 +431,7 @@ def is_ephemeral_one_shot(name: str, group: str = DEFAULT_SCHEDULE_GROUP) -> boo
     return got.get("ActionAfterCompletion") == "DELETE"
 
 
-def trigger_targets(trigger: dict) -> list[str]:
+def trigger_targets(trigger: JsonDict) -> list[str]:
     """The ARNs a trigger invokes. Empty is a legitimate answer (a rule whose
     targets were removed), and is reported as such rather than skipped.
 
@@ -441,7 +448,7 @@ def trigger_targets(trigger: dict) -> list[str]:
 
 # ── register 2: the published observability registry ─────────────────────────
 
-def load_registry(local_dir: Path | None = None) -> dict[str, dict]:
+def load_registry(local_dir: Path | None = None) -> dict[str, JsonDict]:
     """component_id -> row, from S3 (or a local directory, for tests).
 
     Reads the SAME copy the console reads. A local checkout of
@@ -454,7 +461,7 @@ def load_registry(local_dir: Path | None = None) -> dict[str, dict]:
         blobs = {p.name: p.read_text(encoding="utf-8") for p in sorted(local_dir.glob("*.yaml"))}
     else:
         blobs = _fetch_registry_from_s3()
-    rows: dict[str, dict] = {}
+    rows: dict[str, JsonDict] = {}
     for name, text in blobs.items():
         row = yaml.safe_load(text)
         if not isinstance(row, dict) or not row.get("component_id"):
@@ -483,19 +490,19 @@ def _fetch_registry_from_s3() -> dict[str, str]:
                 for p in sorted(Path(tmp).glob("*.yaml"))}
 
 
-def _lifecycle(row: dict | None) -> str | None:
+def _lifecycle(row: JsonDict | None) -> str | None:
     return (row or {}).get("lifecycle")
 
 
-def _declares_off(row: dict | None) -> bool:
+def _declares_off(row: JsonDict | None) -> bool:
     return _lifecycle(row) in NON_SERVICE_LIFECYCLES
 
 
-def _cites_the_manifest(row: dict | None) -> bool:
+def _cites_the_manifest(row: JsonDict | None) -> bool:
     return "automation_pause" in str((row or {}).get("lifecycle_reason") or "")
 
 
-def _rows_for_target(rows: dict[str, dict], arn: str) -> list[dict]:
+def _rows_for_target(rows: dict[str, JsonDict], arn: str) -> list[JsonDict]:
     """Registry rows whose component IS the thing this ARN names.
 
     Joined on the resource name at the tail of the ARN — the registry's
@@ -518,18 +525,18 @@ def _rows_for_target(rows: dict[str, dict], arn: str) -> list[dict]:
 # ── the reconciliation ───────────────────────────────────────────────────────
 
 def reconcile(
-    manifest: dict | None = None,
-    rows: dict[str, dict] | None = None,
-    triggers: list[dict] | None = None,
-    targets_of=None,
+    manifest: JsonDict | None = None,
+    rows: dict[str, JsonDict] | None = None,
+    triggers: list[JsonDict] | None = None,
+    targets_of: Callable[[JsonDict], list[str]] | None = None,
     sf_invoked: set[str] | None = None,
-    invocations_of=None,
-    alarm_actions_of=None,
-    alarm_breaching_of=None,
-    is_ephemeral=None,
-    noted: list[dict] | None = None,
-    executions_of=None,
-) -> list[dict]:
+    invocations_of: Callable[[str], float] | None = None,
+    alarm_actions_of: Callable[[str], bool | None] | None = None,
+    alarm_breaching_of: Callable[[str], bool] | None = None,
+    is_ephemeral: Callable[..., bool] | None = None,
+    noted: list[JsonDict] | None = None,
+    executions_of: Callable[[str], float] | None = None,
+) -> list[JsonDict]:
     """Every disagreement between the three registers.
 
     Arguments are injectable so tests exercise the whole comparison without AWS
@@ -559,6 +566,7 @@ def reconcile(
     rediscovers it from scratch, so the exclusion renders even though it never
     reaches the exit code.
     """
+    m: JsonDict
     m = manifest if manifest is not None else ap.load_manifest()
     reg = rows if rows is not None else load_registry()
     trigs = triggers if triggers is not None else live_triggers()
@@ -594,7 +602,7 @@ def reconcile(
 
     paused = ap.paused_names(m)          # paused + pending
     kept = ap.kept_names(m)
-    findings: list[dict] = []
+    findings: list[JsonDict] = []
 
     # ── direction A: a live trigger nobody's register accounts for ──────────
     for t in trigs:
@@ -848,7 +856,7 @@ def reconcile(
     # cached field, so an un-pause (a trigger's entry removed from `paused`)
     # changes what this direction reports on its very next read.
     for entry in ap.alarm_entries(m):
-        name = entry["name"]
+        name = cast(str, entry["name"])
         justified = ap.alarm_justified(entry, m)
         live = alarm_actions_of(name)
         if live is None:
@@ -888,12 +896,12 @@ def reconcile(
     # The declaration's own shape, offline (alpha-engine-config-I8047). Kept in
     # `automation_pause` and merely re-exported into this verdict rather than
     # re-derived: a second copy of the grammar is a second place to loosen it.
-    findings.extend(ap.declaration_findings(m))
+    findings.extend(ap.declaration_findings(m))  # pyright: ignore[reportUnknownArgumentType]  # automation_pause returns bare list[dict]
 
     return sorted(findings, key=lambda f: (f["kind"], f["trigger"]))
 
 
-def declared_alarm_gaps(manifest: dict | None = None) -> list[dict]:
+def declared_alarm_gaps(manifest: JsonDict | None = None) -> list[JsonDict]:
     """Every currently-justified `paused_alarms` entry, as a declared gap.
 
     Property 2 of alpha-engine-config-I7174: a paused component's silenced
@@ -904,6 +912,7 @@ def declared_alarm_gaps(manifest: dict | None = None) -> list[dict]:
     row stays informative on every green run instead of going silent about the
     one thing worth knowing while the 2026-08-07/08-12 pause holds.
     """
+    m: JsonDict
     m = manifest if manifest is not None else ap.load_manifest()
     return [
         {
@@ -922,7 +931,7 @@ def declared_alarm_gaps(manifest: dict | None = None) -> list[dict]:
 
 # ── the verdict, made readable without opening the log (I7547 deliverable 3) ─
 
-def headline(findings: list[dict], checked: int, error: str | None = None) -> str:
+def headline(findings: list[JsonDict], checked: int, error: str | None = None) -> str:
     """One line, ≤ a job title, that says WHICH kind of red this is.
 
     `pause-reconcile.yml` uses this as the name of the job that carries the
@@ -942,7 +951,7 @@ def headline(findings: list[dict], checked: int, error: str | None = None) -> st
             + ", ".join(kinds))
 
 
-def annotation(findings: list[dict], checked: int, error: str | None = None) -> str:
+def annotation(findings: list[JsonDict], checked: int, error: str | None = None) -> str:
     """The same verdict as a GitHub workflow-command annotation.
 
     Annotations render at the top of the run page and on the check itself, so
@@ -959,8 +968,8 @@ def annotation(findings: list[dict], checked: int, error: str | None = None) -> 
             + " | ".join(f"[{f['kind']}] {f['surface']}:{f['trigger']}" for f in findings))
 
 
-def render_markdown(findings: list[dict], checked: int, registry_rows: int,
-                    gaps: list[dict] | None = None, noted: list[dict] | None = None,
+def render_markdown(findings: list[JsonDict], checked: int, registry_rows: int,
+                    gaps: list[JsonDict] | None = None, noted: list[JsonDict] | None = None,
                     error: str | None = None) -> str:
     """The run summary, as Markdown rather than as the raw `--json` blob.
 
@@ -1002,7 +1011,7 @@ def render_markdown(findings: list[dict], checked: int, registry_rows: int,
     return "\n".join(out)
 
 
-def write_github_output(path: Path, findings: list[dict], checked: int,
+def write_github_output(path: Path, findings: list[JsonDict], checked: int,
                         error: str | None = None) -> None:
     """`$GITHUB_OUTPUT` key/values the workflow turns into a job name.
 
@@ -1019,8 +1028,8 @@ def write_github_output(path: Path, findings: list[dict], checked: int,
 
 # ── the console row ──────────────────────────────────────────────────────────
 
-def publish(findings: list[dict], checked: int, dry_run: bool = False,
-            declared_gaps: list[dict] | None = None) -> str | None:
+def publish(findings: list[JsonDict], checked: int, dry_run: bool = False,
+            declared_gaps: list[JsonDict] | None = None) -> str | None:
     """This detector's own row on the console (observability-policy.md §2.2).
 
     A detector that reports nowhere is unobserved, and a green run is exactly as
@@ -1099,7 +1108,7 @@ def publish_error(error: str, dry_run: bool = False) -> str | None:
     return fcr.emit(env, dry_run=dry_run)
 
 
-def publish_paused_lanes(manifest: dict | None = None, dry_run: bool = False) -> str | None:
+def publish_paused_lanes(manifest: JsonDict | None = None, dry_run: bool = False) -> str | None:
     """Publish the machine-readable declared-pause set (alpha-engine-config-I8189).
 
     A DATA artifact, not this check's own status envelope — deliberately a
@@ -1170,7 +1179,7 @@ def main() -> int:
                           "the workflow passes it on push only")
     args = ap_.parse_args()
 
-    noted: list[dict] = []
+    noted: list[JsonDict] = []
     try:
         triggers = live_triggers()
         rows = load_registry(args.registry_dir)
