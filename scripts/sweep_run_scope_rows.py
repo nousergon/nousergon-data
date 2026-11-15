@@ -61,14 +61,19 @@ import json
 import pathlib
 import re
 import sys
+import types
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 LAMBDA_DIR = _REPO_ROOT / "infrastructure" / "lambdas" / "weekly-run-scope"
 
+# A raw JSON object: an S3 artifact body, a Step Functions history event or a
+# re-derived scope row. Its values are whatever JSON held.
+_Json = dict[str, Any]  # pyright: ignore[reportExplicitAny] — raw JSON object
 
-def _load_run_scope():
+
+def _load_run_scope() -> types.ModuleType:
     """The Lambda's own derivation, loaded by path rather than copied.
 
     By path, not by putting the Lambda directory on ``sys.path``: that
@@ -111,20 +116,20 @@ class SweepWriteConflict(RuntimeError):
 # ---------------------------------------------------------------------------
 
 
-def cut_at_scope(history: list[dict], scope_state: str = rs.SCOPE_STATE) -> list[dict] | None:
+def cut_at_scope(history: list[_Json], scope_state: str = rs.SCOPE_STATE) -> list[_Json] | None:
     """The history up to and including the first ``scope_state`` entry.
 
     That is what the Lambda read when it wrote its row. ``None`` when the
     execution never entered ``scope_state``, so it never wrote a row either.
     """
     for index, event in enumerate(history):
-        details = event.get("stateEnteredEventDetails") or {}
+        details: _Json = event.get("stateEnteredEventDetails") or {}
         if event.get("type") == "TaskStateEntered" and details.get("name") == scope_state:
             return history[: index + 1]
     return None
 
 
-def row_authors(stored: dict) -> list[str]:
+def row_authors(stored: _Json) -> list[str]:
     """Every execution that wrote this cycle's artifact, row authors first.
 
     The authors of the stored rows (``recorded_by_execution_arn``, else the
@@ -150,8 +155,11 @@ def row_authors(stored: dict) -> list[str]:
     return authors
 
 
-def _history(states, execution_arn: str) -> list[dict]:
-    events: list[dict] = []
+def _history(
+    states: Any,  # pyright: ignore[reportExplicitAny] — untyped boto3 client
+    execution_arn: str,
+) -> list[_Json]:
+    events: list[_Json] = []
     paginator = states.get_paginator("get_execution_history")
     for page in paginator.paginate(
         executionArn=execution_arn, includeExecutionData=False, reverseOrder=False,
@@ -160,7 +168,12 @@ def _history(states, execution_arn: str) -> list[dict]:
     return events
 
 
-def rederive(states, execution_arn: str, run_date: str, recorded_at: str) -> tuple[dict | None, str]:
+def rederive(
+    states: Any,  # pyright: ignore[reportExplicitAny] — untyped boto3 client
+    execution_arn: str,
+    run_date: str,
+    recorded_at: str,
+) -> tuple[_Json | None, str]:
     """``(scope, note)`` for one execution, re-derived with the current code.
 
     Read-only: three ``states:Describe*``/``Get*`` calls. Returns ``(None,
@@ -198,7 +211,7 @@ def rederive(states, execution_arn: str, run_date: str, recorded_at: str) -> tup
     return scope, f"re-derived from {len(cut)} events"
 
 
-def cycle_target(scopes: Iterable[dict]) -> dict | None:
+def cycle_target(scopes: Iterable[_Json]) -> _Json | None:
     """The cycle's corrected rows: the re-derived scopes, accumulated by the
     handler's own rule, so a stage one author failed and another completed
     stays completed."""
@@ -213,7 +226,7 @@ def cycle_target(scopes: Iterable[dict]) -> dict | None:
 # ---------------------------------------------------------------------------
 
 
-def _summary(row: Any) -> dict:
+def _summary(row: Any) -> _Json:  # pyright: ignore[reportExplicitAny] — a stored row may be any JSON value
     row = row if isinstance(row, dict) else {}
     return {
         "disposition": row.get("disposition"),
@@ -224,12 +237,12 @@ def _summary(row: Any) -> dict:
     }
 
 
-def classify(stored: dict, target: dict | None, stages: Iterable[str] | None = None) -> list[dict]:
+def classify(stored: _Json, target: _Json | None, stages: Iterable[str] | None = None) -> list[_Json]:
     """One finding per stored row (or per ``stages``), held vs corrected."""
     wanted = set(stages) if stages else None
-    target_rows = (target or {}).get("stages") or {}
-    after_scope = (target or {}).get("after_scope") or {}
-    findings = []
+    target_rows: _Json = (target or {}).get("stages") or {}
+    after_scope: _Json = (target or {}).get("after_scope") or {}
+    findings: list[_Json] = []
     for name, held in sorted((stored.get("stages") or {}).items()):
         if wanted is not None and name not in wanted:
             continue
@@ -255,7 +268,7 @@ def classify(stored: dict, target: dict | None, stages: Iterable[str] | None = N
     return findings
 
 
-def corrected_artifact(stored: dict, target: dict, findings: list[dict], swept_at: str) -> dict:
+def corrected_artifact(stored: _Json, target: _Json, findings: list[_Json], swept_at: str) -> _Json:
     """The stored artifact with its ``upgrade`` rows replaced, via the merge.
 
     The incoming body is the stored one carrying only the corrected rows, so
@@ -268,7 +281,7 @@ def corrected_artifact(stored: dict, target: dict, findings: list[dict], swept_a
     for finding in findings:
         if finding["kind"] != UPGRADE:
             continue
-        row = copy.deepcopy(target["stages"][finding["stage"]])
+        row: _Json = copy.deepcopy(target["stages"][finding["stage"]])
         row["corrected_by"] = {
             "sweep": SWEEP_ID,
             "swept_at": swept_at,
@@ -299,10 +312,14 @@ def corrected_artifact(stored: dict, target: dict, findings: list[dict], swept_a
 # ---------------------------------------------------------------------------
 
 
-def stored_keys(s3, bucket: str, run_dates: list[str] | None) -> list[str]:
+def stored_keys(
+    s3: Any,  # pyright: ignore[reportExplicitAny] — untyped boto3 client
+    bucket: str,
+    run_dates: list[str] | None,
+) -> list[str]:
     if run_dates:
         return [KEY_TEMPLATE.format(run_date=d) for d in sorted(set(run_dates))]
-    keys = []
+    keys: list[str] = []
     for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=PREFIX):
         for obj in page.get("Contents", []) or []:
             if _KEY_RE.match(obj["Key"]):
@@ -310,7 +327,11 @@ def stored_keys(s3, bucket: str, run_dates: list[str] | None) -> list[str]:
     return sorted(keys)
 
 
-def read_artifact(s3, bucket: str, key: str) -> tuple[dict, str]:
+def read_artifact(
+    s3: Any,  # pyright: ignore[reportExplicitAny] — untyped boto3 client
+    bucket: str,
+    key: str,
+) -> tuple[_Json, str]:
     response = s3.get_object(Bucket=bucket, Key=key)
     body = json.loads(response["Body"].read())
     if not isinstance(body, dict):
@@ -318,7 +339,13 @@ def read_artifact(s3, bucket: str, key: str) -> tuple[dict, str]:
     return body, response.get("ETag", "")
 
 
-def write_artifact(s3, bucket: str, key: str, body: dict, etag: str) -> None:
+def write_artifact(
+    s3: Any,  # pyright: ignore[reportExplicitAny] — untyped boto3 client
+    bucket: str,
+    key: str,
+    body: _Json,
+    etag: str,
+) -> None:
     """Conditional on the ETag read. A lost race stops the sweep; it never
     retries onto a body it has not classified."""
     if not etag:
@@ -346,12 +373,21 @@ def write_artifact(s3, bucket: str, key: str, body: dict, etag: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def sweep_one(s3, states, bucket: str, key: str, *, stages=None, apply=False, now=None) -> dict:
+def sweep_one(
+    s3: Any,  # pyright: ignore[reportExplicitAny] — untyped boto3 client
+    states: Any,  # pyright: ignore[reportExplicitAny] — untyped boto3 client
+    bucket: str,
+    key: str,
+    *,
+    stages: Iterable[str] | None = None,
+    apply: bool = False,
+    now: datetime | None = None,
+) -> _Json:
     swept_at = (now or datetime.now(timezone.utc)).isoformat(timespec="seconds")
     run_date = _KEY_RE.match(key).group(1)
     stored, etag = read_artifact(s3, bucket, key)
     notes: dict[str, str] = {}
-    scopes = []
+    scopes: list[_Json] = []
     for arn in row_authors(stored):
         scope, note = rederive(states, arn, run_date, swept_at)
         notes[arn] = note
@@ -359,22 +395,25 @@ def sweep_one(s3, states, bucket: str, key: str, *, stages=None, apply=False, no
             scopes.append(scope)
     target = cycle_target(scopes)
     findings = classify(stored, target, stages)
-    result = {"key": key, "authors": notes, "findings": findings, "written": False}
-    if apply and any(f["kind"] == UPGRADE for f in findings):
+    result: _Json = {"key": key, "authors": notes, "findings": findings, "written": False}
+    # An upgrade finding exists only where ``target`` has the row, so the
+    # ``target is not None`` test never changes which cycles are written.
+    if apply and target is not None and any(f["kind"] == UPGRADE for f in findings):
         body = corrected_artifact(stored, target, findings, swept_at)
         write_artifact(s3, bucket, key, body, etag)
         result["written"] = True
     return result
 
 
-def _render(result: dict, verbose: bool) -> list[str]:
+def _render(result: _Json, verbose: bool) -> list[str]:
     lines = [f"== s3://{BUCKET}/{result['key']}"]
     for arn, note in result["authors"].items():
         lines.append(f"   author {arn.rsplit(':', 1)[-1]}: {note}")
     for finding in result["findings"]:
         if finding["kind"] in (UNCHANGED, AFTER_SCOPE) and not verbose:
             continue
-        held, new = finding["stored"], finding["corrected"] or {}
+        held: _Json = finding["stored"]
+        new: _Json = finding["corrected"] or {}
         line = (
             f"   {finding['kind'].upper():16s} {finding['stage']}: "
             f"{held['disposition']} / {held['entry_state']} -> "
@@ -396,7 +435,12 @@ def _run_date(value: str) -> str:
     return value
 
 
-def main(argv: list[str] | None = None, *, s3=None, states=None) -> int:
+def main(
+    argv: list[str] | None = None,
+    *,
+    s3: Any = None,  # pyright: ignore[reportExplicitAny] — untyped boto3 client
+    states: Any = None,  # pyright: ignore[reportExplicitAny] — untyped boto3 client
+) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--bucket", default=BUCKET)
     parser.add_argument("--region", default="us-east-1")
@@ -416,7 +460,7 @@ def main(argv: list[str] | None = None, *, s3=None, states=None) -> int:
         s3 = s3 or boto3.client("s3", region_name=args.region)
         states = states or boto3.client("stepfunctions", region_name=args.region)
 
-    results = []
+    results: list[_Json] = []
     status = 0
     for key in stored_keys(s3, args.bucket, args.run_dates):
         try:
