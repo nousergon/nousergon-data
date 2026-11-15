@@ -29,8 +29,26 @@ import json
 import logging
 import os
 import time
+from collections.abc import Callable, Mapping
+from types import ModuleType
+from typing import Protocol, cast
 
 logger = logging.getLogger(__name__)
+
+
+class _Response(Protocol):
+    """The slice of ``requests.Response`` this module reads."""
+
+    @property
+    def status_code(self) -> int: ...
+
+    def json(self) -> object: ...
+
+
+class _HttpClient(Protocol):
+    """The slice of the ``requests`` module (or a test double) this module calls."""
+
+    def get(self, url: str, *, headers: Mapping[str, str], timeout: float) -> _Response: ...
 
 _COMPANY_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 
@@ -51,11 +69,13 @@ DEFAULT_TTL_SECONDS = 12 * 3600  # 12h
 
 def load_cik_map(
     *,
-    http=None,
+    # ``ModuleType``: ingest_form4 threads the ``requests`` module through an
+    # unannotated ``http=requests`` parameter, which reaches here as a plain module.
+    http: _HttpClient | ModuleType | None = None,
     cache_path: str | None = None,
     ttl_seconds: float = DEFAULT_TTL_SECONDS,
-    headers: dict | None = None,
-    monotonic_time=time.time,
+    headers: Mapping[str, str] | None = None,
+    monotonic_time: Callable[[], float] = time.time,
 ) -> dict[str, str]:
     """Return ``{TICKER: cik_str}`` for the full EDGAR universe.
 
@@ -92,7 +112,9 @@ def load_cik_map(
                 "[cik_lookup] company_tickers.json returned %d", resp.status_code
             )
             return {}
-        data = resp.json()
+        # company_tickers.json's documented shape, ``{"0": {"cik_str": ..., "ticker": ...}, ...}``,
+        # read unchecked below as it always was: a body of another shape raises there.
+        data = cast("Mapping[str, Mapping[str, object]]", resp.json())
     except Exception as e:
         logger.warning("[cik_lookup] CIK map download failed: %s", e)
         return {}
@@ -109,7 +131,7 @@ def load_cik_map(
 
 
 def _read_cache(
-    cache_path: str, ttl_seconds: float, monotonic_time
+    cache_path: str, ttl_seconds: float, monotonic_time: Callable[[], float]
 ) -> dict[str, str] | None:
     try:
         stat = os.stat(cache_path)
@@ -124,7 +146,8 @@ def _read_cache(
         cik_map = payload.get("cik_map")
         if not isinstance(cik_map, dict):
             return None
-        return cik_map
+        # The file is this module's own: `_write_cache` dumps a {ticker: cik_str} dict.
+        return cast("dict[str, str]", cik_map)
     except Exception as e:
         logger.warning("[cik_lookup] failed to read CIK cache %s: %s", cache_path, e)
         return None
