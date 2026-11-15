@@ -13,23 +13,25 @@ import json
 import os
 from pathlib import Path
 import time
+from typing import Any, Callable, Iterator, cast
 
 UTC = dt.timezone.utc
 SCHEMA = Path(__file__).resolve().parents[2] / "contracts/cloudtrail_evidence.v1.schema.json"
+JsonDict = dict[str, Any]  # pyright: ignore[reportExplicitAny]  # raw CloudTrail / S3 response JSON and the evidence document
 
 
 class LimitReached(Exception):
     pass
 
 
-def timestamp(value):
+def timestamp(value: str) -> dt.datetime:
     parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
     if parsed.tzinfo is None:
         raise ValueError("timezone required")
     return parsed.astimezone(UTC)
 
 
-def selectors_match(value, bucket):
+def selectors_match(value: JsonDict, bucket: str) -> bool:
     selectors = value.get("EventSelectors", [])
     management = any(s.get("ReadWriteType") == "All" and s.get("IncludeManagementEvents") is True
                      and not s.get("ExcludeManagementEventSources") for s in selectors)
@@ -40,13 +42,13 @@ def selectors_match(value, bucket):
     return management and writes
 
 
-def lifecycle_matches(value):
+def lifecycle_matches(value: JsonDict) -> bool:
     enabled = [r for r in value.get("Rules", []) if r.get("Status") == "Enabled"]
     if not enabled or any("Expiration" in r for r in enabled):
         return False
     # Compare the entire enabled action set; a prefix filter cannot prove
     # retention for the bucket, and extra transitions can change that retention.
-    actions = []
+    actions: list[JsonDict] = []
     for rule in enabled:
         if rule.get("Prefix", "") or rule.get("Filter", {}) not in ({}, {"Prefix": ""}):
             return False
@@ -61,21 +63,22 @@ def lifecycle_matches(value):
         map(lambda x: json.dumps(x, sort_keys=True), expected))
 
 
-def validate(document):
+def validate(document: JsonDict) -> None:
     import jsonschema
-    jsonschema.Draft202012Validator(json.loads(SCHEMA.read_text())).validate(document)
+    jsonschema.Draft202012Validator(json.loads(SCHEMA.read_text())).validate(document)  # pyright: ignore[reportUnknownMemberType]  # jsonschema validator methods are untyped
 
 
-def collect(s3, cloudtrail, *, archive_bucket, archive_prefix, research_bucket,
-            trail, since, now, source_sha, max_requests=200, max_bytes=16*1024*1024,
-            max_seconds=120):
+def collect(s3: Any, cloudtrail: Any, *, archive_bucket: str, archive_prefix: str,  # pyright: ignore[reportExplicitAny]  # untyped boto3 clients (no stubs)
+            research_bucket: str, trail: str, since: dt.datetime, now: dt.datetime,
+            source_sha: str, max_requests: int = 200, max_bytes: int = 16*1024*1024,
+            max_seconds: float = 120) -> JsonDict:
     if since.tzinfo is None or now.tzinfo is None or since > now:
         raise ValueError("invalid aware observation window")
     if min(max_requests, max_bytes, max_seconds) <= 0:
         raise ValueError("positive limits required")
     started = time.monotonic()
     prefix = archive_prefix.rstrip("/") + "/"
-    result = {
+    result: JsonDict = {
         "schema_version": "cloudtrail_evidence.v1",
         "collected_at": now.isoformat(), "source_sha": source_sha,
         "window": {"start": since.isoformat(), "end": now.isoformat()},
@@ -90,15 +93,15 @@ def collect(s3, cloudtrail, *, archive_bucket, archive_prefix, research_bucket,
         "errors": [],
     }
 
-    def call(fn, **kwargs):
+    def call(fn: Callable[..., JsonDict], **kwargs: object) -> JsonDict:
         if result["requests"] >= max_requests or time.monotonic() - started >= max_seconds:
             raise LimitReached()
         result["requests"] += 1
         return fn(**kwargs)
 
-    def pages(**kwargs):
-        token = None
-        seen = set()
+    def pages(**kwargs: str) -> Iterator[JsonDict]:
+        token: str | None = None
+        seen: set[str] = set()
         while True:
             page = call(s3.list_objects_v2, Bucket=archive_bucket, MaxKeys=100,
                         **kwargs, **({"ContinuationToken": token} if token else {}))
@@ -110,12 +113,12 @@ def collect(s3, cloudtrail, *, archive_bucket, archive_prefix, research_bucket,
                 raise ValueError("invalid pagination token")
             seen.add(token)
 
-    def sample_record(record, key):
+    def sample_record(record: JsonDict, key: str) -> JsonDict | None:
         if record.get("eventSource") != "s3.amazonaws.com" or record.get("eventName") not in {
             "PutObject", "DeleteObject", "DeleteObjects", "CompleteMultipartUpload", "CopyObject"
         } or record.get("errorCode") or record.get("errorMessage"):
             return None
-        params = record.get("requestParameters") or {}
+        params: JsonDict = record.get("requestParameters") or {}
         if params.get("bucketName") != research_bucket:
             return None
         # A DeleteObjects envelope alone is not proof of a particular object write.
@@ -124,8 +127,10 @@ def collect(s3, cloudtrail, *, archive_bucket, archive_prefix, research_bucket,
         event_time = timestamp(record["eventTime"])
         if not since <= event_time <= now:
             return None
-        identity = record.get("userIdentity") or {}
-        principal = (identity.get("sessionContext") or {}).get("sessionIssuer", {}).get("arn") or identity.get("arn")
+        identity: JsonDict = record.get("userIdentity") or {}
+        session: JsonDict = identity.get("sessionContext") or {}
+        issuer: JsonDict = session.get("sessionIssuer", {})
+        principal: str | None = issuer.get("arn") or identity.get("arn")
         if not principal:
             return None
         return {"archive_bucket": archive_bucket, "archive_key": key,
@@ -144,7 +149,7 @@ def collect(s3, cloudtrail, *, archive_bucket, archive_prefix, research_bucket,
                                   "selectors_match": selectors_match(selectors, research_bucket),
                                   "lifecycle_matches": lifecycle_matches(lifecycle)}
         stage = "region_discovery"
-        regions = []
+        regions: list[str] = []
         for page in pages(Prefix=prefix, Delimiter="/"):
             for entry in page.get("CommonPrefixes", []):
                 region_prefix = entry["Prefix"]
@@ -159,7 +164,7 @@ def collect(s3, cloudtrail, *, archive_bucket, archive_prefix, research_bucket,
         while day >= since.date() and result["sample"] is None:
             for region_prefix in sorted(set(regions)):
                 partition = region_prefix + day.strftime("%Y/%m/%d/")
-                observed = {"prefix": partition, "objects_read": 0, "listing_complete": False}
+                observed: JsonDict = {"prefix": partition, "objects_read": 0, "listing_complete": False}
                 result["coverage"]["partitions"].append(observed)
                 for page in pages(Prefix=partition):
                     for item in page.get("Contents", []):
@@ -183,9 +188,10 @@ def collect(s3, cloudtrail, *, archive_bucket, archive_prefix, research_bucket,
                         result["decoded_bytes"] += len(decoded)
                         if result["decoded_bytes"] > max_bytes:
                             raise LimitReached()
-                        records = json.loads(decoded)["Records"]
+                        records: object = json.loads(decoded)["Records"]
                         if not isinstance(records, list):
                             raise ValueError("Records must be a list")
+                        records = cast(list[JsonDict], records)
                         observed["objects_read"] += 1
                         for record in records:
                             if time.monotonic() - started >= max_seconds:
@@ -221,7 +227,7 @@ def collect(s3, cloudtrail, *, archive_bucket, archive_prefix, research_bucket,
     return result
 
 
-def main(argv=None):
+def main(argv: list[str] | None = None) -> int:
     import boto3
     from botocore.config import Config
     from data_gate.producers.executor_profile import DEFAULT_ARCHIVE_BUCKET, DEFAULT_ARCHIVE_PREFIX, DEFAULT_BUCKET
