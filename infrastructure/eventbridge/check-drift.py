@@ -63,6 +63,11 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any, cast
+
+# Raw JSON: a parsed EVENT_PATTERN heredoc, an `aws events` CLI response, or a
+# discovered-rule record (whose `source_file` is a Path). Shapes are open-ended.
+JsonDict = dict[str, Any]  # pyright: ignore[reportExplicitAny]  # raw JSON / rule record, open-ended shape
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
 REPO_ROOT = SCRIPT_DIR.parent.parent
@@ -83,7 +88,7 @@ _EVENT_PATTERN_RE = re.compile(
 _RULE_NAME_RE = re.compile(r'^RULE_NAME="([^"]+)"', re.MULTILINE)
 
 
-def _discover_codified_rules() -> list[dict]:
+def _discover_codified_rules() -> list[JsonDict]:
     """Scan every `infrastructure/lambdas/*/deploy.sh` for an EVENT_PATTERN
     heredoc keyed on `stateMachineArn`. Returns one entry per rule found,
     each either `{"rule_name", "source_file", "expected_pattern"}` or, if
@@ -94,7 +99,7 @@ def _discover_codified_rules() -> list[dict]:
     philosophy, so a new Lambda wiring an SF-status EventBridge rule is
     picked up automatically without editing this script.
     """
-    rules: list[dict] = []
+    rules: list[JsonDict] = []
     for deploy_sh in sorted(LAMBDAS_DIR.glob("*/deploy.sh")):
         text = deploy_sh.read_text()
         pattern_match = _EVENT_PATTERN_RE.search(text)
@@ -122,7 +127,7 @@ def _discover_codified_rules() -> list[dict]:
             "${ACCOUNT_ID}", DEFAULT_ACCOUNT_ID
         )
         try:
-            expected_pattern = json.loads(resolved)
+            expected_pattern: object = json.loads(resolved)
         except json.JSONDecodeError as exc:
             rules.append({
                 "rule_name": rule_name,
@@ -142,7 +147,7 @@ def _discover_codified_rules() -> list[dict]:
     return rules
 
 
-def _aws_events(*args: str, allow_missing: bool = False) -> dict | list | str | None:
+def _aws_events(*args: str, allow_missing: bool = False) -> object:
     """Call `aws events ...` and return the parsed JSON output.
 
     If `allow_missing` and the CLI fails with ResourceNotFoundException,
@@ -164,16 +169,18 @@ def _aws_events(*args: str, allow_missing: bool = False) -> dict | list | str | 
             f"stderr: {result.stderr}\n"
         )
         sys.exit(2)
-    return json.loads(result.stdout) if result.stdout.strip() else {}
+    parsed: object = json.loads(result.stdout) if result.stdout.strip() else {}
+    return parsed
 
 
-def _canonical(obj):
+def _canonical(obj: object) -> object:
     """Recursively sort dict keys and (order-independently) list elements
     so cosmetic reordering doesn't register as drift."""
     if isinstance(obj, dict):
-        return {k: _canonical(obj[k]) for k in sorted(obj)}
+        obj_dict = cast(JsonDict, obj)
+        return {k: _canonical(obj_dict[k]) for k in sorted(obj_dict)}
     if isinstance(obj, list):
-        canon_items = [_canonical(v) for v in obj]
+        canon_items = [_canonical(v) for v in cast(list[object], obj)]
         try:
             return sorted(canon_items, key=lambda x: json.dumps(x, sort_keys=True))
         except TypeError:
@@ -181,31 +188,32 @@ def _canonical(obj):
     return obj
 
 
-def _canonical_json(obj) -> str:
+def _canonical_json(obj: object) -> str:
     return json.dumps(_canonical(obj), sort_keys=True, separators=(",", ":"))
 
 
-def _extract_state_machine_arns(pattern: dict) -> set[str]:
+def _extract_state_machine_arns(pattern: object) -> set[str]:
     """Pull the `detail.stateMachineArn` allow-list out of an EventPattern.
     Handles both list and bare-string shapes (AWS accepts either)."""
-    detail = pattern.get("detail", {}) if isinstance(pattern, dict) else {}
-    arns = detail.get("stateMachineArn", [])
+    detail: object = cast(JsonDict, pattern).get("detail", {}) if isinstance(pattern, dict) else {}
+    arns: object = cast(JsonDict, detail).get("stateMachineArn", [])
     if isinstance(arns, str):
         return {arns}
     if isinstance(arns, list):
-        return set(arns)
+        return set(cast(list[str], arns))
     return set()
 
 
-def _check_rule(rule: dict) -> list[str]:
+def _check_rule(rule: JsonDict) -> list[str]:
     """Return list of drift findings for one codified rule. Empty means clean."""
-    rule_name = rule["rule_name"]
+    rule_name: str = rule["rule_name"]
 
     if "error" in rule:
         return [f"{rule_name}: {rule['error']}"]
 
-    expected_pattern = rule["expected_pattern"]
-    source_rel = rule["source_file"].relative_to(REPO_ROOT)
+    expected_pattern: object = rule["expected_pattern"]
+    source_file: Path = rule["source_file"]
+    source_rel = source_file.relative_to(REPO_ROOT)
 
     desc = _aws_events("describe-rule", "--name", rule_name, allow_missing=True)
     if desc is None:
@@ -215,7 +223,7 @@ def _check_rule(rule: dict) -> list[str]:
             f"deploy.sh if it was deleted out of band)"
         ]
 
-    live_pattern_raw = desc.get("EventPattern")
+    live_pattern_raw: object = cast(JsonDict, desc).get("EventPattern")
     if not live_pattern_raw:
         return [
             f"{rule_name}: live rule exists but has no EventPattern "
@@ -223,7 +231,7 @@ def _check_rule(rule: dict) -> list[str]:
         ]
 
     try:
-        live_pattern = json.loads(live_pattern_raw)
+        live_pattern: object = json.loads(cast(str, live_pattern_raw))
     except json.JSONDecodeError as exc:
         return [f"{rule_name}: live EventPattern is not valid JSON ({exc})"]
 
@@ -256,12 +264,13 @@ def main() -> int:
 
     rules = _discover_codified_rules()
 
-    if args.rule:
-        rules = [r for r in rules if r["rule_name"] == args.rule]
+    rule_filter: str | None = args.rule
+    if rule_filter:
+        rules = [r for r in rules if r["rule_name"] == rule_filter]
         if not rules:
             sys.stderr.write(
                 f"ERROR: no codified EVENT_PATTERN found for rule "
-                f"'{args.rule}' under {LAMBDAS_DIR}/*/deploy.sh\n"
+                f"'{rule_filter}' under {LAMBDAS_DIR}/*/deploy.sh\n"
             )
             return 2
 

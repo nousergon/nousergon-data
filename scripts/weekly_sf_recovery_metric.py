@@ -93,7 +93,8 @@ import os
 import re
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
+from typing import Any, cast
 
 # Repo-root bootstrap so `from scripts.weekly_sf_rerun import ...` resolves
 # whether this is invoked as `python scripts/weekly_sf_recovery_metric.py`
@@ -103,9 +104,12 @@ from datetime import datetime, timedelta, timezone
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 from scripts.weekly_sf_rerun import (  # noqa: E402
-    execution_input,
     list_all_executions,
 )
+
+# A Step Functions / S3 API response, an execution's input/output JSON, or the
+# emitted metric record: open-ended mappings whose value types vary per key.
+JsonDict = dict[str, Any]  # pyright: ignore[reportExplicitAny]  # boto3 response / SF execution JSON / metric record, open-ended shape
 
 logger = logging.getLogger(__name__)
 
@@ -130,7 +134,7 @@ NAME_RUN_DATE_RE = re.compile(r"^(?:watch-)?rerun-(\d{4}-\d{2}-\d{2})-\d+$")
 # never a real run_date attempt.
 EXERCISE_ROLES = frozenset({"exercise", "weekly-exercise"})
 
-def _is_weekly_gate_out(output_json: dict) -> bool:
+def _is_weekly_gate_out(output_json: JsonDict) -> bool:
     """True iff a SUCCEEDED weekly-role execution's OWN OUTPUT proves it did
     no work (alpha-engine-config-I8057, mirrors
     ``gate_sf_run_sweep.py::_is_weekly_gate_out`` from
@@ -140,13 +144,13 @@ def _is_weekly_gate_out(output_json: dict) -> bool:
     key's absence — a real run does not carry it at all, so an absent-key-
     as-gate-out reading would strand every real weekly execution.
     """
-    gate = output_json.get("weekly_run_day_gate")
+    gate: object = output_json.get("weekly_run_day_gate")
     if not isinstance(gate, dict):
         return False
-    inner = gate.get("Payload")
+    inner: object = cast(JsonDict, gate).get("Payload")
     if not isinstance(inner, dict):
         return False
-    return inner.get("is_weekly_run_day") is False
+    return cast(JsonDict, inner).get("is_weekly_run_day") is False
 
 
 @dataclass(frozen=True)
@@ -161,15 +165,18 @@ class ExecutionRecord:
     classification: str  # "counted" | "excluded_exercise" | "excluded_gate_skip"
 
 
-def classify_execution(sf, ex: dict) -> ExecutionRecord:
+def classify_execution(
+    sf: Any,  # pyright: ignore[reportExplicitAny]  # untyped boto3 stepfunctions client (no stubs installed)
+    ex: JsonDict,
+) -> ExecutionRecord:
     """Classify one `list_executions` summary. Fetches `describe_execution`
     only for executions whose name doesn't already carry the run_date — that
     same call's `output` field (already in hand, no second AWS call) also
     carries the gate-out verdict for weekly-role SUCCEEDED candidates."""
-    name = ex["name"]
-    status = ex["status"]
-    start = ex["startDate"]
-    stop = ex.get("stopDate")
+    name: str = ex["name"]
+    status: str = ex["status"]
+    start: datetime = ex["startDate"]
+    stop: datetime | None = ex.get("stopDate")
 
     m = NAME_RUN_DATE_RE.match(name)
     if m:
@@ -184,13 +191,14 @@ def classify_execution(sf, ex: dict) -> ExecutionRecord:
             classification="counted",
         )
 
-    desc = sf.describe_execution(executionArn=ex["executionArn"])
+    desc: JsonDict = sf.describe_execution(executionArn=ex["executionArn"])
     try:
-        input_json = json.loads(desc.get("input") or "{}")
+        input_json: JsonDict = json.loads(desc.get("input") or "{}")
     except json.JSONDecodeError:
         input_json = {}
-    role = input_json.get("pipeline_role")
+    role: str | None = input_json.get("pipeline_role")
 
+    run_date: str
     if isinstance(input_json.get("run_date"), str) and input_json["run_date"]:
         run_date = input_json["run_date"]
     else:
@@ -205,7 +213,7 @@ def classify_execution(sf, ex: dict) -> ExecutionRecord:
         classification = "excluded_exercise"
     elif role == "weekly" and status == "SUCCEEDED":
         try:
-            output_json = json.loads(desc.get("output") or "{}")
+            output_json: JsonDict = json.loads(desc.get("output") or "{}")
         except json.JSONDecodeError:
             output_json = {}
         if _is_weekly_gate_out(output_json):
@@ -217,11 +225,18 @@ def classify_execution(sf, ex: dict) -> ExecutionRecord:
     )
 
 
-def gather_records(sf, sm_arn: str, run_date: str, *, scan_cap: int = 300) -> list[ExecutionRecord]:
+def gather_records(
+    sf: Any,  # pyright: ignore[reportExplicitAny]  # untyped boto3 stepfunctions client (no stubs installed)
+    sm_arn: str,
+    run_date: str,
+    *,
+    scan_cap: int = 300,
+) -> list[ExecutionRecord]:
     """Classify every execution in the scan window and return those
     correlated to `run_date` (any classification — callers filter for
     "counted" themselves so excluded classes stay visible for transparency)."""
-    records = []
+    records: list[ExecutionRecord] = []
+    ex: JsonDict
     for ex in list_all_executions(sf, sm_arn, cap=scan_cap):
         rec = classify_execution(sf, ex)
         if rec.run_date == run_date:
@@ -229,18 +244,22 @@ def gather_records(sf, sm_arn: str, run_date: str, *, scan_cap: int = 300) -> li
     return records
 
 
-def resolve_latest_run_date(s3, bucket: str) -> str:
+def resolve_latest_run_date(
+    s3: Any,  # pyright: ignore[reportExplicitAny]  # untyped boto3 s3 client (no stubs installed)
+    bucket: str,
+) -> str:
     """Default --run-date: the most recent WriteCompletionMarker date under
     the weekly SF's own `_sf_completion/` prefix (excludes this script's own
     `-recovery.json` siblings via the strict `{date}.json` match)."""
     dates: list[str] = []
-    token = None
+    token: str | None = None
     while True:
-        kwargs = {"Bucket": bucket, "Prefix": COMPLETION_PREFIX}
+        kwargs: dict[str, str] = {"Bucket": bucket, "Prefix": COMPLETION_PREFIX}
         if token:
             kwargs["ContinuationToken"] = token
-        resp = s3.list_objects_v2(**kwargs)
-        for obj in resp.get("Contents", []) or []:
+        resp: JsonDict = s3.list_objects_v2(**kwargs)
+        contents: list[JsonDict] = resp.get("Contents", []) or []
+        for obj in contents:
             m = COMPLETION_MARKER_RE.match(obj["Key"])
             if m:
                 dates.append(m.group(1))
@@ -258,7 +277,7 @@ def resolve_latest_run_date(s3, bucket: str) -> str:
     return max(dates)
 
 
-def build_metric(run_date: str, records: list[ExecutionRecord]) -> dict:
+def build_metric(run_date: str, records: list[ExecutionRecord]) -> JsonDict:
     counted = sorted(
         (r for r in records if r.classification == "counted"),
         key=lambda r: r.start,
@@ -266,7 +285,7 @@ def build_metric(run_date: str, records: list[ExecutionRecord]) -> dict:
     executions_total = len(counted)
     recovery_actions = max(0, executions_total - 1)
     first_terminal_status = counted[0].status if counted else None
-    succeeded_after_n_reruns = None
+    succeeded_after_n_reruns: int | None = None
     for i, r in enumerate(counted):
         if r.status == "SUCCEEDED":
             succeeded_after_n_reruns = i
@@ -286,7 +305,7 @@ def build_metric(run_date: str, records: list[ExecutionRecord]) -> dict:
     }
 
 
-def _publish_recovery_alert(metric: dict) -> None:
+def _publish_recovery_alert(metric: JsonDict) -> None:
     """Best-effort alert fan-out (nousergon_lib.alerts.publish — mirrors
     validators/constituents_drift_check.py). NEVER raises: a failure here
     must not take down a metric write that already succeeded."""
@@ -331,7 +350,7 @@ def _publish_recovery_alert(metric: dict) -> None:
         logger.warning("recovery alert publish failed: %s", exc)
 
 
-def main(argv: list | None = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     ap.add_argument("--run-date", default=None, help="target run_date YYYY-MM-DD (default: latest _sf_completion marker)")
