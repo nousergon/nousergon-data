@@ -78,8 +78,15 @@ import itertools
 import json
 import re
 from pathlib import Path
+from typing import Any, Iterator, cast
 
 INFRA = Path(__file__).resolve().parent
+
+JsonDict = dict[str, Any]  # pyright: ignore[reportExplicitAny]  # raw Step Functions (ASL) definition JSON
+#: Boolean facts known on a path, as sorted (variable, value) pairs.
+Context = tuple[tuple[str, bool], ...]
+#: Fields guaranteed available at each reachable (state, context) pair.
+Available = dict[tuple[str, Context], set[str]]
 
 #: Safety bound on the path-sensitive walk. Exceeding it is a loud failure, never
 #: a silently truncated analysis (fail-loud: a partial sweep reads as a clean one).
@@ -132,23 +139,23 @@ _NOT_A_READ = (
 # --------------------------------------------------------------------------- #
 # Reference extraction
 # --------------------------------------------------------------------------- #
-def refs(node) -> set[str]:
+def refs(node: object) -> set[str]:
     """Every top-level field name referenced anywhere inside ``node``."""
     found: set[str] = set()
     if isinstance(node, dict):
-        for key, value in node.items():
+        for key, value in cast(JsonDict, node).items():
             if key == "Comment":
                 continue
             found |= refs(value)
     elif isinstance(node, list):
-        for value in node:
+        for value in cast(list[object], node):
             found |= refs(value)
     elif isinstance(node, str):
         found |= set(_REF.findall(_QUOTED.sub("''", node)))
     return found
 
 
-def _guarded_vars(rule: dict) -> set[str]:
+def _guarded_vars(rule: JsonDict) -> set[str]:
     """Variables an ``IsPresent`` in this rule makes safe to *reference*.
 
     Testing a field's presence is the standard ASL idiom for an optional field
@@ -165,7 +172,7 @@ def _guarded_vars(rule: dict) -> set[str]:
     return safe
 
 
-def state_refs(state: dict) -> set[str]:
+def state_refs(state: JsonDict) -> set[str]:
     """Fields this state reads, excluding ``IsPresent``-guarded Choice variables."""
     kind = state.get("Type")
     if kind == "Choice":
@@ -248,9 +255,9 @@ def produced_keys(expr: str, current: frozenset[str], entry: frozenset[str]) -> 
     return set()  # a JSONPath into a sub-document: opaque, guarantees nothing
 
 
-def _pass_output(state: dict, current: frozenset[str], entry: frozenset[str]) -> set[str]:
+def _pass_output(state: JsonDict, current: frozenset[str], entry: frozenset[str]) -> set[str]:
     """Fields guaranteed on the payload leaving a Pass that rewrites its input."""
-    params = state.get("Parameters") or {}
+    params: JsonDict = state.get("Parameters") or {}
     out_path = state.get("OutputPath")
     if isinstance(out_path, str) and out_path.startswith("$."):
         root = out_path[2:].split(".")[0]
@@ -266,7 +273,7 @@ def _pass_output(state: dict, current: frozenset[str], entry: frozenset[str]) ->
 # --------------------------------------------------------------------------- #
 # Choice path sensitivity
 # --------------------------------------------------------------------------- #
-def _rule_facts(rule: dict) -> tuple[set[str], dict[str, bool]]:
+def _rule_facts(rule: JsonDict) -> tuple[set[str], dict[str, bool]]:
     """(fields proven PRESENT, boolean literal facts) established by taking a rule."""
     present: set[str] = set()
     bools: dict[str, bool] = {}
@@ -286,7 +293,7 @@ def _rule_facts(rule: dict) -> tuple[set[str], dict[str, bool]]:
     return present, bools
 
 
-def _rule_is_contradicted(rule: dict, bools: dict[str, bool]) -> bool:
+def _rule_is_contradicted(rule: JsonDict, bools: dict[str, bool]) -> bool:
     """True when known boolean facts make this rule unsatisfiable."""
     if "Variable" in rule and isinstance(rule.get("BooleanEquals"), bool):
         names = _REF.findall(rule["Variable"])
@@ -295,7 +302,7 @@ def _rule_is_contradicted(rule: dict, bools: dict[str, bool]) -> bool:
     return any(_rule_is_contradicted(sub, bools) for sub in rule.get("And", []))
 
 
-def _rule_is_entailed(rule: dict, bools: dict[str, bool], present: frozenset[str]) -> bool:
+def _rule_is_entailed(rule: JsonDict, bools: dict[str, bool], present: frozenset[str]) -> bool:
     """True when known facts already satisfy every conjunct of this rule.
 
     An entailed rule makes the Choice's remaining rules and its ``Default``
@@ -322,9 +329,9 @@ def _rule_is_entailed(rule: dict, bools: dict[str, bool], present: frozenset[str
 # --------------------------------------------------------------------------- #
 # The walk
 # --------------------------------------------------------------------------- #
-def _choice_bool_vars(state: dict) -> set[str]:
+def _choice_bool_vars(state: JsonDict) -> set[str]:
     """Boolean variables this state's Choice rules test."""
-    def collect(rule: dict) -> set[str]:
+    def collect(rule: JsonDict) -> set[str]:
         found: set[str] = set()
         if "Variable" in rule and isinstance(rule.get("BooleanEquals"), bool):
             names = _REF.findall(rule["Variable"])
@@ -343,21 +350,22 @@ def _choice_bool_vars(state: dict) -> set[str]:
     # A Parallel/Map state consumes facts INSIDE its branches. Without this, the
     # liveness pass drops a skip flag at the Parallel's boundary and the branch is
     # then explored on a path its own gates rule out.
-    nested_states: list[dict] = []
+    nested_states: list[JsonDict] = []
     for key in ("ItemProcessor", "Iterator"):
         nested = state.get(key)
         if isinstance(nested, dict) and "States" in nested:
-            nested_states.append(nested["States"])
-    for branch in state.get("Branches", []) or []:
+            nested_states.append(cast(JsonDict, nested)["States"])
+    branches: list[JsonDict] = state.get("Branches", []) or []
+    for branch in branches:
         nested_states.append(branch["States"])
     for group in nested_states:
         for child in group.values():
             if isinstance(child, dict):
-                found |= _choice_bool_vars(child)
+                found |= _choice_bool_vars(cast(JsonDict, child))
     return found
 
 
-def _edges(state: dict) -> list[str]:
+def _edges(state: JsonDict) -> list[str]:
     """Every state name this state can transition to, feasibility ignored."""
     out: list[str] = []
     if "Next" in state:
@@ -369,7 +377,7 @@ def _edges(state: dict) -> list[str]:
     return out
 
 
-def live_bool_vars(states: dict) -> dict[str, frozenset[str]]:
+def live_bool_vars(states: JsonDict) -> dict[str, frozenset[str]]:
     """Boolean variables still readable by some Choice reachable FROM each state.
 
     A fact is worth carrying only until the last gate that can consult it. Without
@@ -395,16 +403,18 @@ def live_bool_vars(states: dict) -> dict[str, frozenset[str]]:
     return {name: frozenset(vars_) for name, vars_ in live.items()}
 
 
-def _result_root(path) -> str | None:
+def _result_root(path: object) -> str | None:
     if isinstance(path, str) and path.startswith("$."):
         return path[2:].split(".")[0]
     return None
 
 
-def _successors(name: str, state: dict, bools: dict[str, bool], present: frozenset[str]):
+def _successors(
+    name: str, state: JsonDict, bools: dict[str, bool], present: frozenset[str]
+) -> Iterator[tuple[str, set[str], dict[str, bool]]]:
     """Yield (next_state, extra_present_fields, extra_bool_facts) per feasible edge."""
     written = _result_root(state.get("ResultPath"))
-    extra = {written} if written else set()
+    extra: set[str] = {written} if written else set()
 
     if "Next" in state:
         yield state["Next"], extra, {}
@@ -430,7 +440,7 @@ def _successors(name: str, state: dict, bools: dict[str, bool], present: frozens
         yield catch["Next"], ({caught} if caught else set()), {}
 
 
-def _topological_rank(states: dict, start: str) -> dict[str, int]:
+def _topological_rank(states: JsonDict, start: str) -> dict[str, int]:
     """Reverse-postorder index of every state reachable from ``start``.
 
     The walk's worklist pops in this order (alpha-engine-config-I11309). It used
@@ -461,12 +471,12 @@ def _topological_rank(states: dict, start: str) -> dict[str, int]:
 
 
 def walk(
-    states: dict,
+    states: JsonDict,
     start: str,
     seed: set[str],
     entry: set[str],
-    context: tuple[tuple[str, bool], ...] = (),
-) -> dict:
+    context: Context = (),
+) -> Available:
     """Fields guaranteed available at each reachable (state, boolean-context) pair.
 
     PATH SENSITIVITY IS LOAD-BEARING, not an optimisation. Keying availability on
@@ -480,7 +490,7 @@ def walk(
     """
     entry_fs = frozenset(entry)
     live = live_bool_vars(states)
-    available: dict[tuple[str, tuple], set[str]] = {}
+    available: Available = {}
     # Worklist in reverse postorder, with every not-yet-processed arrival at a
     # (state, context) key folded into ONE pending entry (alpha-engine-config-I11309).
     # Popping last-in-first-out, one entry per arrival, processed a key once per
@@ -492,10 +502,10 @@ def walk(
     rank = _topological_rank(states, start)
     unranked = len(rank)
     ticket = itertools.count()
-    pending: dict[tuple[str, tuple], frozenset[str]] = {}
-    queue: list[tuple[int, int, str, tuple[tuple[str, bool], ...]]] = []
+    pending: dict[tuple[str, Context], frozenset[str]] = {}
+    queue: list[tuple[int, int, str, Context]] = []
 
-    def arrive(name: str, fields: frozenset[str], bool_items: tuple) -> None:
+    def arrive(name: str, fields: frozenset[str], bool_items: Context) -> None:
         key = (name, bool_items)
         if key in pending:
             pending[key] = pending[key] & fields
@@ -549,7 +559,7 @@ def walk(
     return available
 
 
-def collapse(available: dict) -> dict[str, set[str]]:
+def collapse(available: Available) -> dict[str, set[str]]:
     """Per-state intersection over its feasible contexts, for reporting only."""
     out: dict[str, set[str]] = {}
     for (name, _context), fields in available.items():
@@ -557,7 +567,9 @@ def collapse(available: dict) -> dict[str, set[str]]:
     return out
 
 
-def _scopes(states: dict, available: dict, scope: str, entry: set[str]):
+def _scopes(
+    states: JsonDict, available: Available, scope: str, entry: set[str]
+) -> Iterator[tuple[str, JsonDict, str, set[str], Context]]:
     """Yield (scope_label, states, start, seed) for every nested Map/Parallel scope.
 
     A Parallel branch is seeded ONCE PER DISTINCT payload the Parallel is reached
@@ -572,21 +584,24 @@ def _scopes(states: dict, available: dict, scope: str, entry: set[str]):
     # count, which the weekly SF puts near two thousand on many states. (name,
     # context) is already unique in ``available``, so this keeps every pair in
     # first-seen order, exactly as the list did.
-    reached: dict[str, dict[tuple[frozenset[str], tuple], None]] = {}
+    reached: dict[str, dict[tuple[frozenset[str], Context], None]] = {}
     for (name, context), fields in available.items():
         reached.setdefault(name, {})[(frozenset(fields), context)] = None
 
     for name, state in states.items():
         if not isinstance(state, dict) or name not in reached:
             continue
+        state = cast(JsonDict, state)
         for key in ("ItemProcessor", "Iterator"):
             nested = state.get(key)
             if isinstance(nested, dict) and "States" in nested:
-                selector = state.get("ItemSelector") or state.get("Parameters") or {}
+                nested = cast(JsonDict, nested)
+                selector: JsonDict = state.get("ItemSelector") or state.get("Parameters") or {}
                 seed = {k[:-2] if k.endswith(".$") else k for k in selector}
                 yield f"{scope}/{name}", nested["States"], nested["StartAt"], seed, ()
         variants = list(reached[name])
-        for index, branch in enumerate(state.get("Branches", []) or []):
+        branches: list[JsonDict] = state.get("Branches", []) or []
+        for index, branch in enumerate(branches):
             for variant, (fields, context) in enumerate(variants):
                 label = f"{scope}/{name}[{index}]"
                 if len(variants) > 1:
@@ -604,10 +619,10 @@ def _scopes(states: dict, available: dict, scope: str, entry: set[str]):
 #: unscoped analysis serves every scope by prefixing. Keying on it made
 #: ``item_selector_problems`` (scope ``""``) and the per-file test (scope = file
 #: name) run the whole weekly analysis twice.
-_ANALYSIS_CACHE: dict[tuple[str, frozenset], list[str]] = {}
+_ANALYSIS_CACHE: dict[tuple[str, frozenset[str]], list[str]] = {}
 
 
-def analyse(definition: dict, entry: set[str], scope: str) -> list[str]:
+def analyse(definition: JsonDict, entry: set[str], scope: str) -> list[str]:
     """Every field-reachability problem in a definition, including nested scopes."""
     cache_key = (json.dumps(definition, sort_keys=True), frozenset(entry))
     unscoped = _ANALYSIS_CACHE.get(cache_key)
@@ -617,9 +632,11 @@ def analyse(definition: dict, entry: set[str], scope: str) -> list[str]:
     return [f"{scope}{problem}" for problem in unscoped]
 
 
-def _analyse(definition: dict, entry: set[str], scope: str) -> list[str]:
+def _analyse(definition: JsonDict, entry: set[str], scope: str) -> list[str]:
     problems: list[str] = []
-    pending = [(scope, definition["States"], definition["StartAt"], set(entry), ())]
+    pending: list[tuple[str, JsonDict, str, set[str], Context]] = [
+        (scope, definition["States"], definition["StartAt"], set(entry), ())
+    ]
 
     while pending:
         label, states, start, seed, context = pending.pop()
@@ -643,7 +660,7 @@ def _analyse(definition: dict, entry: set[str], scope: str) -> list[str]:
     return problems
 
 
-def _item_selector_problems_in(states: dict, available: dict, scope: str) -> list[str]:
+def _item_selector_problems_in(states: JsonDict, available: Available, scope: str) -> list[str]:
     """``ItemSelector`` is evaluated at the Map's INPUT, not inside an iteration.
 
     Checked inside ``analyse``'s scope walk rather than only at the top level:
@@ -655,12 +672,16 @@ def _item_selector_problems_in(states: dict, available: dict, scope: str) -> lis
     reached = collapse(available)
     problems: list[str] = []
     for name, state in states.items():
-        if not isinstance(state, dict) or state.get("Type") != "Map":
+        if not isinstance(state, dict):
+            continue
+        state = cast(JsonDict, state)
+        if state.get("Type") != "Map":
             continue
         at_map = reached.get(name)
         if at_map is None:
             continue
-        missing = refs(state.get("ItemSelector") or {}) - at_map
+        selector: JsonDict = state.get("ItemSelector") or {}
+        missing = refs(selector) - at_map
         if missing:
             problems.append(
                 f"{scope}/{name}.ItemSelector references {sorted(missing)} at the "
@@ -669,7 +690,7 @@ def _item_selector_problems_in(states: dict, available: dict, scope: str) -> lis
     return problems
 
 
-def item_selector_problems(definition: dict, entry: set[str]) -> list[str]:
+def item_selector_problems(definition: JsonDict, entry: set[str]) -> list[str]:
     """Every Map ``ItemSelector`` problem, at any nesting depth.
 
     Kept as a named entry point because it answers a different question from
