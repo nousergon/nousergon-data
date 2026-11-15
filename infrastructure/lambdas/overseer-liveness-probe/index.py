@@ -80,12 +80,16 @@ import logging
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import boto3
 import yaml
 
 from flow_doctor_telegram import notify_via_flow_doctor
 from nousergon_lib.flow_doctor_fleet import FleetTelegramTopic
+
+# Registry YAML, boto3 responses and S3 JSON bodies are untyped JSON (boto3 ships no stubs).
+JsonDict = dict[str, Any]  # pyright: ignore[reportExplicitAny]  # raw registry YAML / boto3 response / S3 JSON body
 
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
@@ -118,7 +122,7 @@ _MAX_HEADLINES = 8       # headline lines rendered before "…and N more"
 _HEADLINE_ITEMS = 3      # per-finding items (timestamps, runs) named inline
 
 
-def _finding(component: str, headline: str, detail: str | None = None) -> dict:
+def _finding(component: str, headline: str, detail: str | None = None) -> JsonDict:
     """One liveness finding, in the two registers a page needs.
 
     ``headline`` is scannable and one line; ``detail`` is the full prose that
@@ -143,10 +147,10 @@ class _RegistryError(RuntimeError):
     Lambda Errors metric (fail-loud), never a silent no-op."""
 
 
-_REGISTRY_CACHE: dict | None = None
+_REGISTRY_CACHE: JsonDict | None = None
 
 
-def _registry() -> dict:
+def _registry() -> JsonDict:
     """Load (once per container) the bundled playbook registry — fail-loud on a
     missing/malformed file (mirrors overseer-dispatcher._registry)."""
     global _REGISTRY_CACHE
@@ -165,39 +169,39 @@ def _error_code(exc: Exception) -> str:
     return str(getattr(exc, "response", {}).get("Error", {}).get("Code", ""))
 
 
-def _events_client():
+def _events_client() -> Any:  # pyright: ignore[reportExplicitAny]  # untyped boto3 client (no stubs)
     return boto3.client("events", region_name=REGION)
 
 
-def _sfn_client():
+def _sfn_client() -> Any:  # pyright: ignore[reportExplicitAny]  # untyped boto3 client (no stubs)
     return boto3.client("stepfunctions", region_name=REGION)
 
 
-def _lambda_client():
+def _lambda_client() -> Any:  # pyright: ignore[reportExplicitAny]  # untyped boto3 client (no stubs)
     return boto3.client("lambda", region_name=REGION)
 
 
-def _s3_client():
+def _s3_client() -> Any:  # pyright: ignore[reportExplicitAny]  # untyped boto3 client (no stubs)
     return boto3.client("s3", region_name=REGION)
 
 
-def _ec2_client():
+def _ec2_client() -> Any:  # pyright: ignore[reportExplicitAny]  # untyped boto3 client (no stubs)
     return boto3.client("ec2", region_name=REGION)
 
 
-def _sqs_client():
+def _sqs_client() -> Any:  # pyright: ignore[reportExplicitAny]  # untyped boto3 client (no stubs)
     return boto3.client("sqs", region_name=REGION)
 
 
-def _cloudwatch_client():
+def _cloudwatch_client() -> Any:  # pyright: ignore[reportExplicitAny]  # untyped boto3 client (no stubs)
     return boto3.client("cloudwatch", region_name=REGION)
 
 
-def _scheduler_client():
+def _scheduler_client() -> Any:  # pyright: ignore[reportExplicitAny]  # untyped boto3 client (no stubs)
     return boto3.client("scheduler", region_name=REGION)
 
 
-def _cw_client():
+def _cw_client() -> Any:  # pyright: ignore[reportExplicitAny]  # untyped boto3 client (no stubs)
     """CloudWatch client for alarm coverage checks (alpha-engine-config-I4482)."""
     return boto3.client("cloudwatch", region_name=REGION)
 
@@ -209,7 +213,7 @@ def _on_bus(bus: str | None) -> str:
 # ── Check: eventbridge_rule ──────────────────────────────────────────────────
 
 
-def _check_eventbridge_rule(spec: dict, now: datetime) -> tuple[list[str], dict]:
+def _check_eventbridge_rule(spec: JsonDict, now: datetime) -> tuple[list[str], JsonDict]:
     """Rule existence/state/target (+ optional stateMachineArn registration).
     Generalizes sf-watch-reclaim-sweep-handler._check_rule: the target may be a Lambda
     (``expect_target_function``) or an SQS queue (``expect_target_queue``, the
@@ -274,7 +278,7 @@ def _check_eventbridge_rule(spec: dict, now: datetime) -> tuple[list[str], dict]
 # ── Check: state_machines_exist ──────────────────────────────────────────────
 
 
-def _check_state_machines_exist(spec: dict, now: datetime) -> tuple[list[str], dict]:
+def _check_state_machines_exist(spec: JsonDict, now: datetime) -> tuple[list[str], JsonDict]:
     """Each named pipeline's Step Function must actually exist — the exact
     2026-06-29 dead-ARN bug class, caught directly (ported from
     sf-watch-reclaim-sweep-handler._check_state_machines_exist)."""
@@ -295,7 +299,7 @@ def _check_state_machines_exist(spec: dict, now: datetime) -> tuple[list[str], d
 # ── Check: lambda_active (+ optional kill-switch report + launch config) ──────
 
 
-def _check_launch_config(fn_name: str, lc: dict, env: dict[str, str]) -> list[str]:
+def _check_launch_config(fn_name: str, lc: JsonDict, env: dict[str, str]) -> list[str]:
     """The deregistered-AMI silent-break guard (ported from
     sf-watch-reclaim-sweep-handler._check_launch_config): assert the AMI/SG/subnets the
     DEPLOYED Lambda would launch with still exist, reading their ids from its
@@ -353,7 +357,7 @@ def _check_launch_config(fn_name: str, lc: dict, env: dict[str, str]) -> list[st
     return problems
 
 
-def _check_lambda_active(spec: dict, now: datetime) -> tuple[list[str], dict]:
+def _check_lambda_active(spec: JsonDict, now: datetime) -> tuple[list[str], JsonDict]:
     """Function Active + LastUpdateStatus Successful. Optionally REPORTS a
     kill-switch env value (never alerted — a deliberate operator disable is
     state) and verifies launch-config resources. Ported from
@@ -375,7 +379,8 @@ def _check_lambda_active(spec: dict, now: datetime) -> tuple[list[str], dict]:
         problems.append(f"Lambda '{fn_name}' state={cfg.get('State')}, not Active")
     if cfg.get("LastUpdateStatus") != "Successful":
         problems.append(f"Lambda '{fn_name}' LastUpdateStatus={cfg.get('LastUpdateStatus')}")
-    env = (cfg.get("Environment") or {}).get("Variables") or {}
+    env_block: JsonDict = cfg.get("Environment") or {}
+    env: dict[str, str] = env_block.get("Variables") or {}
     if switch_key:
         # REPORTED, never alerted: absence of the key means the in-code default ("true").
         kill_switches[switch_key] = env.get(switch_key, "unset(default:true)")
@@ -388,7 +393,7 @@ def _check_lambda_active(spec: dict, now: datetime) -> tuple[list[str], dict]:
 # ── Check: sqs_queue_exists ──────────────────────────────────────────────────
 
 
-def _check_sqs_queue_exists(spec: dict, now: datetime) -> tuple[list[str], dict]:
+def _check_sqs_queue_exists(spec: JsonDict, now: datetime) -> tuple[list[str], JsonDict]:
     """The intake queue (+ optional DLQ) must exist. get_queue_url raises
     ``QueueDoesNotExist`` for a truly-absent queue (a FINDING); any other error
     RAISES (fail-loud — an unreadable queue state must not read as 'present')."""
@@ -405,7 +410,7 @@ def _check_sqs_queue_exists(spec: dict, now: datetime) -> tuple[list[str], dict]
     return problems, {}
 
 
-def _queues_to_check(spec: dict) -> list[tuple[str, str]]:
+def _queues_to_check(spec: JsonDict) -> list[tuple[str, str]]:
     out = [(spec["queue_name"], "intake queue")]
     if spec.get("expect_dlq"):
         out.append((spec["expect_dlq"], "intake DLQ"))
@@ -431,7 +436,7 @@ _DLQ_SEVERE = {"error", "critical"}
 _DLQ_BODY_TRUNC = 300
 
 
-def _dlq_parse_message(msg: dict) -> dict:
+def _dlq_parse_message(msg: JsonDict) -> JsonDict:
     """Best-effort parse of one SQS message as the EventBridge nousergon.alert.v1
     envelope. A message that fails to parse is reported as its own histogram
     bucket ('unparseable') rather than silently dropped or raising — this
@@ -462,12 +467,12 @@ def _dlq_parse_message(msg: dict) -> dict:
         }
 
 
-def _dlq_sample(sqs, queue_url: str, sample_max: int) -> list[dict]:
+def _dlq_sample(sqs: Any, queue_url: str, sample_max: int) -> list[JsonDict]:  # pyright: ignore[reportExplicitAny]  # untyped boto3 client (no stubs)
     """Drain-free sample: repeated short-VisibilityTimeout ReceiveMessage calls
     until either sample_max is reached or two consecutive empty polls (SQS
     ReceiveMessage is best-effort per call; a single empty response does not
     mean the queue is empty). Never calls DeleteMessage or PurgeQueue."""
-    out: list[dict] = []
+    out: list[JsonDict] = []
     consecutive_empty = 0
     while len(out) < sample_max and consecutive_empty < 2:
         resp = sqs.receive_message(
@@ -486,7 +491,7 @@ def _dlq_sample(sqs, queue_url: str, sample_max: int) -> list[dict]:
     return out
 
 
-def _check_sqs_dlq_content(spec: dict, now: datetime) -> tuple[list[dict], dict]:
+def _check_sqs_dlq_content(spec: JsonDict, now: datetime) -> tuple[list[JsonDict], JsonDict]:
     """Sample ``dlq_name`` (read-only), summarize content, ship the summary to
     S3, publish a CloudWatch metric, and surface every error/critical body as
     a liveness finding. If the queue itself is absent this is silent — queue
@@ -580,7 +585,7 @@ def _check_sqs_dlq_content(spec: dict, now: datetime) -> tuple[list[dict], dict]
 # ── Check: scheduler_schedule_exists ─────────────────────────────────────────
 
 
-def _check_scheduler_schedule_exists(spec: dict, now: datetime) -> tuple[list[str], dict]:
+def _check_scheduler_schedule_exists(spec: JsonDict, now: datetime) -> tuple[list[str], JsonDict]:
     """EventBridge Scheduler schedule exists + (by default) ENABLED. A
     DIFFERENT AWS resource from the classic `events` rules the
     ``eventbridge_rule`` check covers — a deleted/disabled Scheduler schedule
@@ -628,7 +633,7 @@ def _cw_timestamp(raw: object) -> datetime | None:
     return parsed
 
 
-def _insufficient_data_age_hours(alarm: dict, now: datetime) -> tuple[float | None, bool]:
+def _insufficient_data_age_hours(alarm: JsonDict, now: datetime) -> tuple[float | None, bool]:
     """Hours this alarm has sat in its state UNDER ITS CURRENT CONFIGURATION,
     and whether a reconfiguration moved the clock.
 
@@ -648,11 +653,11 @@ def _insufficient_data_age_hours(alarm: dict, now: datetime) -> tuple[float | No
         return None, False
     reconfigured_at = _cw_timestamp(alarm.get("AlarmConfigurationUpdatedTimestamp"))
     reconfigured = reconfigured_at is not None and reconfigured_at > transition
-    since = reconfigured_at if reconfigured else transition
+    since = reconfigured_at if reconfigured_at is not None and reconfigured else transition
     return (now - since).total_seconds() / 3600, reconfigured
 
 
-def _check_alarm_coverage(spec: dict, now: datetime) -> tuple[list[str], dict]:
+def _check_alarm_coverage(spec: JsonDict, now: datetime) -> tuple[list[str], JsonDict]:
     """For each registry-declared alarm spec, assert a live CloudWatch alarm
     exists matching a declared name pattern, is not indefinitely stuck in
     INSUFFICIENT_DATA, and its alarm actions include the expected target.
@@ -737,11 +742,11 @@ def _check_alarm_coverage(spec: dict, now: datetime) -> tuple[list[str], dict]:
 # content-fingerprint (below) subsumes groom's per-trigger dedup.
 
 
-def _rw_schedule(spec: dict) -> list[dict]:
+def _rw_schedule(spec: JsonDict) -> list[JsonDict]:
     return spec["schedule"]
 
 
-def _rw_lookback_dates(spec: dict, now: datetime) -> list[str]:
+def _rw_lookback_dates(spec: JsonDict, now: datetime) -> list[str]:
     horizon = now - timedelta(hours=spec["lookback_hours"])
     dates: list[str] = []
     d = horizon.date()
@@ -752,7 +757,7 @@ def _rw_lookback_dates(spec: dict, now: datetime) -> list[str]:
     return dates
 
 
-def _rw_expected_triggers(spec: dict, now: datetime) -> list[dict]:
+def _rw_expected_triggers(spec: JsonDict, now: datetime) -> list[JsonDict]:
     """Enumerate every FIXED-CRON trigger (registry ``schedule``) in the lookback
     window that is now MATURE (had ceiling+margin minutes to finish). Each →
     {at, label}. Kept as a belt-and-braces cross-check alongside the decision-log
@@ -761,7 +766,7 @@ def _rw_expected_triggers(spec: dict, now: datetime) -> list[dict]:
     mature_min = spec["ceiling_min"] + spec["margin_min"]
     horizon = now - timedelta(hours=lookback_hours)
     mature_before = now - timedelta(minutes=mature_min)
-    out: list[dict] = []
+    out: list[JsonDict] = []
     day = (horizon - timedelta(days=1)).date()
     last = now.date()
     while day <= last:
@@ -780,7 +785,7 @@ def _rw_expected_triggers(spec: dict, now: datetime) -> list[dict]:
     return out
 
 
-def _rw_decision_launched(record: dict) -> bool:
+def _rw_decision_launched(record: JsonDict) -> bool:
     """True iff this dispatch-decision record shows AT LEAST ONE launch=true
     decision (handles the top-level ``launched``/``launch`` bool and the
     ``decisions: [...]`` list schema). A skip-only record is NOT expected to
@@ -795,7 +800,7 @@ def _rw_decision_launched(record: dict) -> bool:
     return False
 
 
-def _rw_expected_triggers_from_decisions(spec: dict, s3, now: datetime) -> list[dict]:
+def _rw_expected_triggers_from_decisions(spec: JsonDict, s3: Any, now: datetime) -> list[JsonDict]:  # pyright: ignore[reportExplicitAny]  # untyped boto3 client (no stubs)
     """Enumerate mature expected triggers from the dispatcher's OWN
     dispatch-decision log (``{decision_record_prefix}{date}/*.json``) — how
     sweep-mode (event-driven, no fixed cron) dispatches become visible.
@@ -809,7 +814,7 @@ def _rw_expected_triggers_from_decisions(spec: dict, s3, now: datetime) -> list[
     mature_min = spec["ceiling_min"] + spec["margin_min"]
     horizon = now - timedelta(hours=lookback_hours)
     mature_before = now - timedelta(minutes=mature_min)
-    out: list[dict] = []
+    out: list[JsonDict] = []
     for date in _rw_lookback_dates(spec, now):
         prefix = f"{prefix_root}{date}/"
         token = None
@@ -826,7 +831,8 @@ def _rw_expected_triggers_from_decisions(spec: dict, s3, now: datetime) -> list[
                     spec.get("label"), prefix, exc,
                 )
                 break
-            for obj in resp.get("Contents", []) or []:
+            contents: list[JsonDict] = resp.get("Contents", []) or []
+            for obj in contents:
                 key = obj["Key"]
                 if not key.endswith(".json"):
                     continue
@@ -857,11 +863,11 @@ def _rw_expected_triggers_from_decisions(spec: dict, s3, now: datetime) -> list[
     return out
 
 
-def _rw_all_expected_triggers(spec: dict, s3, now: datetime) -> list[dict]:
+def _rw_all_expected_triggers(spec: JsonDict, s3: Any, now: datetime) -> list[JsonDict]:  # pyright: ignore[reportExplicitAny]  # untyped boto3 client (no stubs)
     """Union of the fixed-cron schedule and the real dispatch-decision log,
     de-duplicated by ``at`` timestamp so a full-mode trigger appearing in BOTH
     sources is never double-counted."""
-    merged: dict[datetime, dict] = {}
+    merged: dict[datetime, JsonDict] = {}
     for trig in _rw_expected_triggers(spec, now):
         merged[trig["at"]] = trig
     for trig in _rw_expected_triggers_from_decisions(spec, s3, now):
@@ -869,7 +875,7 @@ def _rw_all_expected_triggers(spec: dict, s3, now: datetime) -> list[dict]:
     return sorted(merged.values(), key=lambda d: d["at"])
 
 
-def _rw_fetch_run_artifacts(spec: dict, s3, now: datetime) -> list[tuple[datetime, str, dict]]:
+def _rw_fetch_run_artifacts(spec: JsonDict, s3: Any, now: datetime) -> list[tuple[datetime, str, JsonDict]]:  # pyright: ignore[reportExplicitAny]  # untyped boto3 client (no stubs)
     """Recent S3 run artifacts (``{artifact_prefix}{date}/{run_id}.json``) as
     (run_start, key, artifact). PRIMARY input — RAISES on error (fail-loud); a
     malformed individual artifact also raises (skipping it silently would let a
@@ -891,7 +897,7 @@ def _rw_fetch_run_artifacts(spec: dict, s3, now: datetime) -> list[tuple[datetim
     distinction the whole check exists to make."""
     artifact_prefix = spec["artifact_prefix"]
     start_field = spec.get("run_start_field", "run_start")
-    found: list[tuple[datetime, str, dict]] = []
+    found: list[tuple[datetime, str, JsonDict]] = []
     for date in _rw_lookback_dates(spec, now):
         prefix = f"{artifact_prefix}{date}/"
         token = None
@@ -900,7 +906,8 @@ def _rw_fetch_run_artifacts(spec: dict, s3, now: datetime) -> list[tuple[datetim
             if token:
                 kwargs["ContinuationToken"] = token
             resp = s3.list_objects_v2(**kwargs)
-            for obj in resp.get("Contents", []):
+            contents: list[JsonDict] = resp.get("Contents", [])
+            for obj in contents:
                 key = obj["Key"]
                 if not key.endswith(".json"):
                     continue
@@ -923,14 +930,14 @@ def _rw_fetch_run_artifacts(spec: dict, s3, now: datetime) -> list[tuple[datetim
     return found
 
 
-def _rw_missed(spec: dict, triggers: list[dict], stamps: list[datetime]) -> list[dict]:
+def _rw_missed(spec: JsonDict, triggers: list[JsonDict], stamps: list[datetime]) -> list[JsonDict]:
     """A trigger is a MISS iff no run artifact's start timestamp fell inside its
     run window [T, T + ceiling + margin]."""
     window = timedelta(minutes=spec["ceiling_min"] + spec["margin_min"])
     return [trig for trig in triggers if not any(trig["at"] <= s <= trig["at"] + window for s in stamps)]
 
 
-def _rw_resolve_field(field: str, art: dict):
+def _rw_resolve_field(field: str, art: JsonDict) -> object:
     """Resolve a dot-separated field path through a nested artifact dict.
 
     ``"ingested.queue"`` resolves to ``art["ingested"]["queue"]``. A field
@@ -951,7 +958,7 @@ def _rw_resolve_field(field: str, art: dict):
     return value
 
 
-def _rw_clause_holds(clause: dict, art: dict) -> bool:
+def _rw_clause_holds(clause: JsonDict, art: JsonDict) -> bool:
     """Evaluate ONE declarative ``productive_when`` clause against an artifact.
 
     Supported: ``{field: <name>, gt|ge|lt|le|eq: <number-or-value>}``. An
@@ -984,7 +991,7 @@ def _rw_clause_holds(clause: dict, art: dict) -> bool:
     return True
 
 
-def _rw_dead_runs(spec: dict, artifacts: list[tuple[datetime, str, dict]]) -> list[tuple[str, str]]:
+def _rw_dead_runs(spec: JsonDict, artifacts: list[tuple[datetime, str, JsonDict]]) -> list[tuple[str, str]]:
     """Run artifacts that prove a box BOOTED but not that the run did anything.
 
     A pure existence check answers "was an artifact written?", which is not the
@@ -1035,7 +1042,7 @@ def _rw_dead_runs(spec: dict, artifacts: list[tuple[datetime, str, dict]]) -> li
     return out
 
 
-def _check_run_window(spec: dict, now: datetime) -> tuple[list[dict], dict]:
+def _check_run_window(spec: JsonDict, now: datetime) -> tuple[list[JsonDict], JsonDict]:
     """Per-trigger run-window accounting — a mature scheduled run with no
     covering S3 artifact = a silent death (ported from groom-liveness-probe,
     minus its per-trigger dedup which the unified fingerprint subsumes).
@@ -1052,7 +1059,7 @@ def _check_run_window(spec: dict, now: datetime) -> tuple[list[dict], dict]:
         return [], {}
     artifacts = _rw_fetch_run_artifacts(spec, s3, now)  # PRIMARY — fail-loud
     misses = _rw_missed(spec, triggers, [a[0] for a in artifacts])
-    findings: list[dict] = []
+    findings: list[JsonDict] = []
     if misses:
         when = ", ".join(m["at"].strftime("%m-%d %H:%M") + "Z" for m in misses[:_HEADLINE_ITEMS])
         if len(misses) > _HEADLINE_ITEMS:
@@ -1097,16 +1104,16 @@ def _check_run_window(spec: dict, now: datetime) -> tuple[list[dict], dict]:
 _SF_FAILURE_STATUSES = ("FAILED", "TIMED_OUT", "ABORTED")
 
 
-def _list_recent_sf_failures(sfn, state_machine_arn: str, horizon: datetime) -> list[dict]:
+def _list_recent_sf_failures(sfn: Any, state_machine_arn: str, horizon: datetime) -> list[JsonDict]:  # pyright: ignore[reportExplicitAny]  # untyped boto3 client (no stubs)
     """Every FAILED/TIMED_OUT/ABORTED execution of this state machine with
     stopDate >= horizon. ListExecutions returns executions newest-first within
     each status filter, so paging stops as soon as one is older than horizon.
     PRIMARY input — RAISES on any API error (fail-loud)."""
-    out: list[dict] = []
+    out: list[JsonDict] = []
     for status in _SF_FAILURE_STATUSES:
         token = None
         while True:
-            kwargs: dict = {
+            kwargs: JsonDict = {
                 "stateMachineArn": state_machine_arn,
                 "statusFilter": status,
                 "maxResults": 100,
@@ -1127,7 +1134,7 @@ def _list_recent_sf_failures(sfn, state_machine_arn: str, horizon: datetime) -> 
     return out
 
 
-def _sf_watch_run_date_for_execution(sfn, execu: dict, now: datetime) -> str:
+def _sf_watch_run_date_for_execution(sfn: Any, execu: JsonDict, now: datetime) -> str:  # pyright: ignore[reportExplicitAny]  # untyped boto3 client (no stubs)
     """Mirror saturday-sf-watch-dispatcher._run_date verbatim: prefer the
     execution input's ``run_date``, else the execution ``startDate``, else
     ``now`` — so this check reads the EXACT S3 key the dispatcher itself would
@@ -1157,7 +1164,7 @@ def _sf_watch_run_date_for_execution(sfn, execu: dict, now: datetime) -> str:
     return now.date().isoformat()
 
 
-def _watch_log_events(s3, key: str) -> list[dict] | None:
+def _watch_log_events(s3: Any, key: str) -> list[JsonDict] | None:  # pyright: ignore[reportExplicitAny]  # untyped boto3 client (no stubs)
     """Read + parse the day's watch-log doc, or None if it genuinely does not
     exist yet (the common no-failure-today case). Any OTHER read error — 403
     above all, the exact 2026-07-17 incident class — RAISES (fail-loud): a
@@ -1177,7 +1184,7 @@ def _watch_log_events(s3, key: str) -> list[dict] | None:
     return events if isinstance(events, list) else []
 
 
-def _check_sf_watch_invocation_success(spec: dict, now: datetime) -> tuple[list[dict], dict]:
+def _check_sf_watch_invocation_success(spec: JsonDict, now: datetime) -> tuple[list[JsonDict], JsonDict]:
     """Per registered pipeline, every MATURE (older than
     ``response_window_min``) terminal-failure execution within
     ``lookback_hours`` must have produced a matching watch-log event. A miss
@@ -1251,7 +1258,7 @@ def _check_sf_watch_invocation_success(spec: dict, now: datetime) -> tuple[list[
 #   lookback_hours — how far back to look for dispatched-but-unfinished boxes
 
 
-def _family_dispatch_records(s3, spec: dict, now: datetime) -> list[dict]:
+def _family_dispatch_records(s3: Any, spec: JsonDict, now: datetime) -> list[JsonDict]:  # pyright: ignore[reportExplicitAny]  # untyped boto3 client (no stubs)
     """Enumerate dispatch records within the lookback window. Each record must
     carry at minimum the ``completion_key_field`` value and a timestamp field
     (``dispatched_at``, ``decided_at``, or ``at``). Returns list of
@@ -1267,7 +1274,7 @@ def _family_dispatch_records(s3, spec: dict, now: datetime) -> list[dict]:
     mature_before = now - timedelta(minutes=spec["response_window_min"])
     horizon = now - timedelta(hours=lookback_hours)
     key_field = spec.get("completion_key_field")
-    records: list[dict] = []
+    records: list[JsonDict] = []
     token = None
     while True:
         kwargs = {"Bucket": WATCH_BUCKET, "Prefix": prefix}
@@ -1278,7 +1285,8 @@ def _family_dispatch_records(s3, spec: dict, now: datetime) -> list[dict]:
         except Exception:  # noqa: BLE001 — best-effort enumeration
             logger.warning("dispatch_invocation_success: list failed for %s", prefix, exc_info=True)
             break
-        for obj in resp.get("Contents", []) or []:
+        contents: list[JsonDict] = resp.get("Contents", []) or []
+        for obj in contents:
             key = obj["Key"]
             if not key.endswith(".json"):
                 continue
@@ -1324,7 +1332,7 @@ def _family_dispatch_records(s3, spec: dict, now: datetime) -> list[dict]:
     return records
 
 
-def _check_dispatch_invocation_success(spec: dict, now: datetime) -> tuple[list[str], dict]:
+def _check_dispatch_invocation_success(spec: JsonDict, now: datetime) -> tuple[list[str], JsonDict]:
     """For every mature dispatch record in the lookback window, assert a
     completion marker exists at ``{completion_prefix}/{completion_key}.json``.
     A missing marker means the box was launched but never finished — it died
@@ -1381,7 +1389,7 @@ _ADC_FAILED_STATUSES = {"Failed", "TimedOut", "Cancelled", "Cancelling"}
 _ADC_RUNNING_STATUSES = {"Pending", "InProgress", "Delayed"}
 
 
-def _check_agent_dispatch_completeness(spec: dict, now: datetime) -> tuple[list[dict], dict]:
+def _check_agent_dispatch_completeness(spec: JsonDict, now: datetime) -> tuple[list[JsonDict], JsonDict]:
     """For every dispatch the dispatch ledger records as launched=True within
     lookback_hours, the corresponding SSM command must have reached a terminal
     Success status. A command that terminated non-success (or is still running
@@ -1408,7 +1416,7 @@ def _check_agent_dispatch_completeness(spec: dict, now: datetime) -> tuple[list[
         lookup_dates.append(d.isoformat())
         d += timedelta(days=1)
 
-    dispatched: list[dict] = []
+    dispatched: list[JsonDict] = []
     for date in lookup_dates:
         prefix = f"{prefix_root}{date}/"
         token = None
@@ -1417,7 +1425,8 @@ def _check_agent_dispatch_completeness(spec: dict, now: datetime) -> tuple[list[
             if token:
                 kwargs["ContinuationToken"] = token
             resp = s3.list_objects_v2(**kwargs)
-            for obj in resp.get("Contents", []) or []:
+            contents: list[JsonDict] = resp.get("Contents", []) or []
+            for obj in contents:
                 key = obj["Key"]
                 if not key.endswith(".json"):
                     continue
@@ -1477,7 +1486,7 @@ def _check_agent_dispatch_completeness(spec: dict, now: datetime) -> tuple[list[
     # CHECKERS dispatch table isolates a per-check runtime error — an
     # AccessDenied will become its own problem line, not crash the probe).
     ssm = boto3.client("ssm", region_name=REGION)
-    missed: list[dict] = []
+    missed: list[JsonDict] = []
     for entry in dispatched:
         command_id = entry["command_id"]
         try:
@@ -1623,15 +1632,20 @@ CHECKERS = {
 }
 
 
-def _iter_check_specs(registry: dict) -> list[tuple[str, dict]]:
+def _iter_check_specs(registry: JsonDict) -> list[tuple[str, JsonDict]]:
     """Every liveness check in the registry, as (source_label, spec) — each
     playbook's ``liveness.checks`` (sorted for determinism) then the top-level
     ``watch_plane_liveness.checks``."""
-    specs: list[tuple[str, dict]] = []
-    for pb_name, pb in sorted((registry.get("playbooks") or {}).items()):
-        for spec in ((pb.get("liveness") or {}).get("checks") or []):
+    specs: list[tuple[str, JsonDict]] = []
+    playbooks: dict[str, JsonDict] = registry.get("playbooks") or {}
+    for pb_name, pb in sorted(playbooks.items()):
+        liveness: JsonDict = pb.get("liveness") or {}
+        pb_checks: list[JsonDict] = liveness.get("checks") or []
+        for spec in pb_checks:
             specs.append((f"playbook:{pb_name}", spec))
-    for spec in ((registry.get("watch_plane_liveness") or {}).get("checks") or []):
+    wpl_block: JsonDict = registry.get("watch_plane_liveness") or {}
+    wpl_checks: list[JsonDict] = wpl_block.get("checks") or []
+    for spec in wpl_checks:
         specs.append(("watch_plane", spec))
     return specs
 
@@ -1642,7 +1656,7 @@ def _component_name(label: str) -> str:
     return label.split(":", 1)[1] if label.startswith("playbook:") else label.replace("_", "-")
 
 
-def _run_checks(now: datetime) -> tuple[list[dict], dict[str, str], int, int]:
+def _run_checks(now: datetime) -> tuple[list[JsonDict], dict[str, str], int, int, JsonDict]:
     """Run every registry-declared liveness check, aggregating findings +
     reported kill-switches.
 
@@ -1667,7 +1681,7 @@ def _run_checks(now: datetime) -> tuple[list[dict], dict[str, str], int, int]:
 
     Returns (findings, kill_switches, checks_run, checks_failed, reconciliation)."""
     registry = _registry()
-    findings: list[dict] = []
+    findings: list[JsonDict] = []
     kill_switches: dict[str, str] = {}
     checks_run = 0
     checks_failed = 0
@@ -1730,7 +1744,7 @@ def _stable_problem_key(problem: str) -> str:
     return hashlib.sha256(problem.encode()).hexdigest()[:16]
 
 
-def _load_alerted_state(s3) -> dict[str, str] | None:
+def _load_alerted_state(s3: Any) -> dict[str, str] | None:  # pyright: ignore[reportExplicitAny]  # untyped boto3 client (no stubs)
     """Previously-alerted per-problem state: ``{fingerprint: problem_text}``.
 
     Returns ``None`` when there is no prior state at all (first-ever run, or
@@ -1758,7 +1772,7 @@ def _load_alerted_state(s3) -> dict[str, str] | None:
         return None
 
 
-def _save_alerted_state(s3, state: dict[str, str] | None) -> None:
+def _save_alerted_state(s3: Any, state: dict[str, str] | None) -> None:  # pyright: ignore[reportExplicitAny]  # untyped boto3 client (no stubs)
     """Persist (or clear) the per-problem dedup state.
 
     ``state is None`` (or ``{}``) clears the state — written as ``{}`` so
@@ -1780,7 +1794,7 @@ def _save_alerted_state(s3, state: dict[str, str] | None) -> None:
         logger.warning("could not persist overseer liveness state %s: %s", STATE_KEY, exc)
 
 
-def _write_detail_report(s3, findings: list[dict], now: datetime,
+def _write_detail_report(s3: Any, findings: list[JsonDict], now: datetime,  # pyright: ignore[reportExplicitAny]  # untyped boto3 client (no stubs)
                          checks_run: int, checks_failed: int) -> str | None:
     """Persist the full per-finding prose and return its s3:// URI, or None if
     the write failed.
@@ -1853,7 +1867,7 @@ def _alert_diff(
 
 
 def _alert(
-    new_findings: list[dict],
+    new_findings: list[JsonDict],
     continuing_count: int,
     resolved_count: int,
     total_findings: int,
@@ -1959,7 +1973,7 @@ def _alert(
         return False
 
 
-def _compute_reconciliation(registry: dict) -> dict:
+def _compute_reconciliation(registry: JsonDict) -> JsonDict:
     """Registry-vs-live reconciliation summary (alpha-engine-config-I4482 item 3).
 
     Returns declared counts for the handler's return payload:
@@ -1967,7 +1981,7 @@ def _compute_reconciliation(registry: dict) -> dict:
       - schedule_checks_declared: total ``scheduler_schedule_exists`` check specs
       - alarm_coverage_declared: total ``alarm_coverage`` check specs
     """
-    playbooks = registry.get("playbooks") or {}
+    playbooks: dict[str, JsonDict] = registry.get("playbooks") or {}
     n_playbooks = sum(
         1 for pb in playbooks.values()
         if isinstance(pb.get("liveness"), dict) and pb["liveness"].get("checks")
@@ -1975,13 +1989,16 @@ def _compute_reconciliation(registry: dict) -> dict:
     n_schedule = 0
     n_alarm = 0
     for pb in playbooks.values():
-        for spec in (pb.get("liveness") or {}).get("checks") or []:
+        liveness: JsonDict = pb.get("liveness") or {}
+        pb_checks: list[JsonDict] = liveness.get("checks") or []
+        for spec in pb_checks:
             if spec.get("type") == "scheduler_schedule_exists":
                 n_schedule += 1
             elif spec.get("type") == "alarm_coverage":
                 n_alarm += 1
     # Also count watch_plane_liveness (top-level, cross-cutting checks).
-    wpl = (registry.get("watch_plane_liveness") or {}).get("checks") or []
+    wpl_block: JsonDict = registry.get("watch_plane_liveness") or {}
+    wpl: list[JsonDict] = wpl_block.get("checks") or []
     for spec in wpl:
         if spec.get("type") == "scheduler_schedule_exists":
             n_schedule += 1
@@ -1994,7 +2011,7 @@ def _compute_reconciliation(registry: dict) -> dict:
     }
 
 
-def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
+def handler(event: JsonDict, context: object) -> JsonDict:  # noqa: ARG001 — Lambda contract
     """Scheduled (EventBridge) entrypoint. Iterates the playbook registry,
     runs every declared liveness check read-only, dedups PER PROBLEM
     (alpha-engine-config-I5207), and LOUD-alerts only when NEW problems appear.

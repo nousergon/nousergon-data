@@ -107,6 +107,7 @@ import re
 import time
 import uuid
 from datetime import datetime, timedelta
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import boto3
@@ -119,6 +120,9 @@ from nousergon_lib import dispatch_lease
 from nousergon_lib import groom_eligibility as ge
 from nousergon_lib import spot_dispatch
 from nousergon_lib.flow_doctor_fleet import FleetTelegramTopic
+
+# Registry/S3/GitHub JSON bodies and boto3 responses are untyped JSON (boto3 ships no stubs).
+JsonDict = dict[str, Any]  # pyright: ignore[reportExplicitAny]  # raw S3 / GitHub / boto3 response JSON
 
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
@@ -457,7 +461,7 @@ if _unknown_primary_tiers:
     )
 
 
-def _primary_backend_for(tiers) -> str | None:
+def _primary_backend_for(tiers: tuple[str, ...]) -> str | None:
     """PRIMARY-mode DeepSeek selection (alpha-engine-config-I3479): returns
     ``GROOM_BACKEND_DEEPSEEK`` iff ``GROOM_PRIMARY_DEEPSEEK_TIERS`` is armed
     (non-empty) AND every tier in this launch's bundle is a member of it —
@@ -492,7 +496,7 @@ def _primary_backend_for(tiers) -> str | None:
 
 
 
-def _resolve_run_mode(event: dict) -> str:
+def _resolve_run_mode(event: JsonDict) -> str:
     """Pull run-mode from the EventBridge Scheduler input; unknown/missing → full."""
     rm = str(event.get("run_mode") or _DEFAULT_RUN_MODE).strip().lower()
     if rm not in _VALID_RUN_MODES:
@@ -501,7 +505,7 @@ def _resolve_run_mode(event: dict) -> str:
     return rm
 
 
-def _resolve_issue_filter(event: dict) -> str:
+def _resolve_issue_filter(event: JsonDict) -> str:
     """Pull issue_filter from the schedule input; unknown/missing → mid-only (Sonnet queue)."""
     f = str(event.get("issue_filter") or _DEFAULT_ISSUE_FILTER).strip().lower()
     if f == "default":
@@ -512,7 +516,7 @@ def _resolve_issue_filter(event: dict) -> str:
     return f
 
 
-def _resolve_model(event: dict) -> str:
+def _resolve_model(event: JsonDict) -> str:
     """Pull model from the schedule input; missing/malformed → default (Sonnet 5)."""
     m = str(event.get("model") or _DEFAULT_MODEL).strip()
     if not _MODEL_RE.match(m):
@@ -521,7 +525,7 @@ def _resolve_model(event: dict) -> str:
     return m
 
 
-def _resolve_force_on_demand(event: dict) -> bool:
+def _resolve_force_on_demand(event: JsonDict) -> bool:
     """config#1645: set by the dispatch Step Function's relaunch loop on the
     final bounded retry after repeated spot-interruption (mid-run box death,
     not a launch-time capacity error — see _launch_instance) — forces this
@@ -531,7 +535,7 @@ def _resolve_force_on_demand(event: dict) -> bool:
     return bool(event.get("force_on_demand", False))
 
 
-def _resolve_attempt(event: dict) -> int:
+def _resolve_attempt(event: JsonDict) -> int:
     """alpha-engine-config-I5923: which launch ATTEMPT this is for the lane —
     0 for the initial launch, 1..max_retries for each bounded relaunch. Set by
     the dispatch Step Function (``$.fod.attempt``, seeded 0 in the Map's
@@ -581,7 +585,7 @@ def _rotated_instance_types(tier_tag: str, attempt: int) -> list[str]:
     return INSTANCE_TYPES[offset:] + INSTANCE_TYPES[:offset]
 
 
-def _resolve_soft_limit_min(event: dict) -> int | None:
+def _resolve_soft_limit_min(event: JsonDict) -> int | None:
     """Optional bounded-test override — NOT set by any of the 3 live schedules
     (their SCHED_INPUTS carry no such key), only by a manual `aws lambda invoke`
     validating a change before/without waiting for the cron. Missing/invalid →
@@ -600,7 +604,7 @@ def _resolve_soft_limit_min(event: dict) -> int | None:
     return n
 
 
-def _task_token(event: dict) -> str:
+def _task_token(event: JsonDict) -> str:
     """The SF task token for this ``launch_decided`` invocation, or "".
 
     config-I4333: the token arrives INSIDE the Lambda ``Payload``, under the key
@@ -632,7 +636,7 @@ def _task_token(event: dict) -> str:
     return str(raw).strip() if raw else ""
 
 
-def _resolve_launch_decided_backend(event: dict) -> str:
+def _resolve_launch_decided_backend(event: JsonDict) -> str:
     """Validate the ``backend`` threaded through a ``launch_decided`` SF
     invocation (PRIMARY-mode DeepSeek selection, alpha-engine-config-I3479)
     against the fixed vocabulary — only ``GROOM_BACKEND_DEEPSEEK``
@@ -654,7 +658,7 @@ def _resolve_launch_decided_backend(event: dict) -> str:
     return backend
 
 
-def _resolve_pr_budget(event: dict) -> int | None:
+def _resolve_pr_budget(event: JsonDict) -> int | None:
     """Optional per-schedule PR budget override (config#1769).
 
     Only the dedicated high-only schedule sets this today; missing/invalid → None
@@ -757,7 +761,7 @@ export GROOM_RUN_TOKEN={run_token}
 def _launch_instance(force_on_demand: bool = False,
                      tier_tag: str = "",
                      attempt: int = 0,
-                     extra_identity_tags: dict | None = None) -> tuple[str, str]:
+                     extra_identity_tags: JsonDict | None = None) -> tuple[str, str]:
     """Launch the groom box; spot first, on-demand fallback on capacity exhaustion
     OR when force_on_demand (config#1645: the dispatch SF's last bounded relaunch
     attempt after repeated mid-run spot interruption — skip straight to on-demand
@@ -994,7 +998,7 @@ def _dispatch_state_machine_arn(execution_arn: str) -> str:
     return ":".join(parts[:5] + ["stateMachine", parts[6]])
 
 
-def _concurrent_cycle_blockers(execution_arn: str) -> list[dict]:
+def _concurrent_cycle_blockers(execution_arn: str) -> list[JsonDict]:
     """RUNNING sibling executions of this dispatch SF that started BEFORE us.
 
     **Why this guard exists (alpha-engine-config-I5371).** The dispatch SF
@@ -1030,7 +1034,7 @@ def _concurrent_cycle_blockers(execution_arn: str) -> list[dict]:
     sm_arn = _dispatch_state_machine_arn(execution_arn)
     try:
         sfn = boto3.client("stepfunctions", region_name=REGION)
-        running: list[dict] = []
+        running: list[JsonDict] = []
         kwargs = {"stateMachineArn": sm_arn, "statusFilter": "RUNNING", "maxResults": 100}
         while True:
             page = sfn.list_executions(**kwargs)
@@ -1100,7 +1104,7 @@ def _utc_today() -> str:
     return datetime.now(ZoneInfo("UTC")).strftime("%Y-%m-%d")
 
 
-def _notify_cycle(text: str, *, severity: str, dedup_key: str, context: dict,
+def _notify_cycle(text: str, *, severity: str, dedup_key: str, context: JsonDict,
                   silent: bool = False) -> None:
     """Send one CYCLE-level lifecycle ping (buzzing unless ``silent``) — never raises.
 
@@ -1131,7 +1135,7 @@ def _notify_cycle(text: str, *, severity: str, dedup_key: str, context: dict,
         logger.warning("cycle lifecycle Telegram failed (non-fatal): %s", exc)
 
 
-def _notify_cycle_started(decide_payload: dict, schedule_label: str) -> None:
+def _notify_cycle_started(decide_payload: JsonDict, schedule_label: str) -> None:
     """Buzzing STARTED ping naming exactly which lanes this trigger launches.
 
     Emitted from the decide phase — the single chokepoint every `decide_only`
@@ -1238,7 +1242,7 @@ def _skip_verdict(reason: str | None) -> tuple[str, bool, str]:
     return ("❔", False, f"unrecognized skip reason {reason!r}")
 
 
-def _lane_rows(map_outcome: list) -> tuple[list[str], bool]:
+def _lane_rows(map_outcome: list[object]) -> tuple[list[str], bool]:
     """Render one row per lane; return (rows, any_degraded).
 
     Totality matters more than prettiness here: every element of map_outcome
@@ -1281,7 +1285,7 @@ def _lane_rows(map_outcome: list) -> tuple[list[str], bool]:
     return rows, degraded
 
 
-def _notify_cycle_complete(cycle: dict) -> dict:
+def _notify_cycle_complete(cycle: JsonDict) -> JsonDict:
     """Buzzing COMPLETE roll-up — one ping per trigger, every lane named.
 
     Invoked by the dispatch SF immediately before its terminal Succeed/Fail
@@ -1300,7 +1304,7 @@ def _notify_cycle_complete(cycle: dict) -> dict:
     schedule_label = str(
         cycle.get("schedule") or sched_input.get("schedule") or "unknown"
     )
-    map_outcome = cycle.get("mapOutcome") or []
+    map_outcome: list[object] = cycle.get("mapOutcome") or []
     sweep = cycle.get("sweep") or {}
     map_failure = cycle.get("mapFailure")
 
@@ -1378,7 +1382,7 @@ def _notify_cycle_complete(cycle: dict) -> dict:
     }
 
 
-def _decide_result(decide_payload: dict, schedule_label: str) -> dict:
+def _decide_result(decide_payload: JsonDict, schedule_label: str) -> JsonDict:
     """SINGLE chokepoint for every ``decide_only`` response.
 
     Every early return in the decide phase routes through here so the STARTED
@@ -1390,7 +1394,7 @@ def _decide_result(decide_payload: dict, schedule_label: str) -> dict:
     return {"decide": decide_payload}
 
 
-def _handle_cycle_complete(event: dict) -> dict:
+def _handle_cycle_complete(event: JsonDict) -> JsonDict:
     """``{"mode": "cycle_complete", "cycle": {...}}`` — SF terminal roll-up.
 
     A FOURTH invocation shape alongside fallback / decide_only / launch_decided,
@@ -1406,7 +1410,7 @@ def _handle_cycle_complete(event: dict) -> dict:
         return {"cycleNotify": {"notified": False, "error": str(exc)}}
 
 
-def _notify_concurrent_cycle_skip(blockers: list[dict], schedule_label: str,
+def _notify_concurrent_cycle_skip(blockers: list[JsonDict], schedule_label: str,
                                   execution_arn: str) -> None:
     """Loud ping for a whole-cycle singleton skip — never raises.
 
@@ -1621,7 +1625,7 @@ def _write_dispatch_ledger_entry(run_token: str, tier_tag: str, schedule_label: 
     eventually, never spin invisibly)."""
     today = datetime.now(ZoneInfo("UTC")).strftime("%Y-%m-%d")
     key = f"{_DISPATCH_LEDGER_PREFIX}/{today}/{run_token}.json"
-    fields: dict = {
+    fields: JsonDict = {
         "run_token": run_token, "tier_tag": tier_tag, "schedule": schedule_label,
         "instance_id": instance_id,
         "deadline_utc": deadline_utc,
@@ -1733,7 +1737,7 @@ def _scan_days(now: datetime) -> list[str]:
     return [(now - timedelta(days=offset)).strftime("%Y-%m-%d") for offset in (0, 1)]
 
 
-def _latest_ledger_entry_for_lane(tier_tag: str, days: list[str]) -> dict:
+def _latest_ledger_entry_for_lane(tier_tag: str, days: list[str]) -> JsonDict:
     """The most recent dispatch-ledger entry for one lane, or {}.
 
     alpha-engine-config-I5914. The SF's relaunch ladder does not know the run
@@ -1747,7 +1751,7 @@ def _latest_ledger_entry_for_lane(tier_tag: str, days: list[str]) -> dict:
         return {}
     s3 = boto3.client("s3", region_name=REGION)
     paginator = s3.get_paginator("list_objects_v2")
-    best: dict = {}
+    best: JsonDict = {}
     best_sort = None
     for day in days:
         prefix = f"{_DISPATCH_LEDGER_PREFIX}/{day}/"
@@ -1792,7 +1796,7 @@ def _le_sort(a: tuple, b: tuple) -> bool:
     return at is None  # a missing timestamp is treated as older
 
 
-def _handle_retry_marker(event: dict) -> dict:
+def _handle_retry_marker(event: JsonDict) -> JsonDict:
     """Answer the SF's ONE question before a relaunch: did this lane finish?
 
     alpha-engine-config-I5914. The ``CheckCompletionMarkerTaskToken`` state has
@@ -1840,7 +1844,7 @@ def _handle_retry_marker(event: dict) -> dict:
     }
 
 
-def _reconcile_lane_death() -> dict:
+def _reconcile_lane_death() -> JsonDict:
     """Reconciler entry point — enumerate open expectations, check each one
     against live EC2 state, page on death or deadline exceedance.
 
@@ -1864,7 +1868,7 @@ def _reconcile_lane_death() -> dict:
     ec2 = boto3.client("ec2", region_name=REGION)
 
     # 1. Collect open expectations — ledger entries with no completion marker.
-    open_expectations: list[dict] = []
+    open_expectations: list[JsonDict] = []
     seen_tokens: set[str] = set()
     paginator = s3.get_paginator("list_objects_v2")
     for day in scan_days:
@@ -2111,7 +2115,7 @@ def _reconcile_lane_death() -> dict:
             "checked_at": now.isoformat()}
 
 
-def _reconcile_trigger_health() -> dict:
+def _reconcile_trigger_health() -> JsonDict:
     """Trigger-health reconciler leg (alpha-engine-config-I4988) — page when a
     dispatch-SF execution left no decision record.
 
@@ -2162,7 +2166,7 @@ def _reconcile_trigger_health() -> dict:
     mature_before = now - timedelta(minutes=_TRIGGER_HEALTH_MATURITY_MIN)
     checked = 0
     paged = 0
-    missing: list[dict] = []
+    missing: list[JsonDict] = []
     for ex in resp.get("executions", []):
         started = ex.get("startDate")
         if started is None:
@@ -2258,7 +2262,7 @@ def _reconcile_trigger_health() -> dict:
 _LANE_YIELD_STARVATION_EVAL_HOUR_UTC = 22
 
 
-def _reconcile_lane_yield_starvation() -> dict:
+def _reconcile_lane_yield_starvation() -> JsonDict:
     """Page when a lane yielded its per-lane dispatch lease (I6460) on
     EVERY decision recorded for it today, with zero successful launches.
 
@@ -2294,7 +2298,7 @@ def _reconcile_lane_yield_starvation() -> dict:
         return {"evaluated": False, "error": str(exc), "paged": 0}
 
     # tier_tag -> {"launched": bool, "yielded": int, "other": int}
-    tallies: dict[str, dict] = {}
+    tallies: dict[str, JsonDict] = {}
     for key in keys:
         try:
             body = json.loads(s3.get_object(Bucket=_RESEARCH_BUCKET, Key=key)["Body"].read())
@@ -2351,7 +2355,7 @@ def _reconcile_lane_yield_starvation() -> dict:
     return {"evaluated": True, "starved_lanes": starved, "paged": paged, "tallies": tallies}
 
 
-def _s3_key_exists(s3, key: str) -> bool:
+def _s3_key_exists(s3: Any, key: str) -> bool:  # pyright: ignore[reportExplicitAny]  # untyped boto3 client (no stubs)
     """True iff ``key`` exists. head_object on a missing key raises
     ClientError/404 — the same shape the lane-death leg relies on."""
     try:
@@ -2365,7 +2369,7 @@ def _s3_key_exists(s3, key: str) -> bool:
 _SCHEDULED_CYCLE_PREFIX = "groom/_control/scheduled"
 
 
-def _write_scheduled_cycle_record(s3, date: str, hhmm: str, started, ex: dict) -> None:
+def _write_scheduled_cycle_record(s3: Any, date: str, hhmm: str, started: datetime, ex: JsonDict) -> None:  # pyright: ignore[reportExplicitAny]  # untyped boto3 client (no stubs)
     """F8 deliverable 1 — the scheduled-cycle record, produced by the
     SCHEDULER (this reconciler tick, reading the dispatch SF's own execution
     history) independently of the cycle it describes. ``started-versus-
@@ -2412,7 +2416,7 @@ def _write_scheduled_cycle_record(s3, date: str, hhmm: str, started, ex: dict) -
 _LANE_START_MATURITY_MIN = 12  # SSM online budget (180s) + dnf/git-clone (~2-4min) + margin
 
 
-def _reconcile_lane_start_health() -> dict:
+def _reconcile_lane_start_health() -> JsonDict:
     """Page a decided lane launch that never wrote its on-box started marker
     within `_LANE_START_MATURITY_MIN` of being dispatched — instead of the 6h
     SF timeout. Scans today's + yesterday's dispatch ledger (mirrors
@@ -2432,7 +2436,7 @@ def _reconcile_lane_start_health() -> dict:
     s3 = boto3.client("s3", region_name=REGION)
     checked = 0
     paged = 0
-    newly_found: list[dict] = []
+    newly_found: list[JsonDict] = []
     for delta_days in range(2):
         day = (now - timedelta(days=delta_days)).strftime("%Y-%m-%d")
         prefix = f"{_DISPATCH_LEDGER_PREFIX}/{day}/"
@@ -2577,7 +2581,7 @@ def _launch_groom_spot(run_mode: str, schedule_label: str, model: str, issue_fil
                        queue_manifest_key: str = "",
                        backend: str = "",
                        task_token: str = "",
-                       attempt: int = 0) -> dict:
+                       attempt: int = 0) -> JsonDict:
     """Launch + bootstrap the groom box. Fail-loud — any error RAISES.
 
     ``backend`` (quota-fallback 3-repo feature, default ``""`` = unchanged
@@ -2843,7 +2847,7 @@ def _github_token() -> str:
     return resp["Parameter"]["Value"].strip()
 
 
-def _gh_rest(path: str, token: str):
+def _gh_rest(path: str, token: str) -> Any:  # pyright: ignore[reportExplicitAny]  # raw GitHub REST JSON body
     """Minimal authenticated GET against the GitHub REST API — mirrors this
     module's existing per-repo issue-list transport verbatim (urllib +
     ``token`` auth, NOT ``Bearer``: matches every other call in this file)."""
@@ -2876,14 +2880,14 @@ def _list_org_repos(token: str) -> list[str]:
     return repos
 
 
-def _ruling_pending_prs_for_repo(repo: str, token: str) -> list[dict]:
+def _ruling_pending_prs_for_repo(repo: str, token: str) -> list[JsonDict]:
     """Fallback per-repo fetch: OPEN PRs on ``repo`` carrying
     ``ge.RULING_PENDING_LABEL``. The ``/issues`` endpoint's ``labels=``
     filter also matches issues sharing the label — keep only items carrying
     a ``pull_request`` key, mirroring the issue/PR split every other
     enumeration in this file already does (e.g. ``_enumerate_tier_stats``'s
     ``"pull_request" in it`` check)."""
-    out: list[dict] = []
+    out: list[JsonDict] = []
     page = 1
     while True:
         batch = _gh_rest(
@@ -2899,7 +2903,7 @@ def _ruling_pending_prs_for_repo(repo: str, token: str) -> list[dict]:
     return out
 
 
-def _enumerate_ruling_pending_prs(token: str) -> list[dict]:
+def _enumerate_ruling_pending_prs(token: str) -> list[JsonDict]:
     """Org-wide OPEN PRs labeled ``ge.RULING_PENDING_LABEL`` (config-I3199 /
     config-I3227 — binding operator rulings awaiting execution, folded into
     every on-box tier lane by groom_driver.py's ``ruling_exec_pr_pool`` since
@@ -2923,7 +2927,7 @@ def _enumerate_ruling_pending_prs(token: str) -> list[dict]:
     """
     query = f'org:{_GH_ORG} is:pr is:open label:"{ge.RULING_PENDING_LABEL}"'
     try:
-        items: list[dict] = []
+        items: list[JsonDict] = []
         page = 1
         while True:
             batch = _gh_rest(
@@ -2941,7 +2945,7 @@ def _enumerate_ruling_pending_prs(token: str) -> list[dict]:
         logger.warning(
             "org-wide ruling:pending-exec PR search failed (%s) — falling "
             "back to a live per-repo org walk", exc)
-        out: list[dict] = []
+        out: list[JsonDict] = []
         for repo in _list_org_repos(token):
             try:
                 for it in _ruling_pending_prs_for_repo(repo, token):
@@ -2952,7 +2956,7 @@ def _enumerate_ruling_pending_prs(token: str) -> list[dict]:
         return out
 
 
-def _enumerate_tier_stats(token: str) -> tuple[dict, dict, bool]:
+def _enumerate_tier_stats(token: str) -> tuple[dict[str, int], dict[str, float], bool]:
     """(counts per tier, oldest wait-hours per tier, has actionable P0).
 
     Wait = hours since the issue's last activity (updatedAt) — the operative
@@ -3013,7 +3017,7 @@ def _enumerate_tier_stats(token: str) -> tuple[dict, dict, bool]:
     return counts, oldest, has_p0
 
 
-def _write_decision_record(slot_tier: str, decision, counts: dict,
+def _write_decision_record(slot_tier: str, decision: ge.SlotDecision, counts: JsonDict,
                            schedule_label: str, backend: str = "") -> None:
     """groom/decisions/{date}/{slot}.json — a skipped slot must be
     distinguishable from a broken scheduler (no-silent-caps). Best-effort.
@@ -3069,7 +3073,7 @@ def _notify_demand_trigger_failed(exc: Exception, schedule_label: str) -> None:
         logger.warning("trigger-failed Telegram failed (non-fatal): %s", notify_exc)
 
 
-def _notify_demand_skip(decision, counts: dict, schedule_label: str) -> None:
+def _notify_demand_skip(decision: ge.SlotDecision, counts: JsonDict, schedule_label: str) -> None:
     """Best-effort ping for a demand-gate skip — never raises."""
     text = (
         "⚪ Backlog groom slot SKIPPED — light queue (config#1933). "
@@ -3092,7 +3096,7 @@ def _notify_demand_skip(decision, counts: dict, schedule_label: str) -> None:
         logger.warning("demand-skip Telegram failed (non-fatal): %s", exc)
 
 
-def _demand_decision(issue_filter: str, schedule_label: str):
+def _demand_decision(issue_filter: str, schedule_label: str) -> tuple[ge.SlotDecision, dict[str, int], str] | None:
     """config#1933 enumerate-then-decide. Returns ``(decision, counts,
     backend)``, or None to proceed with the legacy unconditional launch
     (gate off / non-slot run / enumeration failure — the gate is an
@@ -3127,7 +3131,7 @@ def _demand_decision(issue_filter: str, schedule_label: str):
         return None
 
 
-def _enumerate_tier_stats_fresh(token: str) -> tuple[dict, dict, list, dict]:
+def _enumerate_tier_stats_fresh(token: str) -> tuple[dict[str, int], dict[str, float], list[str], dict[str, list[JsonDict]]]:
     """Tier stats (config#2146: the 72h fresh-skip cooldown this function
     used to apply is retired — eligibility is disposition-structural now,
     ``ge.is_actionable`` alone decides membership; see groom_eligibility's
@@ -3157,8 +3161,8 @@ def _enumerate_tier_stats_fresh(token: str) -> tuple[dict, dict, list, dict]:
     already use for the identical PR-vs-issue ambiguity."""
     counts: dict[str, int] = {t: 0 for t in ge.TIERS}
     oldest: dict[str, float] = {t: 0.0 for t in ge.TIERS}
-    tier_issues: dict[str, list[dict]] = {t: [] for t in ge.TIERS}
-    p0_tiers: set = set()
+    tier_issues: dict[str, list[JsonDict]] = {t: [] for t in ge.TIERS}
+    p0_tiers: set[str] = set()
     now = datetime.now(ZoneInfo("UTC"))
     now_epoch = now.timestamp()
     for repo in BACKLOG_REPOS:
@@ -3216,8 +3220,8 @@ def _enumerate_tier_stats_fresh(token: str) -> tuple[dict, dict, list, dict]:
     return counts, oldest, sorted(p0_tiers), tier_issues
 
 
-def _write_queue_manifests(schedule_label: str, launches: list,
-                           tier_issues: dict) -> dict:
+def _write_queue_manifests(schedule_label: str, launches: list[ge.SlotDecision],
+                           tier_issues: JsonDict) -> JsonDict:
     """config#2152 (queue manifest, OBSERVER phase): one manifest per launched
     box at a deterministic key — ``groom/queues/{date}/trigger-{HHMM}-{issue_
     filter}.json`` — carrying the exact issue list behind the launch decision.
@@ -3236,7 +3240,7 @@ def _write_queue_manifests(schedule_label: str, launches: list,
     Returns {issue_filter: s3_key} for the trigger record / response payload.
     """
     now = datetime.now(ZoneInfo("UTC"))
-    keys: dict = {}
+    keys: JsonDict = {}
     for d in launches:
         if not d.launch:
             continue
@@ -3259,7 +3263,7 @@ def _write_queue_manifests(schedule_label: str, launches: list,
     return keys
 
 
-def _write_skip_record(schedule_label: str, skip_reason: str, **extra) -> None:
+def _write_skip_record(schedule_label: str, skip_reason: str, **extra: object) -> None:
     """Decision record for a trigger evaluation that never reached a launch
     decision (config-I2540) — same key shape the console lists, additive
     ``skip_reason`` field, empty ``decisions`` (schema_version 2 already means
@@ -3281,7 +3285,7 @@ def _write_skip_record(schedule_label: str, skip_reason: str, **extra) -> None:
         logger.warning("skip record write failed (non-fatal): %s", exc)
 
 
-def _write_trigger_record(schedule_label: str, decisions_record: list, counts: dict) -> None:
+def _write_trigger_record(schedule_label: str, decisions_record: list[JsonDict], counts: JsonDict) -> None:
     """One record per trigger evaluation — groom/decisions/{date}/{HHMM}.json.
 
     ``decisions_record`` is the list of per-decision dicts the demand-all
@@ -3305,7 +3309,7 @@ def _write_trigger_record(schedule_label: str, decisions_record: list, counts: d
         logger.warning("trigger record write failed (non-fatal): %s", exc)
 
 
-def _write_sweep_decision_record(schedule_label: str, run_mode: str, launched: dict) -> None:
+def _write_sweep_decision_record(schedule_label: str, run_mode: str, launched: JsonDict) -> None:
     """config#2667: the ``launch_decided`` fast-path (the end-of-SF
     ``run_mode=sweep`` box, and any other pre-decided ``launch_decided``
     invocation) previously wrote NO ``groom/decisions/{date}/*.json`` record at
@@ -3360,7 +3364,7 @@ def _write_sweep_decision_record(schedule_label: str, run_mode: str, launched: d
 
 
 def _write_fallback_decision_record(schedule_label: str, tier: str, backend: str,
-                                    launched: dict) -> None:
+                                    launched: JsonDict) -> None:
     """groom/decisions/{date}/fallback-{HHMMSS}.json — records a quota-fallback
     direct-invoke dispatch (``{"mode": "fallback", "tier": ...}`` — see
     ``_handle_fallback_dispatch``). Own key prefix (``fallback-{HHMMSS}``, not
@@ -3400,7 +3404,7 @@ def _write_fallback_decision_record(schedule_label: str, tier: str, backend: str
         logger.warning("fallback decision record write failed (non-fatal): %s", exc)
 
 
-def _handle_fallback_dispatch(event: dict) -> dict:
+def _handle_fallback_dispatch(event: JsonDict) -> JsonDict:
     """Direct ``lambda:InvokeFunction`` quota-fallback path (3-repo feature;
     this Lambda is one leg — see ``alpha-engine-config``'s
     ``groom_driver.py`` quota classifier and its krepis-based tier->model
@@ -3465,7 +3469,7 @@ def _handle_fallback_dispatch(event: dict) -> dict:
     return {"groom": result}
 
 
-def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
+def handler(event: JsonDict, context: object) -> JsonDict:  # noqa: ARG001 — Lambda contract
     """EventBridge Scheduler handler — launches the groom spot box on cadence.
 
     `event` is the schedule's JSON input, e.g. {"run_mode": "full", "model":
@@ -3697,7 +3701,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         if launches is not None:
             manifest_keys = _write_queue_manifests(schedule_label, launches, tier_issues)
             entries = []
-            decisions_record = []
+            decisions_record: list[JsonDict] = []
             for d in launches:
                 # alpha-engine-config-I3479 (PRIMARY-mode DeepSeek): computed
                 # once per bundle from its own .tiers, folded into BOTH the
@@ -3707,7 +3711,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
                 record = dict(d.as_record())
                 if backend:
                     record["backend"] = backend
-                decisions_record.append(record)
+                decisions_record.append(record)  # pyright: ignore[reportUnknownArgumentType]  # SlotDecision.as_record() returns a bare dict (nousergon-lib)
                 if not d.launch:
                     logger.info("demand trigger: %s", d.reason)
                     _notify_demand_skip(d, counts, schedule_label)
@@ -3719,7 +3723,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
                 # from nousergon-lib's SlotDecision (confirmed on the lib's
                 # current default branch, pin >= v0.109.0). The end-of-SF
                 # sweep box replaced per-box partitioned sweeps.
-                entry = {"model": d.model_group, "issue_filter": d.issue_filter}
+                entry: dict[str, str | int] = {"model": d.model_group, "issue_filter": d.issue_filter}
                 if pr_budget is not None and "high" in d.tiers:
                     entry["pr_budget"] = pr_budget
                 if backend:
