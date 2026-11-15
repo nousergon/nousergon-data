@@ -55,7 +55,7 @@ from typing import Any
 
 import requests
 
-from krepis.http_retry import request_with_retry  # pyright: ignore[reportUnknownVariableType]  # krepis annotates its `params` as a bare `dict`
+from krepis.http_retry import request_with_retry
 from krepis.secrets import get_secret
 
 logger = logging.getLogger(__name__)
