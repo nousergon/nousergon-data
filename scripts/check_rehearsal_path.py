@@ -164,7 +164,7 @@ def weekly_critical_paths_touched(
     run, and so a future non-GHA caller — e.g. a pre-commit hook — can reuse
     it).
     """
-    hits = []
+    hits: list[str] = []
     for raw in changed_paths:
         normalized = raw.replace(os.sep, "/").lstrip("/")
         if any(fnmatch.fnmatch(normalized, glob) for glob in globs):
@@ -172,7 +172,7 @@ def weekly_critical_paths_touched(
     return hits
 
 
-def _extract(pattern: re.Pattern, body: str) -> str | None:
+def _extract(pattern: re.Pattern[str], body: str) -> str | None:
     match = pattern.search(body)
     if not match:
         return None
