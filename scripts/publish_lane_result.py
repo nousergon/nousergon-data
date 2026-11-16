@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from typing import Protocol, cast
 
 logger = logging.getLogger(__name__)
 
@@ -46,11 +47,31 @@ COMPONENT_ID = "overseer-arctic-migration"
 LABEL = "Overseer lane: arctic-migration"
 
 
-def build(status: str, summary: str, findings: list[dict] | None = None,
-          deep_link: str | None = None) -> dict:
-    from nousergon_lib import fleet_check_result as fcr
+class _FleetCheckResult(Protocol):
+    @staticmethod
+    def build(*, check_id: str, label: str, status: str, summary: str,
+              cadence_minutes: int | None,
+              findings: list[dict[str, object]] | None = None,
+              deep_link: str | None = None) -> dict[str, object]: ...
 
-    env = fcr.build(
+    @staticmethod
+    def emit(envelope: dict[str, object], *, dry_run: bool = False) -> str | None: ...
+
+
+class _Args(Protocol):
+    status: str
+    summary: str
+    deep_link: str | None
+    dry_run: bool
+
+
+def build(status: str, summary: str,
+          findings: list[dict[str, object]] | None = None,
+          deep_link: str | None = None) -> dict[str, object]:
+    from nousergon_lib import fleet_check_result as fcr
+    typed_fcr = cast(_FleetCheckResult, fcr)  # Third-party annotations use bare dict.
+
+    env = typed_fcr.build(
         check_id=COMPONENT_ID, label=LABEL, status=status, summary=summary,
         # This lane is event-driven ("merge-triggered; no scheduled wake" in
         # playbooks.yaml), so it has NO cadence to declare. The shared builder
@@ -74,13 +95,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--summary", required=True)
     ap.add_argument("--deep-link", default=None)
     ap.add_argument("--dry-run", action="store_true")
-    args = ap.parse_args(argv)
+    args = cast(_Args, ap.parse_args(argv))  # argparse constructs attributes dynamically.
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
     try:
         from nousergon_lib import fleet_check_result as fcr
+        typed_fcr = cast(_FleetCheckResult, fcr)  # Third-party annotations use bare dict.
         env = build(args.status, args.summary, deep_link=args.deep_link)
-        uri = fcr.emit(env, dry_run=args.dry_run)
+        uri = typed_fcr.emit(env, dry_run=args.dry_run)
     except Exception:  # noqa: BLE001
         # A publish failure must not fail the lane: the lane's job is the
         # migration, and a successful run turned red by its own telemetry is a
