@@ -60,7 +60,7 @@ import datetime as dt
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import cast
 
 from collectors.security_master import (
     AliasEvent,
@@ -114,7 +114,7 @@ def share_class_of(ticker: str) -> str | None:
     return m.group(1) if m else None
 
 
-def roster_from_company_tickers(doc: Mapping[str, Any]) -> dict[str, int]:
+def roster_from_company_tickers(doc: Mapping[str, object]) -> dict[str, int]:
     """``{ticker: cik}`` from SEC ``company_tickers.json``.
 
     Unlike `edgar_pit_fundamentals.ticker_cik_map` (first row wins), a ticker
@@ -123,20 +123,21 @@ def roster_from_company_tickers(doc: Mapping[str, Any]) -> dict[str, int]:
     """
     out: dict[str, int] = {}
     for entry in doc.values():
-        if not isinstance(entry, Mapping) or not entry.get("ticker"):
+        if not isinstance(entry, Mapping) or not cast(Mapping[object, object], entry).get("ticker"):
             continue
+        entry = cast(Mapping[str, object], entry)  # Narrow raw JSON object keys to the source's string-keyed contract.
         ticker = normalize_ticker(str(entry["ticker"]))
-        cik = int(entry["cik_str"])
+        cik = int(cast(int | str, entry["cik_str"]))
         if out.get(ticker, cik) != cik:
             raise IdentityConflict(f"roster lists {ticker!r} under CIK {out[ticker]} and {cik}")
         out[ticker] = cik
     return out
 
 
-def renames_from_retickers(doc: Mapping[str, Any]) -> list[Rename]:
+def renames_from_retickers(doc: Mapping[str, object]) -> list[Rename]:
     """The renames in `sp500_known_retickers.json`, validated, in date order."""
     out: list[Rename] = []
-    for entry in doc.get("retickers") or []:
+    for entry in cast(list[Mapping[str, object]], doc.get("retickers") or []):  # Narrow the validated JSON boundary.
         old, new, effective = (str(entry.get(k) or "") for k in ("old", "new", "effective"))
         if not (old and new and effective):
             raise IdentityConflict(f"reticker entry {entry!r} lacks old, new or effective")
@@ -216,14 +217,14 @@ def feed_events(
 
 
 def build_from_sources(
-    company_tickers: Mapping[str, Any],
-    retickers: Mapping[str, Any],
+    company_tickers: Mapping[str, object],
+    retickers: Mapping[str, object],
     *,
     snapshot_date: dt.date,
     master_version: str,
     available_at: dt.datetime,
     first_seen: Mapping[str, str] | None = None,
-) -> tuple[list[dict[str, Any]], FeedReport]:
+) -> tuple[list[dict[str, object]], FeedReport]:
     """The security master the two sources describe, and the feed's report."""
     events, report = feed_events(
         roster_from_company_tickers(company_tickers),
