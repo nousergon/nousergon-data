@@ -38,9 +38,10 @@ from dataclasses import dataclass
 from datetime import date as Date
 from datetime import datetime, timezone
 from io import BytesIO
-from typing import Any, Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
+from typing import Any, Protocol, TypedDict, cast
 
-import pandas as pd
+import pandas as pd  # pyright: ignore[reportMissingTypeStubs] -- pandas does not ship typing metadata.
 
 from collectors.news_aggregator import AggregatedNewsArticle, NewsAggregator
 from collectors.nlp.pipeline import NewsNLPOutput
@@ -48,9 +49,22 @@ from collectors.nlp.protocols import EventFlag, SentimentScore
 
 # Reuse the aggregate module's trust-weight resolution so the two
 # artifacts agree on "which source is most trusted" for a given story.
-from data.derived.news_aggregates import _make_trust_weight_fn
+from data.derived.news_aggregates import _make_trust_weight_fn  # pyright: ignore[reportPrivateUsage] -- shared internal helper keeps both artifacts' weighting identical.
 
 logger = logging.getLogger(__name__)
+
+
+class _StreamingBody(Protocol):
+    def read(self) -> bytes: ...
+
+
+class _S3Response(TypedDict):
+    Body: _StreamingBody
+
+
+class _S3Client(Protocol):
+    put_object: Callable[..., object]
+    get_object: Callable[..., _S3Response]
 
 
 SCHEMA_VERSION = 1
@@ -120,7 +134,9 @@ def build_news_articles_df(
     the ``primary_source`` / ``trust_weight_max`` selection. Falls back to
     a flat-1.0 weighting if neither is passed (ties broken by sort order).
     """
-    weight_fn = _make_trust_weight_fn(aggregator, trust_weights)
+    # The shared helper's return is unannotated; its three branches all accept
+    # a source slug and return a numeric weight.
+    weight_fn = cast(Callable[[str], float], _make_trust_weight_fn(aggregator, trust_weights))
 
     # Index NLP streams by article fingerprint for O(1) per-article lookup.
     sentiment_by_fp: dict[str, list[SentimentScore]] = {}
@@ -154,7 +170,7 @@ def _build_article_row(
     sentiment_by_fp: dict[str, list[SentimentScore]],
     events_by_fp: dict[str, list[EventFlag]],
     aggregate_date: Date,
-    weight_fn,
+    weight_fn: Callable[[str], float],
 ) -> NewsArticleRecord:
     fp = article.canonical_fingerprint
     variants = list(article.variants)
@@ -255,7 +271,7 @@ def _empty_df() -> pd.DataFrame:
     """Empty DataFrame with the canonical column order so consumers
     reading an empty-day parquet don't crash on missing columns."""
     cols = list(NewsArticleRecord.__dataclass_fields__.keys())
-    return pd.DataFrame(columns=cols)
+    return pd.DataFrame(columns=pd.Index(cols))
 
 
 # ── S3 parquet writer ──────────────────────────────────────────────────
@@ -269,7 +285,7 @@ def write_news_articles_parquet(
     df: pd.DataFrame,
     *,
     aggregate_date: Date,
-    s3_client: Any,
+    s3_client: Any,  # pyright: ignore[reportExplicitAny] -- boto3 clients have no installed stubs.
     bucket: str = DEFAULT_S3_BUCKET,
     prefix: str = DEFAULT_S3_PREFIX,
     run_id: str | None = None,
@@ -292,8 +308,9 @@ def write_news_articles_parquet(
     latest_key = eval_latest_key(prefix)
 
     buf = BytesIO()
-    df.to_parquet(buf, engine="pyarrow", index=False)
-    s3_client.put_object(
+    df.to_parquet(buf, engine="pyarrow", index=False)  # pyright: ignore[reportUnknownMemberType] -- pandas' untyped parquet kwargs cross the pyarrow boundary.
+    client = cast(_S3Client, s3_client)
+    client.put_object(
         Bucket=bucket,
         Key=artifact_key,
         Body=buf.getvalue(),
@@ -307,7 +324,7 @@ def write_news_articles_parquet(
         "row_count": int(len(df)),
         "written_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
-    s3_client.put_object(
+    client.put_object(
         Bucket=bucket,
         Key=latest_key,
         Body=json.dumps(latest_payload).encode("utf-8"),
@@ -322,7 +339,7 @@ def write_news_articles_parquet(
 
 def read_news_articles_parquet(
     *,
-    s3_client: Any,
+    s3_client: Any,  # pyright: ignore[reportExplicitAny] -- boto3 clients have no installed stubs.
     bucket: str = DEFAULT_S3_BUCKET,
     prefix: str = DEFAULT_S3_PREFIX,
 ) -> pd.DataFrame:
@@ -331,14 +348,16 @@ def read_news_articles_parquet(
     when no artifact exists."""
     from nousergon_lib.eval_artifacts import eval_latest_key
 
+    client = cast(_S3Client, s3_client)
     latest_key = eval_latest_key(prefix)
     try:
-        obj = s3_client.get_object(Bucket=bucket, Key=latest_key)
-        sidecar = json.loads(obj["Body"].read())
-        artifact_key = sidecar.get("artifact_key")
-        if artifact_key:
-            body = s3_client.get_object(Bucket=bucket, Key=artifact_key)
-            return pd.read_parquet(BytesIO(body["Body"].read()), engine="pyarrow")
+        obj = client.get_object(Bucket=bucket, Key=latest_key)
+        sidecar: object = json.loads(obj["Body"].read())
+        sidecar_dict = cast(dict[object, object], sidecar) if isinstance(sidecar, dict) else {}
+        artifact_key = sidecar_dict.get("artifact_key")
+        if isinstance(artifact_key, str) and artifact_key:
+            body = client.get_object(Bucket=bucket, Key=artifact_key)
+            return pd.read_parquet(BytesIO(body["Body"].read()), engine="pyarrow")  # pyright: ignore[reportUnknownMemberType] -- pandas' parquet reader is incompletely typed.
     except Exception as e:
         logger.info(
             "[news_articles] canonical sidecar read failed for %s (%s)",
@@ -356,7 +375,7 @@ def articles_build_and_write(
     *,
     aggregate_date: Date | datetime,
     aggregator: NewsAggregator | None,
-    s3_client: Any,
+    s3_client: Any,  # pyright: ignore[reportExplicitAny] -- boto3 clients have no installed stubs.
     bucket: str = DEFAULT_S3_BUCKET,
     prefix: str = DEFAULT_S3_PREFIX,
 ) -> tuple[str, pd.DataFrame]:

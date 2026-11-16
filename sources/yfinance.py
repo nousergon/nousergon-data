@@ -9,10 +9,29 @@ Phase 1a: faithfully wraps ``collectors.daily_closes._fetch_yfinance_closes``.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import Protocol, cast
+
 from collectors import daily_closes as _dc
 
 from .contract import PriceBar, SourceCapabilities
 from .registry import register
+
+_LegacyRecord = dict[str, object]
+
+
+class _YfinanceFetcher(Protocol):
+    def __call__(
+        self,
+        tickers: list[str],
+        run_date: str,
+        records: list[_LegacyRecord],
+    ) -> int: ...
+
+
+# The legacy conversion uses an unparameterized dict annotation; pin its actual
+# adapter-facing type at that untyped boundary.
+_price_bar_from_record = cast(Callable[[_LegacyRecord], PriceBar], PriceBar.from_record)
 
 
 class YfinanceAdapter:
@@ -33,23 +52,24 @@ class YfinanceAdapter:
 
     def fetch_into(
         self,
-        records: list[dict],
+        records: list[_LegacyRecord],
         tickers: list[str],
         run_date: str,
         *,
         strict: bool = False,
-        window_cache: dict | None = None,
+        window_cache: dict[str, object] | None = None,
     ) -> int:
         # yfinance has no strict mode (it logs + returns a partial count); the
         # ``strict`` flag is accepted for port-uniformity and ignored.
-        return _dc._fetch_yfinance_closes(tickers, run_date, records)
+        fetch = cast(_YfinanceFetcher, _dc._fetch_yfinance_closes)  # pyright: ignore[reportPrivateUsage]
+        return fetch(tickers, run_date, records)
 
     def fetch_ohlcv(
         self, tickers: list[str], run_date: str, *, strict: bool = False
     ) -> list[PriceBar]:
-        records: list[dict] = []
+        records: list[_LegacyRecord] = []
         self.fetch_into(records, tickers, run_date, strict=strict)
-        return [PriceBar.from_record(r) for r in records]
+        return [_price_bar_from_record(r) for r in records]
 
 
 register(YfinanceAdapter())

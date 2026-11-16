@@ -26,10 +26,10 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Sequence
+from typing import Sequence, cast
 
-import arcticdb as adb
-import pandas as pd
+import arcticdb as adb  # pyright: ignore[reportMissingTypeStubs] - arcticdb does not publish complete stubs
+import pandas as pd  # pyright: ignore[reportMissingTypeStubs] - pandas does not publish complete stubs
 from nousergon_lib.arcticdb import arctic_uri, open_macro_lib, open_universe_lib
 
 from shadow.root import active_root, shadow_arctic_library
@@ -133,16 +133,16 @@ def _open_library(
         # or the schema assert reads v0 and every history-dependent feature is
         # computed over one bar. ensure_seeded is idempotent per stamp, and it
         # raises rather than returning an unseeded library.
-        from shadow.arctic_seed import ensure_seeded
+        from shadow.arctic_seed import ensure_seeded  # pyright: ignore[reportUnknownVariableType] - dependency accepts an untyped Arctic handle
 
         arctic = _get_arctic(bucket)
-        ensure_seeded(arctic, active_root())
-        return arctic.get_library(shadowed, create_if_missing=True)
+        ensure_seeded(arctic, active_root())  # pyright: ignore[reportArgumentType] - shadowed names require an active root
+        return arctic.get_library(shadowed, create_if_missing=True)  # pyright: ignore[reportUnknownMemberType] - ArcticDB's optional enum is untyped
     if name == "universe":
         return open_universe_lib(bucket, create_if_missing=create_if_missing)
     if name == "macro":
         return open_macro_lib(bucket, create_if_missing=create_if_missing)
-    return _get_arctic(bucket).get_library(name, create_if_missing=create_if_missing)
+    return _get_arctic(bucket).get_library(name, create_if_missing=create_if_missing)  # pyright: ignore[reportUnknownMemberType] - ArcticDB's optional enum is untyped
 
 
 def get_universe_lib(bucket: str | None = None) -> adb.library.Library:
@@ -275,7 +275,7 @@ def get_delisted_history_lib(bucket: str | None = None) -> adb.library.Library:
     return _open_library(DELISTED_HISTORY_LIB, bucket)
 
 
-def reset_connection():
+def reset_connection() -> None:
     """Reset the singleton (useful for testing or credential rotation)."""
     global _arctic_instance
     _arctic_instance = None
@@ -300,12 +300,13 @@ def to_arctic_safe(df: pd.DataFrame) -> pd.DataFrame:
     """
     if df.empty:
         return df
-    cat_cols = [c for c in df.columns if isinstance(df[c].dtype, pd.CategoricalDtype)]
+    columns = cast("Sequence[str]", df.columns)  # pandas exposes an untyped Index boundary
+    cat_cols = [c for c in columns if isinstance(df[c].dtype, pd.CategoricalDtype)]  # pyright: ignore[reportUnknownMemberType] - pandas dtype union is incomplete
     if not cat_cols:
         return df
     df = df.copy()
     for col in cat_cols:
-        df[col] = df[col].astype(object)
+        df[col] = df[col].astype(object)  # pyright: ignore[reportUnknownMemberType] - pandas overload is incomplete
     return df
 
 
@@ -386,7 +387,7 @@ def to_arctic_canonical(
     )
 
     if list(df.columns) != canonical:
-        df = df[canonical]
+        df = cast("pd.DataFrame", df[canonical])  # pandas __getitem__ stubs also permit Series
 
     return to_arctic_safe(df)
 

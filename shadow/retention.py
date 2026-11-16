@@ -29,7 +29,8 @@ from __future__ import annotations
 
 import datetime as dt
 import re
-from typing import Any
+from collections.abc import Iterable
+from typing import Protocol, TypedDict
 
 from shadow.root import LIVE_ARCTIC_LIBRARIES, ShadowGuardViolation
 
@@ -40,6 +41,22 @@ DEFAULT_KEEP_DAYS = 7
 #: ``shadow_20260914_universe`` → stamp ``20260914``. Mirrors
 #: ``root.ARCTIC_SHADOW_PREFIX_TEMPLATE``.
 SHADOW_LIBRARY_RE = re.compile(r"^shadow_(\d{8})_(.+)$")
+
+
+class _Arctic(Protocol):
+    def list_libraries(self) -> Iterable[str]: ...
+
+    def delete_library(self, name: str) -> None: ...
+
+
+class RetentionReport(TypedDict):
+    apply: bool
+    today: str
+    keep_days: int
+    shadow_libraries: int
+    expired: list[str]
+    expired_stamps: list[str]
+    deleted: list[str]
 
 
 def _stamp_date(name: str) -> "dt.date | None":
@@ -63,7 +80,7 @@ def select_expired(
     if keep_days < 1:
         raise ValueError(f"keep_days must be >= 1, got {keep_days}")
     cutoff = today - dt.timedelta(days=keep_days)
-    expired = []
+    expired: list[str] = []
     for name in sorted(library_names):
         stamp = _stamp_date(name)
         if stamp is None or stamp >= cutoff:
@@ -77,17 +94,17 @@ def select_expired(
 
 
 def prune(
-    arctic: Any, *, today: dt.date, keep_days: int = DEFAULT_KEEP_DAYS, apply: bool = False,
-) -> dict:
+    arctic: _Arctic, *, today: dt.date, keep_days: int = DEFAULT_KEEP_DAYS, apply: bool = False,
+) -> RetentionReport:
     """Report, and with ``apply=True`` delete, the expired shadow libraries."""
     names = list(arctic.list_libraries())
     expired = select_expired(names, today=today, keep_days=keep_days)
-    deleted = []
+    deleted: list[str] = []
     if apply:
         for name in expired:
             arctic.delete_library(name)
             deleted.append(name)
-    stamps = sorted({SHADOW_LIBRARY_RE.match(n).group(1) for n in expired})
+    stamps = sorted({match.group(1) for n in expired if (match := SHADOW_LIBRARY_RE.match(n)) is not None})
     return {
         "apply": apply,
         "today": today.isoformat(),
