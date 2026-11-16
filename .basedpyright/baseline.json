@@ -160932,7 +160932,7 @@
                 "range": {
                     "startColumn": 11,
                     "endColumn": 5,
-                    "lineCount": 16
+                    "lineCount": 17
                 }
             },
             {
@@ -161064,26 +161064,10 @@
                 }
             },
             {
-                "code": "reportUnknownParameterType",
-                "range": {
-                    "startColumn": 51,
-                    "endColumn": 58,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportMissingParameterType",
-                "range": {
-                    "startColumn": 51,
-                    "endColumn": 58,
-                    "lineCount": 1
-                }
-            },
-            {
                 "code": "reportMissingTypeArgument",
                 "range": {
-                    "startColumn": 84,
-                    "endColumn": 88,
+                    "startColumn": 92,
+                    "endColumn": 96,
                     "lineCount": 1
                 }
             },
@@ -161140,14 +161124,6 @@
                 "range": {
                     "startColumn": 57,
                     "endColumn": 75,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportUnknownArgumentType",
-                "range": {
-                    "startColumn": 31,
-                    "endColumn": 38,
                     "lineCount": 1
                 }
             },
@@ -161260,22 +161236,6 @@
                 "range": {
                     "startColumn": 0,
                     "endColumn": 15,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportUnknownParameterType",
-                "range": {
-                    "startColumn": 59,
-                    "endColumn": 65,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportMissingParameterType",
-                "range": {
-                    "startColumn": 59,
-                    "endColumn": 65,
                     "lineCount": 1
                 }
             },
@@ -161576,26 +161536,10 @@
                 }
             },
             {
-                "code": "reportUnknownParameterType",
-                "range": {
-                    "startColumn": 40,
-                    "endColumn": 47,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportMissingParameterType",
-                "range": {
-                    "startColumn": 40,
-                    "endColumn": 47,
-                    "lineCount": 1
-                }
-            },
-            {
                 "code": "reportMissingTypeArgument",
                 "range": {
-                    "startColumn": 84,
-                    "endColumn": 88,
+                    "startColumn": 101,
+                    "endColumn": 105,
                     "lineCount": 1
                 }
             },
@@ -161944,26 +161888,10 @@
                 }
             },
             {
-                "code": "reportUnknownParameterType",
-                "range": {
-                    "startColumn": 25,
-                    "endColumn": 32,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportMissingParameterType",
-                "range": {
-                    "startColumn": 25,
-                    "endColumn": 32,
-                    "lineCount": 1
-                }
-            },
-            {
                 "code": "reportMissingTypeArgument",
                 "range": {
-                    "startColumn": 37,
-                    "endColumn": 41,
+                    "startColumn": 45,
+                    "endColumn": 49,
                     "lineCount": 1
                 }
             },
@@ -162108,14 +162036,6 @@
                 "range": {
                     "startColumn": 11,
                     "endColumn": 67,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportUnknownArgumentType",
-                "range": {
-                    "startColumn": 41,
-                    "endColumn": 48,
                     "lineCount": 1
                 }
             }
