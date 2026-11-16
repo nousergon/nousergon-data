@@ -151,7 +151,7 @@ _TAG_KEYWORDS: dict[str, tuple[str, ...]] = {
 # ``tags`` (Yahoo RSS in particular). Pattern + category pairs are
 # evaluated in order; first match wins per category. Designed to match
 # headline phrasings, not body text.
-_TITLE_PATTERNS: tuple[tuple[re.Pattern, str], ...] = (
+_TITLE_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\bearnings\b|\bbeats?\s+(?:expect|estimat)|\bmisses?\s+(?:expect|estimat)|\bquarterly results\b", re.I), "earnings_release"),
     (re.compile(r"\b(?:raises|lowers|withdraws|updates?|reaffirms?)\s+(?:guidance|outlook|forecast)\b", re.I), "earnings_guidance"),
     (re.compile(r"\b(?:acquir(?:es?|er|ing|ed|ition)|merging with|to (?:buy|acquire)|merger|takeover|buyout|all-stock deal)\b", re.I), "merger_or_acquisition"),
