@@ -46,11 +46,10 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from features.registry import CATALOG, GROUPS  # noqa: E402
+from features.registry import CATALOG, GROUPS, FeatureEntry  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CONTRACT_PATH = REPO_ROOT / "contracts" / "features_parquet.schema.json"
@@ -104,7 +103,7 @@ SETTLING_BAR: dict[str, str] = {
 }
 
 
-def _column_schema(entry) -> dict[str, Any]:
+def _column_schema(entry: FeatureEntry) -> dict[str, object]:
     try:
         json_type = _DTYPE_JSON_TYPE[entry.dtype]
     except KeyError:
@@ -115,13 +114,13 @@ def _column_schema(entry) -> dict[str, Any]:
     return {"type": [json_type, "null"], "description": entry.description}
 
 
-def render_group(group: str) -> dict[str, Any]:
+def render_group(group: str) -> dict[str, object]:
     """The row schema of ``features/{date}/{group}.parquet``."""
     entries = [e for e in CATALOG if e.group == group]
     per_ticker = {e.per_ticker for e in entries}
     if len(per_ticker) != 1:
         raise ValueError(f"group {group!r} mixes per_ticker True and False; the writer cannot")
-    properties: dict[str, Any] = {}
+    properties: dict[str, object] = {}
     required: list[str] = []
     if per_ticker.pop():
         properties["ticker"] = dict(_TICKER)
@@ -141,7 +140,7 @@ def render_group(group: str) -> dict[str, Any]:
     }
 
 
-def render() -> dict[str, Any]:
+def render() -> dict[str, object]:
     """The whole contract document, in a stable key order."""
     groups = list(GROUPS)
     return {
