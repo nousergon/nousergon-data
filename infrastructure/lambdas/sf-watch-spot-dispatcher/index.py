@@ -82,6 +82,7 @@ import os
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
+from typing import Protocol
 
 import boto3
 from nousergon_lib import spot_dispatch
@@ -250,6 +251,21 @@ _BOOL_RE = re.compile(r"^(true|false)$")
 # interpolated into the bootstrap command, so the injection guard is the point.
 _MODEL_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
+# alpha-engine-config-I13712 — a crucible v2 weekly arc is NOT a Step Function.
+# The crucible-v2 dispatcher wakes this playbook (through the overseer router)
+# when a `weekly` box exits failed, and names the failure by its DISPATCH ID —
+# the `crucible:dispatch-id` tag of the failed box, a 32-hex token with an
+# optional `-r<n>` re-dispatch suffix — because there is no execution ARN to
+# name. For this pipeline, and only this one, `execution_arn` is ABSENT and
+# `dispatch_id` is REQUIRED; for every SF pipeline the old contract holds
+# unchanged. Same shell-safe anchored allowlist discipline as every field
+# above: the value is interpolated into the bootstrap command.
+V2_WEEKLY_PIPELINE = "crucible-v2-weekly"
+_DISPATCH_ID_RE = re.compile(r"^[0-9a-f]{8,64}(-r[0-9]{1,2})?$")
+# Matches nothing a caller can send: `_optional` returns "" for an absent
+# field and refuses any present one as malformed.
+_ABSENT_RE = re.compile(r"(?!)")
+
 
 class _InvalidEvent(ValueError):
     """A required event field is missing or fails its allowlist."""
@@ -288,8 +304,17 @@ def _resolve_event_fields(event: dict) -> dict:
         run_date = f"{DRILL_RUN_DATE_PREFIX}{datetime.now(timezone.utc):%Y-%m-%d}"
     else:
         run_date = _require(event, "run_date", _RUN_DATE_RE)
-    execution_arn = _require(event, "execution_arn", _ARN_RE)
-    state_machine_arn = _optional(event, "state_machine_arn", _ARN_RE)
+    if pipeline_name == V2_WEEKLY_PIPELINE:
+        # No execution ARN exists for this failure, so one in the event is a
+        # caller wiring bug, not extra context — refuse it rather than export a
+        # value the charter would try to read as a Step Function.
+        execution_arn = _optional(event, "execution_arn", _ABSENT_RE)
+        state_machine_arn = _optional(event, "state_machine_arn", _ABSENT_RE)
+        dispatch_id = _require(event, "dispatch_id", _DISPATCH_ID_RE)
+    else:
+        execution_arn = _require(event, "execution_arn", _ARN_RE)
+        state_machine_arn = _optional(event, "state_machine_arn", _ARN_RE)
+        dispatch_id = _optional(event, "dispatch_id", _DISPATCH_ID_RE)
     failed_state = _optional(event, "failed_state", _FAILED_STATE_RE)
     watch_log_key = _optional(event, "watch_log_key", _WATCH_LOG_KEY_RE)
     is_preflight = _optional(event, "is_preflight", _BOOL_RE, default="false")
@@ -322,6 +347,9 @@ def _resolve_event_fields(event: dict) -> dict:
     # re-drives, preflight canaries). When present, it rides the RunInstances
     # call atomically as an EC2 tag.
     sf_execution_id = str(event.get("sf_execution_id") or "").strip() or None
+    if sf_execution_id is None and dispatch_id:
+        # The v2 arc's per-run identity for cost attribution is its dispatch id.
+        sf_execution_id = dispatch_id
     return {
         "pipeline_name": pipeline_name,
         "cadence_slug": cadence_slug,
@@ -337,6 +365,7 @@ def _resolve_event_fields(event: dict) -> dict:
         "model": model,
         "cause": cause,
         "sf_execution_id": sf_execution_id,
+        "dispatch_id": dispatch_id,
     }
 
 
@@ -395,6 +424,7 @@ export SF_PIPELINE="{fields['pipeline_name']}"
 export SF_CADENCE_SLUG="{fields['cadence_slug']}"
 export SF_STATE_MACHINE_ARN="{fields['state_machine_arn']}"
 export SF_EXECUTION_ARN="{fields['execution_arn']}"
+export SF_DISPATCH_ID="{fields['dispatch_id']}"
 export SF_RUN_DATE="{fields['run_date']}"
 export SF_FAILED_STATE="{fields['failed_state']}"
 export SF_FAILED_STATE_DETAIL_B64="{failed_state_detail_b64}"
@@ -539,7 +569,7 @@ def _is_scheduler_conflict(exc: Exception) -> bool:
     return False
 
 
-def _defer_relaunch(fields: dict, generation: int, context, existing: list[str]) -> dict:
+def _defer_relaunch(fields: dict, generation: int, context: object, existing: list[str]) -> dict:
     """A live box holds the (cadence, pipeline, run_date) lock — DEFER this
     dispatch instead of dropping it (config#2226): schedule a one-shot
     EventBridge Scheduler re-invoke of this same Lambda in
@@ -582,6 +612,7 @@ def _defer_relaunch(fields: dict, generation: int, context, existing: list[str])
         "pipeline_name", "cadence_slug", "run_date", "execution_arn",
         "state_machine_arn", "failed_state", "failed_state_detail",
         "watch_log_key", "is_preflight", "is_drill", "force_on_demand", "cause",
+        "dispatch_id",
     )}
     payload["defer_generation"] = next_generation
     fire_at = datetime.now(timezone.utc) + timedelta(seconds=DEFER_DELAY_SECONDS)
@@ -672,7 +703,17 @@ _SKIP_TERMINALS = {
 }
 
 
-def _reached_declared_skip_terminal(execution_arn: str, *, client=None) -> bool:
+class _ExecutionHistoryReader(Protocol):
+    """The one Step Functions call `_reached_declared_skip_terminal` makes."""
+
+    def get_execution_history(
+        self, *, executionArn: str, maxResults: int, reverseOrder: bool  # noqa: N803 — boto3's names
+    ) -> dict[str, list[dict[str, dict[str, str]]]]: ...
+
+
+def _reached_declared_skip_terminal(
+    execution_arn: str, *, client: _ExecutionHistoryReader | None = None
+) -> bool:
     """Did this SUCCEEDED execution end at a DECLARED no-work terminal?
 
     One `GetExecutionHistory` call with `reverseOrder=True`, so the terminal
@@ -721,7 +762,13 @@ def _reevaluate_after_defer(fields: dict) -> dict | None:
     proceed case, `fields["execution_arn"]` is retargeted at the NEWEST
     failed execution (the originally-reported one may be stale by now).
     Fail-safe toward LAUNCHING on any States API error (mirrors the
-    concurrency check's posture: a broken check never blocks a repair)."""
+    concurrency check's posture: a broken check never blocks a repair).
+
+    A crucible v2 weekly arc (alpha-engine-config-I13712) has no state
+    machine to re-check, so it always proceeds: the box's charter reads the
+    arc's own manifest first and stands down when the arc already reads ok."""
+    if fields["pipeline_name"] == V2_WEEKLY_PIPELINE:
+        return None
     state_machine_arn = fields["state_machine_arn"] or _state_machine_arn_from_execution(
         fields["execution_arn"]
     )
@@ -804,7 +851,7 @@ def _reevaluate_after_defer(fields: dict) -> dict | None:
     return None
 
 
-def _launch_sf_watch_spot(fields: dict, context=None, defer_generation: int = 0) -> dict:
+def _launch_sf_watch_spot(fields: dict, context: object | None = None, defer_generation: int = 0) -> dict:
     """Launch + bootstrap the SF-watch box. SYNCHRONOUS contract: every
     anticipated failure mode returns a clean, well-formed launched:false
     rather than raising — see module docstring."""
@@ -919,7 +966,7 @@ def _launch_sf_watch_spot(fields: dict, context=None, defer_generation: int = 0)
     return verdict
 
 
-def handler(event: dict, context) -> dict:
+def handler(event: dict, context: object) -> dict:
     """Synchronous handler invoked once per real saturday-sf-failure event —
     NOT on a cron schedule. `event` carries {"pipeline_name", "cadence_slug",
     "state_machine_arn", "execution_arn", "run_date", "failed_state", "cause",

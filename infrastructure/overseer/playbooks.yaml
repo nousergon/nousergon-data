@@ -50,6 +50,7 @@ playbooks:
     wake:
       - "eventbridge:alpha-engine-saturday-sf-watch-failed (fleet SF terminal failure -> triage Lambda -> router, M2)"
       - "eventbridge:alpha-engine-sf-watch-spot-interruption + alpha-engine-sf-watch-instance-terminated (reclaim/relaunch)"
+      - "eventbridge:crucible-v2-bootstrap-death-redispatch (a crucible v2 `weekly` box shut down with a failed exit record -> crucible-v2-dispatcher -> router, pipeline crucible-v2-weekly, alpha-engine-config-I13712)"
     cadence: "event-driven only — no scheduled wake"
     # `wake` above is prose for a human; `triggers` is the same fact in a shape
     # a reader can JOIN (alpha-engine-config-I7056). Without it, nothing could
@@ -73,6 +74,15 @@ playbooks:
       # `drill_isolation` governs how a drill run is graded, not whether the
       # thing that starts it is a trigger.
       - {surface: scheduler, name: alpha-engine-sf-watch-canary-drill-weekly}
+      # alpha-engine-config-I13712. A crucible v2 weekly arc is not a Step
+      # Function, so no SF status-change rule sees it fail. The crucible-v2
+      # stack's EXISTING EC2 shutting-down rule already routes every
+      # crucible-v2 box's death to that stack's dispatcher; for a `weekly`
+      # box whose exit record reads failed (not reclaimed), the dispatcher
+      # invokes this router with this playbook. No new rule or schedule was
+      # created for it. The rule lives in nous-ergon-ops
+      # `infrastructure/cloudformation/crucible-v2.yaml` (BootstrapDeathRedispatchRule).
+      - {surface: events, name: crucible-v2-bootstrap-death-redispatch}
     executor_function: alpha-engine-sf-watch-spot-dispatcher
     executor_lambda_dir: sf-watch-spot-dispatcher
     # Executor verdict `reason` values that are by-design declines — the
