@@ -40,7 +40,7 @@ import os
 import socket
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 from nousergon_lib import run_manifest
 from nousergon_lib.run_manifest import DEFAULT_MANIFEST_PREFIX, S3ManifestSink
@@ -572,7 +572,7 @@ def is_empty_success(manifest: Mapping[str, Any]) -> bool:
     return not (manifest.get("outputs") or []) and not int(manifest.get("rows_out") or 0)
 
 
-def record_pit_stamps(run_ctx, *, now: dt.datetime | None = None) -> int:
+def record_pit_stamps(run_ctx: run_manifest.UnitRun, *, now: dt.datetime | None = None) -> int:
     """File one ``data_pit`` stamp for every output this run recorded and did not stamp itself.
 
     `alpha-engine-config-I10782` (plan item P-15), stage 2's writer half. Stage 1
@@ -622,7 +622,7 @@ def record_pit_stamps(run_ctx, *, now: dt.datetime | None = None) -> int:
         if not key or key in stamped:
             continue
         entry = pit.pit_guard_entry(
-            key, {pit.AS_OF: run_ctx.trading_day, pit.AVAILABLE_AT: moment}
+            key, {pit.AS_OF: cast(object, run_ctx.trading_day), pit.AVAILABLE_AT: moment}  # untyped unit boundary
         )
         run_ctx.record_guard(
             entry["guard"],
@@ -638,7 +638,7 @@ def record_pit_stamps(run_ctx, *, now: dt.datetime | None = None) -> int:
     return filed
 
 
-def record_empty_production(run_ctx, unit_id: str, *, detail: str) -> None:
+def record_empty_production(run_ctx: run_manifest.UnitRun, unit_id: str, *, detail: str) -> None:
     """Record the terminal state of a run that published nothing. NEVER returns.
 
     Raises :class:`nousergon_lib.run_manifest.NotApplicable` when the unit
@@ -700,14 +700,14 @@ EMPTY_FRESH_SEVERITY: dict[str, int] = {
 
 
 def grade_published_outputs(
-    run_ctx,
+    run_ctx: run_manifest.UnitRun,
     unit_id: str,
     outputs: list[tuple[str, int | None]],
     *,
     bucket: str,
     s3_client: Any,
     source_path: str,
-):
+) -> object:
     """Grade every key an entry-point unit published: present, non-empty, above its floor.
 
     `alpha-engine-config-I10785` (P-18): "every published key passes a non-empty
@@ -861,13 +861,13 @@ def resolve_log_location() -> str:
 
 def manual_run(
     unit_id: str,
-    fn,
+    fn: Any,  # pyright: ignore[reportExplicitAny] -- public repair callbacks are intentionally heterogeneous.
     *,
     write: bool,
     bucket: str = MANIFEST_BUCKET,
     trigger: str = "manual",
     trading_day: str | None = None,
-):
+) -> run_manifest.UnitRunResult:
     """Run a manual/on-demand tool under the same wrapper a scheduled unit uses.
 
     `data_collection_plan_260914.md` §4.4: "Manual and GHA units call the same
@@ -891,7 +891,7 @@ def manual_run(
     """
     from dates import default_run_date  # local: keeps `dates` off the import path of CLIs that do not need it
 
-    def _body(ctx):
+    def _body(ctx: run_manifest.UnitRun) -> object:
         try:
             value = fn(ctx)
         finally:  # a repair that failed halfway still stamps what it did write (I10782)
@@ -955,7 +955,7 @@ def require_in_region(tool: str) -> None:
         )
 
 
-def manifest_sink(bucket: str, s3_client=None) -> S3ManifestSink:
+def manifest_sink(bucket: str, s3_client: Any = None) -> S3ManifestSink:  # pyright: ignore[reportExplicitAny] -- boto3 has no typed client protocol.
     """The production sink for this repo's run manifests.
 
     The collectors' writer identity already holds ``alpha-engine-research/*``,
@@ -1243,7 +1243,7 @@ def recorded_entry(
 
     captured: dict[str, Any] = {}
 
-    def _checked(ctx) -> Any:
+    def _checked(ctx: run_manifest.UnitRun) -> object:
         try:
             captured["value"] = value = body(ctx)
         finally:  # EntryRunFailed still published what it recorded; stamp it (I10782)

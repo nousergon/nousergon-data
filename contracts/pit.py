@@ -65,7 +65,7 @@ import datetime as dt
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import TypedDict, cast
 from zoneinfo import ZoneInfo
 
 __all__ = [
@@ -101,7 +101,7 @@ MARKET_TZ = ZoneInfo("America/New_York")
 #: timestamp, so it is declared provenance: two correct re-productions of the
 #: same record carry different ones, and shadow parity must not grade that as a
 #: data breach (`tests/test_declared_contracts_are_reachable_from_their_keys.py`).
-PIT_PROPERTIES: dict[str, dict[str, Any]] = {
+PIT_PROPERTIES: dict[str, dict[str, object]] = {
     AS_OF: {
         "type": "string",
         "format": "date",
@@ -188,12 +188,12 @@ def as_of_floor(as_of: dt.date) -> dt.datetime:
 
 
 def stamp(
-    payload: Mapping[str, Any],
+    payload: Mapping[str, object],
     *,
     as_of: dt.date | str,
     available_at: dt.datetime | None = None,
     now: dt.datetime | None = None,
-) -> dict[str, Any]:
+) -> dict[str, object]:
     """A copy of ``payload`` carrying both point-in-time fields.
 
     ``available_at`` defaults to ``now`` (or the wall clock): call this when
@@ -222,7 +222,7 @@ def stamp(
     return out
 
 
-def _entry(key: str, verdict: str, detail: str, value: float | None, baseline: float | None) -> dict[str, Any]:
+def _entry(key: str, verdict: str, detail: str, value: float | None, baseline: float | None) -> PitGuardEntry:
     return {
         "guard": PIT_GUARD_NAME,
         "mode": PIT_GUARD_MODE,
@@ -234,7 +234,7 @@ def _entry(key: str, verdict: str, detail: str, value: float | None, baseline: f
     }
 
 
-def pit_guard_entry(key: str, document: Mapping[str, Any] | None) -> dict[str, Any]:
+def pit_guard_entry(key: str, document: object) -> PitGuardEntry:
     """The manifest ``guards[]`` entry for the stamps ``document`` carries.
 
     ``document`` is the payload the producer just wrote at ``key`` (for a row
@@ -245,7 +245,8 @@ def pit_guard_entry(key: str, document: Mapping[str, Any] | None) -> dict[str, A
     exempt = pit_exemption(key)
     if exempt is not None:
         return _entry(key, "not_applicable", f"{key}: {exempt}", None, None)
-    doc = document if isinstance(document, Mapping) else {}
+    # Manifest payloads are an untyped JSON boundary; the runtime check narrows their container.
+    doc: Mapping[str, object] = cast(Mapping[str, object], document) if isinstance(document, Mapping) else {}
     missing = [f for f in (AS_OF, AVAILABLE_AT) if doc.get(f) in (None, "")]
     if missing:
         return _entry(
@@ -293,13 +294,23 @@ class PitStamp:
     detail: str
 
 
+class PitGuardEntry(TypedDict):
+    guard: str
+    mode: str
+    verdict: str
+    detail: str
+    key: str
+    value: float | None
+    baseline: float | None
+
+
 def _seconds(value: object) -> dt.datetime | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         return None
     return dt.datetime.fromtimestamp(float(value), tz=dt.timezone.utc)
 
 
-def read_pit_entry(entry: Mapping[str, Any]) -> PitStamp | None:
+def read_pit_entry(entry: Mapping[str, object]) -> PitStamp | None:
     """A manifest ``guards[]`` entry as a :class:`PitStamp`, or ``None`` if it is not one."""
     if str(entry.get("guard") or "") != PIT_GUARD_NAME or not entry.get("key"):
         return None
