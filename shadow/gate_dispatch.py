@@ -35,7 +35,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import urllib.request
-from typing import Callable
+from typing import Callable, TypedDict
 
 GATE_REPO_OWNER = "nousergon"
 GATE_REPO_NAME = "nousergon-data"
@@ -53,6 +53,24 @@ HTTP_TIMEOUT_SECONDS = 20
 MAX_ERROR_CHARS = 300
 
 
+class DispatchInputs(TypedDict):
+    trading_day: str
+    trigger: str
+
+
+class DispatchPayload(TypedDict):
+    ref: str
+    inputs: DispatchInputs
+
+
+class DispatchRecord(TypedDict):
+    ok: bool
+    error: str | None
+    workflow: str
+    inputs: DispatchInputs
+    dispatched_at: str | None
+
+
 def dispatch_url() -> str:
     return (
         f"https://api.github.com/repos/{GATE_REPO_OWNER}/{GATE_REPO_NAME}"
@@ -60,7 +78,7 @@ def dispatch_url() -> str:
     )
 
 
-def dispatch_payload(trading_day: dt.date) -> dict:
+def dispatch_payload(trading_day: dt.date) -> DispatchPayload:
     """The body `data-gate.yml`'s `workflow_dispatch` inputs accept.
 
     Pinned against the workflow's declared inputs by
@@ -84,7 +102,7 @@ def mint_token() -> str:
     )
 
 
-def post_dispatch(url: str, token: str, payload: dict) -> int:
+def post_dispatch(url: str, token: str, payload: DispatchPayload) -> int:
     request = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
@@ -104,8 +122,8 @@ def dispatch_gate_read(
     trading_day: dt.date,
     *,
     mint: Callable[[], str] = mint_token,
-    post: Callable[[str, str, dict], int] = post_dispatch,
-) -> dict:
+    post: Callable[[str, str, DispatchPayload], int] = post_dispatch,
+) -> DispatchRecord:
     """Dispatch the gate read for ``trading_day``; return what happened.
 
     The returned dict is written into the parity report verbatim as
@@ -113,7 +131,7 @@ def dispatch_gate_read(
     the same object the gate grades.
     """
     payload = dispatch_payload(trading_day)
-    record = {
+    record: DispatchRecord = {
         "ok": False,
         "error": None,
         "workflow": f"{GATE_REPO_OWNER}/{GATE_REPO_NAME}/{GATE_WORKFLOW}",
