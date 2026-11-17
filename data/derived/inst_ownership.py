@@ -82,13 +82,18 @@ import zipfile
 from dataclasses import asdict, dataclass
 from datetime import date as Date
 from datetime import datetime, timedelta, timezone
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 import pandas as pd
 import requests
 
 import run_units
 from dates import default_run_date
+
+if TYPE_CHECKING:
+    import argparse
+
+    from nousergon_lib.run_manifest import UnitRun
 
 logger = logging.getLogger(__name__)
 
@@ -1826,7 +1831,7 @@ def _run_dry_run() -> int:
     return 0 if mapping else 1
 
 
-def _record_written_quarter(ctx: Any, bucket: str, prefix: str, rows: list, *, global_sidecar: bool) -> list[tuple[str, int]]:
+def _record_written_quarter(ctx: UnitRun, bucket: str, prefix: str, rows: list, *, global_sidecar: bool) -> list[tuple[str, int]]:
     """Record one quarter's published keys with the row count that landed.
 
     ``write_inst_ownership_parquet`` writes a run-scoped artifact under a run id
@@ -1847,7 +1852,7 @@ def _record_written_quarter(ctx: Any, bucket: str, prefix: str, rows: list, *, g
     return recorded
 
 
-def _grade_published(ctx: Any, bucket: str, s3_client: Any, published: list[tuple[str, int]]) -> None:
+def _grade_published(ctx: UnitRun, bucket: str, s3_client: Any, published: list[tuple[str, int]]) -> None:
     """The empty-but-fresh + floor guard over every key this D39 run published.
 
     `alpha-engine-config-I10785` (P-18). ``_run_cli`` already exits 1 when
@@ -1941,7 +1946,7 @@ def main() -> None:
     )
 
 
-def _run_cli(args: Any, run_ctx: Any) -> None:
+def _run_cli(args: argparse.Namespace, run_ctx: UnitRun) -> None:
     """The CLI's actual work, recording its lineage on ``run_ctx``."""
     import sys
 
