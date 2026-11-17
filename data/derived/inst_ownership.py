@@ -82,13 +82,18 @@ import zipfile
 from dataclasses import asdict, dataclass
 from datetime import date as Date
 from datetime import datetime, timedelta, timezone
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 import pandas as pd
 import requests
 
 import run_units
 from dates import default_run_date
+
+if TYPE_CHECKING:
+    import argparse
+
+    from nousergon_lib.run_manifest import UnitRun
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +114,25 @@ SEC_13F_INDEX_URL = (
 SEC_13F_BASE_URL = (
     "https://www.sec.gov/files/structureddata/data/form-13f-data-sets"
 )
+SEC_ORIGIN = "https://www.sec.gov"
+
+# A window's download URL exactly as the SEC index page links it, keyed by
+# filename (alpha-engine-config-I13772). SEC does NOT serve every window from
+# ``SEC_13F_BASE_URL``: measured 2026-11-17, the index links
+# ``01jun2026-31aug2026_form13f.zip`` under
+# ``/files/datastandardsinnovation/data/form-13f-data-sets/`` while every
+# older window stays under ``/files/structureddata/...``, and the
+# reconstructed ``structureddata`` URL for that window answers 404. Every
+# weekly run from 2026-09-19 to 2026-11-14 therefore skipped it as
+# "not published" and rewrote 2026Q1, until crucible's point-in-time reader
+# (one missing quarter tolerated, two refused) declared 13F stale on
+# 2026-11-16. The base URL is now only the fallback for a filename the index
+# did not link (the deterministic-construction path).
+_INDEX_HREF_RE = re.compile(
+    r"""href=["']((?:https?://www\.sec\.gov)?/[^"'\s>]*?/form-13f-data-sets/"""
+    r"""([A-Za-z0-9_.\-]+\.zip))["']"""
+)
+_DISCOVERED_WINDOW_URLS: dict[str, str] = {}
 
 _MONTH_ABBR = {
     1: "jan", 2: "feb", 3: "mar", 4: "apr", 5: "may", 6: "jun",
@@ -464,7 +488,7 @@ class OpenFigiMapper:
         self._bucket = bucket or _TokenBucket(rate, 60.0)
 
     @staticmethod
-    def _default_post(url: str, *, json: Any, headers: dict[str, str], timeout: int):
+    def _default_post(url: str, *, json: Any, headers: dict[str, str], timeout: int) -> requests.Response:
         return requests.post(url, json=json, headers=headers, timeout=timeout)
 
     def map_cusips(self, cusips: list[str]) -> dict[str, str]:
@@ -834,6 +858,8 @@ def discover_window_filenames_from_html(html: str) -> list[str]:
     the deterministic fallback still runs if discovery yields nothing.
     """
     names = set(re.findall(r"form-13f-data-sets/([A-Za-z0-9_.\-]+\.zip)", html))
+    for href, name in _INDEX_HREF_RE.findall(html):
+        _DISCOVERED_WINDOW_URLS[name] = href if href.startswith("http") else SEC_ORIGIN + href
     dated = [(n, _window_end_date(n)) for n in names]
     dated = [(n, d) for n, d in dated if d is not None]
     dated.sort(key=lambda pair: pair[1], reverse=True)
@@ -880,6 +906,13 @@ def _user_agent() -> dict[str, str]:
     return dict(_SEC_HEADERS)
 
 
+def window_download_url(filename: str) -> str:
+    """The URL to fetch ``filename`` from: the index page's own link when
+    discovery saw one, else ``SEC_13F_BASE_URL`` (see
+    ``_DISCOVERED_WINDOW_URLS``)."""
+    return _DISCOVERED_WINDOW_URLS.get(filename, f"{SEC_13F_BASE_URL}/{filename}")
+
+
 def _download_sec_bulk_zip(filename: str) -> zipfile.ZipFile | None:
     """Download one SEC Form 13F filing-window bulk ZIP from SEC.gov by
     its exact filename (e.g. ``"01mar2026-31may2026_form13f.zip"``).
@@ -889,7 +922,7 @@ def _download_sec_bulk_zip(filename: str) -> zipfile.ZipFile | None:
     Returns a ``ZipFile`` opened on the temp path, or ``None`` if the
     window isn't published yet (HTTP 404) or the request otherwise failed.
     """
-    url = f"{SEC_13F_BASE_URL}/{filename}"
+    url = window_download_url(filename)
     try:
         with requests.get(url, headers=_SEC_HEADERS, timeout=120, stream=True) as resp:
             status = resp.status_code
@@ -1798,7 +1831,7 @@ def _run_dry_run() -> int:
     return 0 if mapping else 1
 
 
-def _record_written_quarter(ctx, bucket: str, prefix: str, rows: list, *, global_sidecar: bool) -> list[tuple[str, int]]:
+def _record_written_quarter(ctx: UnitRun, bucket: str, prefix: str, rows: list[InstOwnershipRow], *, global_sidecar: bool) -> list[tuple[str, int]]:
     """Record one quarter's published keys with the row count that landed.
 
     ``write_inst_ownership_parquet`` writes a run-scoped artifact under a run id
@@ -1819,7 +1852,7 @@ def _record_written_quarter(ctx, bucket: str, prefix: str, rows: list, *, global
     return recorded
 
 
-def _grade_published(ctx, bucket: str, s3_client: Any, published: list[tuple[str, int]]) -> None:
+def _grade_published(ctx: UnitRun, bucket: str, s3_client: Any, published: list[tuple[str, int]]) -> None:  # pyright: ignore[reportExplicitAny]  # untyped boto3 client (no stubs)
     """The empty-but-fresh + floor guard over every key this D39 run published.
 
     `alpha-engine-config-I10785` (P-18). ``_run_cli`` already exits 1 when
@@ -1913,7 +1946,7 @@ def main() -> None:
     )
 
 
-def _run_cli(args, run_ctx) -> None:
+def _run_cli(args: argparse.Namespace, run_ctx: UnitRun) -> None:
     """The CLI's actual work, recording its lineage on ``run_ctx``."""
     import sys
 
