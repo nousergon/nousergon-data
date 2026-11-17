@@ -1831,7 +1831,7 @@ def _run_dry_run() -> int:
     return 0 if mapping else 1
 
 
-def _record_written_quarter(ctx: UnitRun, bucket: str, prefix: str, rows: list, *, global_sidecar: bool) -> list[tuple[str, int]]:
+def _record_written_quarter(ctx: UnitRun, bucket: str, prefix: str, rows: list[InstOwnershipRow], *, global_sidecar: bool) -> list[tuple[str, int]]:
     """Record one quarter's published keys with the row count that landed.
 
     ``write_inst_ownership_parquet`` writes a run-scoped artifact under a run id
@@ -1852,7 +1852,7 @@ def _record_written_quarter(ctx: UnitRun, bucket: str, prefix: str, rows: list, 
     return recorded
 
 
-def _grade_published(ctx: UnitRun, bucket: str, s3_client: Any, published: list[tuple[str, int]]) -> None:
+def _grade_published(ctx: UnitRun, bucket: str, s3_client: Any, published: list[tuple[str, int]]) -> None:  # pyright: ignore[reportExplicitAny]  # untyped boto3 client (no stubs)
     """The empty-but-fresh + floor guard over every key this D39 run published.
 
     `alpha-engine-config-I10785` (P-18). ``_run_cli`` already exits 1 when
