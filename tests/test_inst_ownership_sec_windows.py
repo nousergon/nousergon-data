@@ -41,6 +41,7 @@ from data.derived.inst_ownership import (
     _window_filename,
     _window_index_for_date,
     discover_window_filenames_from_html,
+    window_download_url,
 )
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
@@ -147,6 +148,32 @@ class TestIndexPageDiscovery:
         html = (FIXTURES_DIR / "sec_13f_index_page_excerpt.html").read_text()
         names = discover_window_filenames_from_html(html)
         assert "README.htm" not in " ".join(names)
+
+    def test_download_url_follows_the_index_link_not_the_base(self):
+        # alpha-engine-config-I13772: SEC moved the newest window to a
+        # different /files/ directory; the reconstructed base URL 404s.
+        html = (
+            '<a href="/files/datastandardsinnovation/data/form-13f-data-sets/'
+            '01jun2026-31aug2026_form13f.zip">Jun-Aug 2026</a>'
+            '<a href="https://www.sec.gov/files/structureddata/data/form-13f-data-sets/'
+            '01mar2026-31may2026_form13f.zip">Mar-May 2026</a>'
+        )
+        names = discover_window_filenames_from_html(html)
+        assert names[0] == "01jun2026-31aug2026_form13f.zip"
+        assert window_download_url("01jun2026-31aug2026_form13f.zip") == (
+            "https://www.sec.gov/files/datastandardsinnovation/data/"
+            "form-13f-data-sets/01jun2026-31aug2026_form13f.zip"
+        )
+        assert window_download_url("01mar2026-31may2026_form13f.zip") == (
+            "https://www.sec.gov/files/structureddata/data/"
+            "form-13f-data-sets/01mar2026-31may2026_form13f.zip"
+        )
+
+    def test_download_url_falls_back_to_base_for_an_unlinked_name(self):
+        assert window_download_url("01sep2031-30nov2031_form13f.zip") == (
+            "https://www.sec.gov/files/structureddata/data/"
+            "form-13f-data-sets/01sep2031-30nov2031_form13f.zip"
+        )
 
     def test_empty_html_yields_no_candidates(self):
         assert discover_window_filenames_from_html("<html></html>") == []
