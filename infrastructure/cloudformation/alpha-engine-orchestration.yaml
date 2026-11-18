@@ -893,7 +893,11 @@ Resources:
   # arcticdb/ and carries NO TARGET on purpose: its AWS/Events `TriggeredRules`
   # metric (dimension RuleName) is the signal, and the alarm that reads it is
   # codified in nous-ergon-ops infrastructure/cloudwatch/alarms/
-  # (ne-arcticdb-object-deleted). Not a trigger, so not an automation-pause entry.
+  # (ne-arcticdb-object-deleted). Not a trigger, but automation_pause.py --check
+  # classifies every live ENABLED rule, so it is declared in not_paused.
+  # The pattern matches API deletes and delete markers only: the bucket's
+  # lifecycle rule expire-noncurrent-versions-30d also emits Object Deleted
+  # (reason "Lifecycle Expiration") for thousands of noncurrent versions a day.
   ArcticDbObjectDeletedRule:
     Type: AWS::Events::Rule
     Properties:
@@ -909,6 +913,9 @@ Resources:
           object:
             key:
               - prefix: arcticdb/
+          $or:
+            - reason: [DeleteObject]
+            - deletion-type: [Delete Marker Created]
 
 Outputs:
   AlertsTopicArn:
