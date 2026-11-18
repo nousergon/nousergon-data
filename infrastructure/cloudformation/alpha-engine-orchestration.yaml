@@ -887,6 +887,29 @@ Resources:
           Arn: !GetAtt AlertLogDeliveryStream.Arn
           RoleArn: !Ref EventBridgeSfnRoleArn
 
+  # alpha-engine-config-I13040: metric source for the ArcticDB delete alarm.
+  # The bucket has EventBridge notifications on, so S3 emits `Object Deleted`
+  # for every DeleteObject / delete marker. This rule matches them under
+  # arcticdb/ and carries NO TARGET on purpose: its AWS/Events `TriggeredRules`
+  # metric (dimension RuleName) is the signal, and the alarm that reads it is
+  # codified in nous-ergon-ops infrastructure/cloudwatch/alarms/
+  # (ne-arcticdb-object-deleted). Not a trigger, so not an automation-pause entry.
+  ArcticDbObjectDeletedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: ne-arcticdb-object-deleted
+      Description: S3 Object Deleted under alpha-engine-research/arcticdb/ (metric source for the delete alarm, config-I13040)
+      State: ENABLED
+      EventPattern:
+        source: [aws.s3]
+        detail-type: [Object Deleted]
+        detail:
+          bucket:
+            name: [alpha-engine-research]
+          object:
+            key:
+              - prefix: arcticdb/
+
 Outputs:
   AlertsTopicArn:
     Value: !Ref AlertsTopic
