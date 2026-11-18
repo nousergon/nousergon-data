@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "guard": "sf-entrypoint-lint",
   "tracker": "alpha-engine-config-I12533",
   "note": "Shrink-only ceiling of S-46 findings per SF definition per rule. Never raise an entry; lower it with `python3 validators/sf_entrypoint_lint.py --update` when a finding is removed.",
@@ -7,38 +7,1860 @@
     "task-undeclared-entrypoint": 1,
     "task-not-an-entrypoint": 140,
     "task-inline-shell-logic": 13,
-    "choice-beyond-outcome": 163,
+    "choice-beyond-outcome": 185,
+    "retry-business-logic": 112,
+    "catch-business-logic": 205,
+    "wait-dynamic": 0,
+    "map-data-derived": 3,
+    "computing-intrinsic": 186,
+    "parallel-business-logic": 2,
     "files": 6
   },
   "files": {
     "infrastructure/step-functions/data-collection.asl.json": {
-      "task-not-an-entrypoint": 3,
-      "choice-beyond-outcome": 6
+      "CheckCompletion": [
+        "choice-beyond-outcome"
+      ],
+      "CheckRequireTradingDay": [
+        "choice-beyond-outcome"
+      ],
+      "CheckVerifyUnits": [
+        "choice-beyond-outcome"
+      ],
+      "CompletionFailureMode": [
+        "choice-beyond-outcome"
+      ],
+      "IsTradingDay": [
+        "choice-beyond-outcome"
+      ],
+      "NotifyCompletionFindings": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "NotifyFailure": [
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "RunWorkloads": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "map-data-derived"
+      ],
+      "RunWorkloads/CheckLaunched": [
+        "choice-beyond-outcome"
+      ],
+      "RunWorkloads/CheckRetryBudget": [
+        "choice-beyond-outcome"
+      ],
+      "RunWorkloads/CheckWorkloadStatus": [
+        "choice-beyond-outcome"
+      ],
+      "RunWorkloads/LaunchWorkload": [
+        "catch-business-logic"
+      ],
+      "RunWorkloads/PollWorkload": [
+        "catch-business-logic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "RunWorkloads/RetryOnDemand": [
+        "computing-intrinsic"
+      ],
+      "TradingDayCheck": [
+        "catch-business-logic"
+      ],
+      "VerifyRunManifests": [
+        "catch-business-logic"
+      ]
     },
     "infrastructure/step_function.json": {
-      "task-not-an-entrypoint": 68,
-      "task-inline-shell-logic": 6,
-      "choice-beyond-outcome": 105
+      "AcquireMutex": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "AggregateCosts": [
+        "catch-business-logic"
+      ],
+      "ApplyNormalizedRunDate": [
+        "computing-intrinsic"
+      ],
+      "ApplyRehearsalNamespace": [
+        "computing-intrinsic"
+      ],
+      "ApplyShellRunDefaults": [
+        "computing-intrinsic"
+      ],
+      "Backtester": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "retry-business-logic"
+      ],
+      "BacktesterLivenessGate": [
+        "choice-beyond-outcome"
+      ],
+      "BacktesterWait": [
+        "computing-intrinsic"
+      ],
+      "CheckBacktesterStatus": [
+        "choice-beyond-outcome"
+      ],
+      "CheckBranchOutcomes": [
+        "choice-beyond-outcome"
+      ],
+      "CheckCollectionReadiness": [
+        "choice-beyond-outcome"
+      ],
+      "CheckCollectionReadinessBudget": [
+        "choice-beyond-outcome"
+      ],
+      "CheckDegradedOutcome": [
+        "choice-beyond-outcome"
+      ],
+      "CheckDirectorRetroRefused": [
+        "choice-beyond-outcome"
+      ],
+      "CheckDirectorStatus": [
+        "choice-beyond-outcome"
+      ],
+      "CheckDirectorSubResults": [
+        "choice-beyond-outcome"
+      ],
+      "CheckEvaluatorDiagnosticsStatus": [
+        "choice-beyond-outcome"
+      ],
+      "CheckEvaluatorOptimizeStatus": [
+        "choice-beyond-outcome"
+      ],
+      "CheckExecutionDidWork": [
+        "choice-beyond-outcome"
+      ],
+      "CheckGateDegradedNotify": [
+        "choice-beyond-outcome"
+      ],
+      "CheckMutexRole": [
+        "choice-beyond-outcome"
+      ],
+      "CheckParityBranchOutcomes": [
+        "choice-beyond-outcome"
+      ],
+      "CheckPitParityCompareStatus": [
+        "choice-beyond-outcome"
+      ],
+      "CheckPortfolioOptimizerBacktestStatus": [
+        "choice-beyond-outcome"
+      ],
+      "CheckPredictorBacktestStatus": [
+        "choice-beyond-outcome"
+      ],
+      "CheckRehearsalDeadlineBeforeBacktester": [
+        "choice-beyond-outcome"
+      ],
+      "CheckRehearsalDeadlineBeforeEvaluatorDiagnostics": [
+        "choice-beyond-outcome"
+      ],
+      "CheckRehearsalDeadlineBeforePortfolioOptimizerBacktest": [
+        "choice-beyond-outcome"
+      ],
+      "CheckRehearsalDeadlineBeforePredictorBacktest": [
+        "choice-beyond-outcome"
+      ],
+      "CheckRehearsalDeadlineBeforeReportCard": [
+        "choice-beyond-outcome"
+      ],
+      "CheckRehearsalMarker": [
+        "choice-beyond-outcome"
+      ],
+      "CheckResearchPredictorDegraded": [
+        "choice-beyond-outcome"
+      ],
+      "CheckRunMode": [
+        "choice-beyond-outcome"
+      ],
+      "CheckRunSlotHeldBeforeDegradedRun": [
+        "choice-beyond-outcome"
+      ],
+      "CheckRunSlotHeldBeforeFailExecution": [
+        "choice-beyond-outcome"
+      ],
+      "CheckRunSlotHeldBeforeVacuousRun": [
+        "choice-beyond-outcome"
+      ],
+      "CheckRunSlotHolderPresent": [
+        "choice-beyond-outcome"
+      ],
+      "CheckRunSlotHolderTerminal": [
+        "choice-beyond-outcome"
+      ],
+      "CheckSaturdayHealthCheckStatus": [
+        "choice-beyond-outcome"
+      ],
+      "CheckScannerResourceKillReason": [
+        "choice-beyond-outcome"
+      ],
+      "CheckShellRun": [
+        "choice-beyond-outcome"
+      ],
+      "CheckShellRunDegradedOutcome": [
+        "choice-beyond-outcome"
+      ],
+      "CheckShellRunNotify": [
+        "choice-beyond-outcome"
+      ],
+      "CheckSkipAggregateCosts": [
+        "choice-beyond-outcome"
+      ],
+      "CheckSkipBacktester": [
+        "choice-beyond-outcome"
+      ],
+      "CheckSkipBacktesterStageOnly": [
+        "choice-beyond-outcome"
+      ],
+      "CheckSkipDirector": [
+        "choice-beyond-outcome"
+      ],
+      "CheckSkipEvaluator": [
+        "choice-beyond-outcome"
+      ],
+      "CheckSkipLibPinDriftCheck": [
+        "choice-beyond-outcome"
+      ],
+      "CheckSkipMorningEnrich": [
+        "choice-beyond-outcome"
+      ],
+      "CheckSkipParity": [
+        "choice-beyond-outcome"
+      ],
+      "CheckSkipPitParityCompare": [
+        "choice-beyond-outcome"
+      ],
+      "CheckSkipPortfolioOptimizerBacktest": [
+        "choice-beyond-outcome"
+      ],
+      "CheckSkipPostEval": [
+        "choice-beyond-outcome"
+      ],
+      "CheckSkipPredictorBacktest": [
+        "choice-beyond-outcome"
+      ],
+      "CheckSkipReportCard": [
+        "choice-beyond-outcome"
+      ],
+      "CheckSkipSaturdayHealthCheck": [
+        "choice-beyond-outcome"
+      ],
+      "CheckSkipScannerLeaderboard": [
+        "choice-beyond-outcome"
+      ],
+      "CheckSpotDispatchNeeded": [
+        "choice-beyond-outcome"
+      ],
+      "CheckSubstrateHealthCheckStatus": [
+        "choice-beyond-outcome"
+      ],
+      "CheckSubstrateHealthGate": [
+        "choice-beyond-outcome"
+      ],
+      "CheckWeeklyCoverageSweepOutcome": [
+        "choice-beyond-outcome"
+      ],
+      "CheckWeeklyFreshnessSpotBootstrapStatus": [
+        "choice-beyond-outcome"
+      ],
+      "CheckWeeklyPreflightOnSpotStatus": [
+        "choice-beyond-outcome"
+      ],
+      "CheckWeeklyRunDayGate": [
+        "choice-beyond-outcome"
+      ],
+      "DegradedRun": [
+        "computing-intrinsic"
+      ],
+      "DescribeRunSlotHolder": [
+        "task-not-an-entrypoint"
+      ],
+      "Director": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "retry-business-logic",
+        "task-inline-shell-logic"
+      ],
+      "DirectorLivenessGate": [
+        "choice-beyond-outcome"
+      ],
+      "DirectorWait": [
+        "computing-intrinsic"
+      ],
+      "DispatchWeeklyFreshnessSpot": [
+        "catch-business-logic",
+        "retry-business-logic"
+      ],
+      "EvaluatorDeployDriftCheck": [
+        "catch-business-logic",
+        "retry-business-logic"
+      ],
+      "EvaluatorDeployDriftGate": [
+        "choice-beyond-outcome"
+      ],
+      "EvaluatorDiagnostics": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "retry-business-logic"
+      ],
+      "EvaluatorDiagnosticsLivenessGate": [
+        "choice-beyond-outcome"
+      ],
+      "EvaluatorDiagnosticsWait": [
+        "computing-intrinsic"
+      ],
+      "EvaluatorDirectorDeployDriftCheck": [
+        "catch-business-logic",
+        "retry-business-logic"
+      ],
+      "EvaluatorDirectorDeployDriftGate": [
+        "choice-beyond-outcome"
+      ],
+      "EvaluatorOptimize": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "retry-business-logic"
+      ],
+      "EvaluatorOptimizeLivenessGate": [
+        "choice-beyond-outcome"
+      ],
+      "EvaluatorOptimizeWait": [
+        "computing-intrinsic"
+      ],
+      "FailExecution": [
+        "computing-intrinsic"
+      ],
+      "HandleFailure": [
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "IncrementCollectionReadinessPoll": [
+        "computing-intrinsic"
+      ],
+      "InitializeInput": [
+        "computing-intrinsic"
+      ],
+      "LibPinDriftCheck": [
+        "catch-business-logic",
+        "retry-business-logic"
+      ],
+      "LibPinDriftGate": [
+        "choice-beyond-outcome"
+      ],
+      "MergeRelaunchedSpotInstanceId": [
+        "computing-intrinsic"
+      ],
+      "MergeWeeklyFreshnessSpotInstanceId": [
+        "computing-intrinsic"
+      ],
+      "NormalizeEc2InstanceId": [
+        "choice-beyond-outcome"
+      ],
+      "NormalizeFailureContext": [
+        "computing-intrinsic"
+      ],
+      "NormalizeFailureContextRepin": [
+        "choice-beyond-outcome",
+        "computing-intrinsic"
+      ],
+      "NormalizeRunDates": [
+        "catch-business-logic",
+        "retry-business-logic"
+      ],
+      "NotifyComplete": [
+        "catch-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "NotifyCompleteGatesAndHealthDegraded": [
+        "catch-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "NotifyCompleteGatesDegraded": [
+        "catch-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "NotifyCompleteHealthDegraded": [
+        "catch-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "NotifyCompleteMultipleDegraded": [
+        "catch-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "NotifyCompleteParityDegraded": [
+        "catch-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "NotifyCompleteReportCardDegraded": [
+        "catch-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "NotifyCompleteScannerLeaderboardDegraded": [
+        "catch-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "NotifyShellRunComplete": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "ParityParallel": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "parallel-business-logic"
+      ],
+      "ParityParallel[0]/CheckPitParityLookaheadResourceKillCheckOutcome": [
+        "choice-beyond-outcome"
+      ],
+      "ParityParallel[0]/CheckPitParityLookaheadStatus": [
+        "choice-beyond-outcome"
+      ],
+      "ParityParallel[0]/CheckSkipPitParityLookahead": [
+        "choice-beyond-outcome"
+      ],
+      "ParityParallel[0]/PitParityLookahead": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "retry-business-logic",
+        "task-inline-shell-logic"
+      ],
+      "ParityParallel[0]/PitParityLookaheadResourceKillCheck": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "retry-business-logic"
+      ],
+      "ParityParallel[0]/PitParityLookaheadWait": [
+        "computing-intrinsic"
+      ],
+      "ParityParallel[0]/WaitForPitParityLookahead": [
+        "catch-business-logic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "ParityParallel[0]/WaitForPitParityLookaheadResourceKillCheck": [
+        "catch-business-logic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "ParityParallel[1]/CheckPitParityWalkforwardResourceKillCheckOutcome": [
+        "choice-beyond-outcome"
+      ],
+      "ParityParallel[1]/CheckPitParityWalkforwardStatus": [
+        "choice-beyond-outcome"
+      ],
+      "ParityParallel[1]/CheckSkipPitParityWalkforward": [
+        "choice-beyond-outcome"
+      ],
+      "ParityParallel[1]/PitParityWalkforward": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "retry-business-logic",
+        "task-inline-shell-logic"
+      ],
+      "ParityParallel[1]/PitParityWalkforwardResourceKillCheck": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "retry-business-logic"
+      ],
+      "ParityParallel[1]/PitParityWalkforwardWait": [
+        "computing-intrinsic"
+      ],
+      "ParityParallel[1]/WaitForPitParityWalkforward": [
+        "catch-business-logic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "ParityParallel[1]/WaitForPitParityWalkforwardResourceKillCheck": [
+        "catch-business-logic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "ParityParallel[2]/CheckParityReplayStatus": [
+        "choice-beyond-outcome"
+      ],
+      "ParityParallel[2]/CheckSkipParityReplay": [
+        "choice-beyond-outcome"
+      ],
+      "ParityParallel[2]/ParityReplay": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "retry-business-logic"
+      ],
+      "ParityParallel[2]/ParityReplayWait": [
+        "computing-intrinsic"
+      ],
+      "ParityParallel[2]/WaitForParityReplay": [
+        "catch-business-logic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "PipelineContractCheck": [
+        "catch-business-logic",
+        "retry-business-logic"
+      ],
+      "PipelineContractGate": [
+        "choice-beyond-outcome"
+      ],
+      "PitParityCompare": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "retry-business-logic"
+      ],
+      "PitParityCompareResourceKill": [
+        "computing-intrinsic"
+      ],
+      "PitParityCompareWait": [
+        "computing-intrinsic"
+      ],
+      "PitParityResourceKillDetected": [
+        "computing-intrinsic"
+      ],
+      "PortfolioOptimizerBacktest": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "retry-business-logic"
+      ],
+      "PortfolioOptimizerBacktestLivenessGate": [
+        "choice-beyond-outcome"
+      ],
+      "PortfolioOptimizerBacktestWait": [
+        "computing-intrinsic"
+      ],
+      "PredictorBacktest": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "retry-business-logic"
+      ],
+      "PredictorBacktestLivenessGate": [
+        "choice-beyond-outcome"
+      ],
+      "PredictorBacktestWait": [
+        "computing-intrinsic"
+      ],
+      "PublishAggregateCostsDegraded": [
+        "catch-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "PublishCostCoverageGap": [
+        "catch-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "PublishEvaluatorDirectorGateDegraded": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "PublishEvaluatorGateDegraded": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "PublishLibPinGateDegraded": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "PublishMutexAcquireDegraded": [
+        "catch-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "PublishParityCompareDegraded": [
+        "catch-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "PublishParityDegraded": [
+        "catch-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "PublishPipelineContractGateDegraded": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "PublishReportCardDegraded": [
+        "catch-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "PublishScannerLeaderboardDegraded": [
+        "catch-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "PublishWeeklyPreflightBlindSpotNotice": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "PublishWeeklyPreflightOnSpotNotice": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "ReadRehearsalMarker": [
+        "computing-intrinsic"
+      ],
+      "ReadRunSlotHolder": [
+        "computing-intrinsic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "ReconcileWeeklyPreflightBlindSpot": [
+        "choice-beyond-outcome"
+      ],
+      "RecordWeeklyPreflightOnSpot": [
+        "computing-intrinsic"
+      ],
+      "RecordWeeklyPreflightOnSpotFail": [
+        "computing-intrinsic"
+      ],
+      "RelaunchWeeklyFreshnessSpot": [
+        "catch-business-logic",
+        "retry-business-logic"
+      ],
+      "ReleaseRunSlotBeforeDegradedRun": [
+        "computing-intrinsic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "ReleaseRunSlotBeforeFailExecution": [
+        "computing-intrinsic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "ReleaseRunSlotBeforeVacuousRun": [
+        "computing-intrinsic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "ReportCard": [
+        "catch-business-logic"
+      ],
+      "ResearchPredictorParallel": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "parallel-business-logic",
+        "retry-business-logic"
+      ],
+      "ResearchPredictorParallel[0]/ChallengerShadow": [
+        "catch-business-logic"
+      ],
+      "ResearchPredictorParallel[0]/CheckDataPhase2Status": [
+        "choice-beyond-outcome"
+      ],
+      "ResearchPredictorParallel[0]/CheckEvalCadenceRehearsal": [
+        "choice-beyond-outcome"
+      ],
+      "ResearchPredictorParallel[0]/CheckEvalJudgeProcessStatus": [
+        "choice-beyond-outcome"
+      ],
+      "ResearchPredictorParallel[0]/CheckEvalJudgeSpotBootstrapStatus": [
+        "choice-beyond-outcome"
+      ],
+      "ResearchPredictorParallel[0]/CheckMonthlyCadence": [
+        "choice-beyond-outcome"
+      ],
+      "ResearchPredictorParallel[0]/CheckRAGIngestionStatus": [
+        "choice-beyond-outcome"
+      ],
+      "ResearchPredictorParallel[0]/CheckRehearsalDeadlineBeforeDataPhase2": [
+        "choice-beyond-outcome"
+      ],
+      "ResearchPredictorParallel[0]/CheckRehearsalDeadlineBeforeRAGIngestion": [
+        "choice-beyond-outcome"
+      ],
+      "ResearchPredictorParallel[0]/CheckSkipChallengerShadow": [
+        "choice-beyond-outcome"
+      ],
+      "ResearchPredictorParallel[0]/CheckSkipCounterfactual": [
+        "choice-beyond-outcome"
+      ],
+      "ResearchPredictorParallel[0]/CheckSkipDataPhase2": [
+        "choice-beyond-outcome"
+      ],
+      "ResearchPredictorParallel[0]/CheckSkipEvalJudge": [
+        "choice-beyond-outcome"
+      ],
+      "ResearchPredictorParallel[0]/CheckSkipRAGIngestion": [
+        "choice-beyond-outcome"
+      ],
+      "ResearchPredictorParallel[0]/CheckSkipRationaleClustering": [
+        "choice-beyond-outcome"
+      ],
+      "ResearchPredictorParallel[0]/CheckSkipRegimeRetrospectiveEval": [
+        "choice-beyond-outcome"
+      ],
+      "ResearchPredictorParallel[0]/CheckSkipRegimeSubstrate": [
+        "choice-beyond-outcome"
+      ],
+      "ResearchPredictorParallel[0]/CheckSkipResearchSelfTest": [
+        "choice-beyond-outcome"
+      ],
+      "ResearchPredictorParallel[0]/CheckSkipScanner": [
+        "choice-beyond-outcome"
+      ],
+      "ResearchPredictorParallel[0]/CheckSkipSignalsEnvelope": [
+        "choice-beyond-outcome"
+      ],
+      "ResearchPredictorParallel[0]/CheckSkipThinkTankCoverage": [
+        "choice-beyond-outcome"
+      ],
+      "ResearchPredictorParallel[0]/CheckUniverseMembershipFresh": [
+        "choice-beyond-outcome"
+      ],
+      "ResearchPredictorParallel[0]/ComputeEvalCadence": [
+        "computing-intrinsic"
+      ],
+      "ResearchPredictorParallel[0]/ComputeEvalCadenceRehearsal": [
+        "computing-intrinsic"
+      ],
+      "ResearchPredictorParallel[0]/Counterfactual": [
+        "catch-business-logic"
+      ],
+      "ResearchPredictorParallel[0]/DataPhase2": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "retry-business-logic"
+      ],
+      "ResearchPredictorParallel[0]/DataPhase2RetryGate": [
+        "choice-beyond-outcome"
+      ],
+      "ResearchPredictorParallel[0]/DataPhase2Wait": [
+        "computing-intrinsic"
+      ],
+      "ResearchPredictorParallel[0]/DispatchEvalJudgeSpot": [
+        "catch-business-logic",
+        "retry-business-logic"
+      ],
+      "ResearchPredictorParallel[0]/EvalJudgeProcess": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "retry-business-logic",
+        "task-inline-shell-logic"
+      ],
+      "ResearchPredictorParallel[0]/EvalJudgeProcessLivenessGate": [
+        "choice-beyond-outcome"
+      ],
+      "ResearchPredictorParallel[0]/EvalJudgeProcessWait": [
+        "computing-intrinsic"
+      ],
+      "ResearchPredictorParallel[0]/EvalJudgeSpotBootstrapLivenessGate": [
+        "choice-beyond-outcome"
+      ],
+      "ResearchPredictorParallel[0]/EvalJudgeSpotBootstrapWait": [
+        "computing-intrinsic"
+      ],
+      "ResearchPredictorParallel[0]/EvalJudgeSubmitFirstSaturday": [
+        "catch-business-logic"
+      ],
+      "ResearchPredictorParallel[0]/EvalJudgeSubmitOutcome": [
+        "choice-beyond-outcome"
+      ],
+      "ResearchPredictorParallel[0]/EvalJudgeSubmitWeekly": [
+        "catch-business-logic"
+      ],
+      "ResearchPredictorParallel[0]/EvalRollingMean": [
+        "catch-business-logic"
+      ],
+      "ResearchPredictorParallel[0]/MarkChallengerShadowDegraded": [
+        "computing-intrinsic"
+      ],
+      "ResearchPredictorParallel[0]/MarkCounterfactualDegraded": [
+        "computing-intrinsic"
+      ],
+      "ResearchPredictorParallel[0]/MarkEvalJudgeDegraded": [
+        "computing-intrinsic"
+      ],
+      "ResearchPredictorParallel[0]/MarkEvalRollingMeanDegraded": [
+        "computing-intrinsic"
+      ],
+      "ResearchPredictorParallel[0]/MarkRationaleClusteringDegraded": [
+        "computing-intrinsic"
+      ],
+      "ResearchPredictorParallel[0]/MarkRegimeRetrospectiveEvalDegraded": [
+        "computing-intrinsic"
+      ],
+      "ResearchPredictorParallel[0]/MarkRegimeSubstrateDegraded": [
+        "computing-intrinsic"
+      ],
+      "ResearchPredictorParallel[0]/MarkScannerDegraded": [
+        "computing-intrinsic"
+      ],
+      "ResearchPredictorParallel[0]/MarkThinkTankCoverageDegraded": [
+        "computing-intrinsic"
+      ],
+      "ResearchPredictorParallel[0]/MergeEvalJudgeSpotInstanceId": [
+        "computing-intrinsic"
+      ],
+      "ResearchPredictorParallel[0]/ProbeUniverseMembershipPointer": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "ResearchPredictorParallel[0]/PublishResearchFailureImmediate": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "ResearchPredictorParallel[0]/RAGIngestion": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "retry-business-logic"
+      ],
+      "ResearchPredictorParallel[0]/RAGIngestionRetryGate": [
+        "choice-beyond-outcome"
+      ],
+      "ResearchPredictorParallel[0]/RAGIngestionWait": [
+        "computing-intrinsic"
+      ],
+      "ResearchPredictorParallel[0]/RationaleClustering": [
+        "catch-business-logic"
+      ],
+      "ResearchPredictorParallel[0]/RegimeRetrospectiveEval": [
+        "catch-business-logic"
+      ],
+      "ResearchPredictorParallel[0]/RegimeSubstrate": [
+        "catch-business-logic",
+        "retry-business-logic"
+      ],
+      "ResearchPredictorParallel[0]/ResearchSelfTest": [
+        "catch-business-logic"
+      ],
+      "ResearchPredictorParallel[0]/Scanner": [
+        "catch-business-logic",
+        "retry-business-logic"
+      ],
+      "ResearchPredictorParallel[0]/ScannerResourceKillDegraded": [
+        "computing-intrinsic"
+      ],
+      "ResearchPredictorParallel[0]/SignalsEnvelope": [
+        "catch-business-logic",
+        "retry-business-logic"
+      ],
+      "ResearchPredictorParallel[0]/ThinkTankCoverage": [
+        "catch-business-logic"
+      ],
+      "ResearchPredictorParallel[0]/WaitForDataPhase2": [
+        "catch-business-logic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "ResearchPredictorParallel[0]/WaitForEvalJudgeProcess": [
+        "catch-business-logic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "ResearchPredictorParallel[0]/WaitForEvalJudgeSpotBootstrap": [
+        "catch-business-logic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "ResearchPredictorParallel[0]/WaitForRAGIngestion": [
+        "catch-business-logic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "ResearchPredictorParallel[1]/CheckModelZooStatus": [
+        "choice-beyond-outcome"
+      ],
+      "ResearchPredictorParallel[1]/CheckModelZooVerdict": [
+        "choice-beyond-outcome"
+      ],
+      "ResearchPredictorParallel[1]/CheckPredictorSkipWeightsFresh": [
+        "choice-beyond-outcome"
+      ],
+      "ResearchPredictorParallel[1]/CheckPredictorStatus": [
+        "choice-beyond-outcome"
+      ],
+      "ResearchPredictorParallel[1]/CheckResolveZooStatus": [
+        "choice-beyond-outcome"
+      ],
+      "ResearchPredictorParallel[1]/CheckSkipPredictorTraining": [
+        "choice-beyond-outcome"
+      ],
+      "ResearchPredictorParallel[1]/MarkModelZooDegraded": [
+        "computing-intrinsic"
+      ],
+      "ResearchPredictorParallel[1]/ModelZooResolveLivenessGate": [
+        "choice-beyond-outcome"
+      ],
+      "ResearchPredictorParallel[1]/ModelZooSelect": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "retry-business-logic"
+      ],
+      "ResearchPredictorParallel[1]/ModelZooSelectLivenessGate": [
+        "choice-beyond-outcome"
+      ],
+      "ResearchPredictorParallel[1]/ModelZooTrainMap": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "map-data-derived"
+      ],
+      "ResearchPredictorParallel[1]/ModelZooTrainMap/CheckTrainSpecStatus": [
+        "choice-beyond-outcome"
+      ],
+      "ResearchPredictorParallel[1]/ModelZooTrainMap/TrainSpecDispatch": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "retry-business-logic"
+      ],
+      "ResearchPredictorParallel[1]/ModelZooTrainMap/TrainSpecWait": [
+        "computing-intrinsic"
+      ],
+      "ResearchPredictorParallel[1]/ModelZooTrainMap/WaitTrainSpec": [
+        "catch-business-logic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "ResearchPredictorParallel[1]/ModelZooWait": [
+        "computing-intrinsic"
+      ],
+      "ResearchPredictorParallel[1]/ParseZooSpecs": [
+        "computing-intrinsic"
+      ],
+      "ResearchPredictorParallel[1]/PredictorSkipWeightsStale": [
+        "computing-intrinsic"
+      ],
+      "ResearchPredictorParallel[1]/PredictorTraining": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "retry-business-logic"
+      ],
+      "ResearchPredictorParallel[1]/PredictorTrainingLivenessGate": [
+        "choice-beyond-outcome"
+      ],
+      "ResearchPredictorParallel[1]/PredictorWait": [
+        "computing-intrinsic"
+      ],
+      "ResearchPredictorParallel[1]/PublishModelZooFailureImmediate": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "ResearchPredictorParallel[1]/PublishModelZooUnservableNotice": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "ResearchPredictorParallel[1]/PublishPredictorFailureImmediate": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "ResearchPredictorParallel[1]/ReadModelZooArenaCycle": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "ResearchPredictorParallel[1]/ResolveZooSpecs": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "retry-business-logic",
+        "task-inline-shell-logic"
+      ],
+      "ResearchPredictorParallel[1]/ResolveZooWait": [
+        "computing-intrinsic"
+      ],
+      "ResearchPredictorParallel[1]/ValidatePredictorSkipWeightsFresh": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "ResearchPredictorParallel[1]/WaitForModelZoo": [
+        "catch-business-logic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "ResearchPredictorParallel[1]/WaitForPredictorTraining": [
+        "catch-business-logic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "ResearchPredictorParallel[1]/WaitResolveZoo": [
+        "catch-business-logic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "ResumeAfterSubstrateRelaunch": [
+        "choice-beyond-outcome"
+      ],
+      "RouteAfterBootstrapSuccess": [
+        "choice-beyond-outcome"
+      ],
+      "RunScope": [
+        "catch-business-logic"
+      ],
+      "SaturdayHealthCheck": [
+        "catch-business-logic",
+        "computing-intrinsic"
+      ],
+      "SaturdayHealthCheckWait": [
+        "computing-intrinsic"
+      ],
+      "ScannerLeaderboard": [
+        "catch-business-logic",
+        "retry-business-logic"
+      ],
+      "SetResearchPredictorDegradedRoutes": [
+        "computing-intrinsic"
+      ],
+      "SubstrateHealthCheckWait": [
+        "computing-intrinsic"
+      ],
+      "SubstrateHealthGate": [
+        "catch-business-logic"
+      ],
+      "SubstrateRelaunchGate": [
+        "choice-beyond-outcome"
+      ],
+      "TakeOverRunSlot": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "VacuousRun": [
+        "computing-intrinsic"
+      ],
+      "WaitForBacktester": [
+        "catch-business-logic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "WaitForCollectionManifests": [
+        "catch-business-logic"
+      ],
+      "WaitForDirector": [
+        "catch-business-logic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "WaitForEvaluatorDiagnostics": [
+        "catch-business-logic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "WaitForEvaluatorOptimize": [
+        "catch-business-logic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "WaitForPitParityCompare": [
+        "catch-business-logic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "WaitForPortfolioOptimizerBacktest": [
+        "catch-business-logic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "WaitForPredictorBacktest": [
+        "catch-business-logic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "WaitForSaturdayHealthCheck": [
+        "catch-business-logic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "WaitForWeeklyFreshnessSpotBootstrap": [
+        "catch-business-logic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "WaitForWeeklyPreflightOnSpot": [
+        "catch-business-logic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "WaitForWeeklySubstrateHealthCheck": [
+        "catch-business-logic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "WeeklyCoverageSweep": [
+        "catch-business-logic"
+      ],
+      "WeeklyCoverageSweepDeferred": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "WeeklyCoverageSweepDegraded": [
+        "catch-business-logic"
+      ],
+      "WeeklyCoverageSweepUnavailable": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "WeeklyFreshnessSpotBootstrapLivenessGate": [
+        "choice-beyond-outcome"
+      ],
+      "WeeklyFreshnessSpotBootstrapWait": [
+        "computing-intrinsic"
+      ],
+      "WeeklyPreflight": [
+        "catch-business-logic",
+        "retry-business-logic"
+      ],
+      "WeeklyPreflightGate": [
+        "choice-beyond-outcome"
+      ],
+      "WeeklyPreflightOnSpot": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "task-inline-shell-logic"
+      ],
+      "WeeklyPreflightOnSpotUnobserved": [
+        "computing-intrinsic"
+      ],
+      "WeeklyPreflightOnSpotWait": [
+        "computing-intrinsic"
+      ],
+      "WeeklyRunDayGate": [
+        "catch-business-logic",
+        "retry-business-logic"
+      ],
+      "WeeklyRunDayGateChoice": [
+        "choice-beyond-outcome"
+      ],
+      "WeeklyRunDayGateFailed": [
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "WeeklySubstrateHealthCheck": [
+        "catch-business-logic",
+        "computing-intrinsic"
+      ],
+      "WrapEc2InstanceIdInArray": [
+        "computing-intrinsic"
+      ],
+      "WriteCompletionMarker": [
+        "computing-intrinsic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "WriteCompletionMarkerCalendar": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "WriteCompletionMarkerDegraded": [
+        "computing-intrinsic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "WriteCompletionMarkerDegradedCalendar": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ]
     },
     "infrastructure/step_function_daily.json": {
-      "task-not-an-entrypoint": 16,
-      "task-inline-shell-logic": 2,
-      "choice-beyond-outcome": 17
+      "AcquireMutex": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "CheckCodeFreshnessStatus": [
+        "choice-beyond-outcome"
+      ],
+      "CheckCollectionReadiness": [
+        "choice-beyond-outcome"
+      ],
+      "CheckCollectionReadinessBudget": [
+        "choice-beyond-outcome"
+      ],
+      "CheckCorrectnessVerdictStatus": [
+        "choice-beyond-outcome"
+      ],
+      "CheckDegradedOutcome": [
+        "choice-beyond-outcome"
+      ],
+      "CheckMorningPlannerStatus": [
+        "choice-beyond-outcome"
+      ],
+      "CheckMutexRole": [
+        "choice-beyond-outcome"
+      ],
+      "CheckPredictorCoverage": [
+        "catch-business-logic"
+      ],
+      "CheckSkipMorningEnrich": [
+        "choice-beyond-outcome"
+      ],
+      "CheckSkipMorningPlanner": [
+        "choice-beyond-outcome"
+      ],
+      "CheckSkipPredictorInference": [
+        "choice-beyond-outcome"
+      ],
+      "CheckSkipRunDaemon": [
+        "choice-beyond-outcome"
+      ],
+      "CodeFreshnessGate": [
+        "catch-business-logic",
+        "retry-business-logic",
+        "task-inline-shell-logic"
+      ],
+      "CorrectnessVerdictGate": [
+        "catch-business-logic",
+        "retry-business-logic"
+      ],
+      "CoverageGapChoice": [
+        "choice-beyond-outcome"
+      ],
+      "DegradedRun": [
+        "computing-intrinsic"
+      ],
+      "DeployDriftCheck": [
+        "catch-business-logic"
+      ],
+      "DeployDriftGate": [
+        "choice-beyond-outcome"
+      ],
+      "DescribeInstanceInfo": [
+        "catch-business-logic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "FinalCoverageGate": [
+        "choice-beyond-outcome"
+      ],
+      "ForceStopUnresponsiveInstance": [
+        "catch-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "HandleFailure": [
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "IncrementCollectionReadinessPoll": [
+        "computing-intrinsic"
+      ],
+      "IncrementSSMPoll": [
+        "computing-intrinsic"
+      ],
+      "InitializeInput": [
+        "computing-intrinsic"
+      ],
+      "MarketHoursGate": [
+        "catch-business-logic",
+        "retry-business-logic"
+      ],
+      "MarketHoursGateChoice": [
+        "choice-beyond-outcome"
+      ],
+      "NotifyHolidaySkip": [
+        "task-not-an-entrypoint"
+      ],
+      "NotifyMarketHoursBlocked": [
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "NotifyMarketHoursOverrideMalformed": [
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "NotifyMarketHoursUnverified": [
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "PredictorInference": [
+        "catch-business-logic"
+      ],
+      "PublishDaemonFailureImmediate": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "PublishDataSpotFailureImmediate": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "PublishDeployDriftDegraded": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "RecheckCoverage": [
+        "catch-business-logic"
+      ],
+      "RecordMarketHoursOverride": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "ReinvokePredictor": [
+        "catch-business-logic"
+      ],
+      "RunDaemon": [
+        "catch-business-logic",
+        "retry-business-logic"
+      ],
+      "RunMorningPlanner": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "retry-business-logic",
+        "task-inline-shell-logic"
+      ],
+      "SSMReadyChoice": [
+        "choice-beyond-outcome"
+      ],
+      "StartExecutorEC2": [
+        "catch-business-logic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "TradingDayGate": [
+        "catch-business-logic",
+        "retry-business-logic"
+      ],
+      "TradingDayGateChoice": [
+        "choice-beyond-outcome"
+      ],
+      "TradingDayGateFailed": [
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "WaitForCodeFreshness": [
+        "catch-business-logic"
+      ],
+      "WaitForCollectionManifests": [
+        "catch-business-logic"
+      ],
+      "WaitForCorrectnessVerdict": [
+        "catch-business-logic"
+      ],
+      "WaitForMorningPlanner": [
+        "catch-business-logic"
+      ],
+      "WriteCompletionMarker": [
+        "computing-intrinsic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "WriteCompletionMarkerDegraded": [
+        "computing-intrinsic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ]
     },
     "infrastructure/step_function_eod.json": {
-      "task-not-an-entrypoint": 20,
-      "task-inline-shell-logic": 2,
-      "choice-beyond-outcome": 10
+      "AcquireMutex": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "CaptureSnapshot": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "retry-business-logic"
+      ],
+      "CheckCaptureSnapshotRetryBudget": [
+        "choice-beyond-outcome"
+      ],
+      "CheckDegradedOutcome": [
+        "choice-beyond-outcome"
+      ],
+      "CheckMutexRole": [
+        "choice-beyond-outcome"
+      ],
+      "CheckRefreshExecutorDeployStatus": [
+        "choice-beyond-outcome"
+      ],
+      "CheckSkipCaptureSnapshot": [
+        "choice-beyond-outcome"
+      ],
+      "CheckSkipRefreshExecutorDeploy": [
+        "choice-beyond-outcome"
+      ],
+      "CheckSnapshotStatus": [
+        "choice-beyond-outcome"
+      ],
+      "CheckTraderReconcileDrainStatus": [
+        "choice-beyond-outcome"
+      ],
+      "DegradedRun": [
+        "computing-intrinsic"
+      ],
+      "DeployDriftCheck": [
+        "catch-business-logic"
+      ],
+      "DeployDriftGate": [
+        "choice-beyond-outcome"
+      ],
+      "DescribeInstanceInfo": [
+        "catch-business-logic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "DrainTraderReconcile": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "retry-business-logic",
+        "task-inline-shell-logic"
+      ],
+      "ForceStopInstance": [
+        "task-not-an-entrypoint"
+      ],
+      "HandleFailure": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "IncrementCaptureSnapshotRetry": [
+        "computing-intrinsic"
+      ],
+      "IncrementSSMPoll": [
+        "computing-intrinsic"
+      ],
+      "MarketHoursGate": [
+        "catch-business-logic",
+        "retry-business-logic"
+      ],
+      "MarketHoursGateChoice": [
+        "choice-beyond-outcome"
+      ],
+      "NotifyMarketHoursBlocked": [
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "NotifyMarketHoursOverrideMalformed": [
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "NotifyMarketHoursUnverified": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "NotifyPreSessionBlocked": [
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "PageCaptureSnapshotFailureImmediate": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "PageCaptureSnapshotIrreversibleFailure": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "PreSessionWindowChoice": [
+        "choice-beyond-outcome"
+      ],
+      "PublishDeployDriftDegraded": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "PublishTraderReconcileDrainUnsettled": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "RecordMarketHoursOverride": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "RefreshExecutorDeploy": [
+        "catch-business-logic",
+        "retry-business-logic",
+        "task-inline-shell-logic"
+      ],
+      "SSMReadyChoice": [
+        "choice-beyond-outcome"
+      ],
+      "StampStartClockUtc": [
+        "computing-intrinsic"
+      ],
+      "StartTradingInstance": [
+        "catch-business-logic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "StopTradingInstance": [
+        "catch-business-logic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "WaitForCaptureSnapshot": [
+        "catch-business-logic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "WaitForRefreshExecutorDeploy": [
+        "catch-business-logic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "WaitForTraderReconcileDrain": [
+        "catch-business-logic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "WriteCompletionMarkerDegraded": [
+        "computing-intrinsic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "WriteCompletionMarkerNormal": [
+        "computing-intrinsic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ]
     },
     "infrastructure/step_function_eod_reconcile.json": {
-      "task-undeclared-entrypoint": 1,
-      "task-not-an-entrypoint": 29,
-      "task-inline-shell-logic": 3,
-      "choice-beyond-outcome": 18
+      "AcquireMutex": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "CaptureSnapshot": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "retry-business-logic",
+        "task-inline-shell-logic"
+      ],
+      "CheckBoxOwnedBeforeForceStop": [
+        "choice-beyond-outcome"
+      ],
+      "CheckBoxOwnedBeforeStop": [
+        "choice-beyond-outcome"
+      ],
+      "CheckCollectionReadiness": [
+        "choice-beyond-outcome"
+      ],
+      "CheckCollectionReadinessBudget": [
+        "choice-beyond-outcome"
+      ],
+      "CheckDegradedOutcome": [
+        "choice-beyond-outcome"
+      ],
+      "CheckEODStatus": [
+        "choice-beyond-outcome"
+      ],
+      "CheckExerciseCadence": [
+        "choice-beyond-outcome"
+      ],
+      "CheckHealLoopEligible": [
+        "choice-beyond-outcome"
+      ],
+      "CheckMutexRole": [
+        "choice-beyond-outcome"
+      ],
+      "CheckRefreshExecutorDeployStatus": [
+        "choice-beyond-outcome"
+      ],
+      "CheckSkipEODReconcile": [
+        "choice-beyond-outcome"
+      ],
+      "CheckSkipPostMarketData": [
+        "choice-beyond-outcome"
+      ],
+      "CheckSkipRefreshExecutorDeploy": [
+        "choice-beyond-outcome"
+      ],
+      "CheckSnapshotStatus": [
+        "choice-beyond-outcome"
+      ],
+      "CheckTraderReconcileDrainStatus": [
+        "choice-beyond-outcome"
+      ],
+      "DegradedRun": [
+        "computing-intrinsic"
+      ],
+      "DescribeInstanceInfo": [
+        "catch-business-logic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "DrainTraderReconcile": [
+        "catch-business-logic",
+        "retry-business-logic",
+        "task-inline-shell-logic"
+      ],
+      "EODReconcile": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "retry-business-logic"
+      ],
+      "ForceStopInstance": [
+        "task-not-an-entrypoint"
+      ],
+      "HandleFailure": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "HealCheckConverged": [
+        "choice-beyond-outcome"
+      ],
+      "HealConvergedNotify": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "HealDispatchReplay": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "task-undeclared-entrypoint"
+      ],
+      "HealLoopGate": [
+        "choice-beyond-outcome"
+      ],
+      "HealLoopIncrement": [
+        "computing-intrinsic"
+      ],
+      "HealNonConvergent": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "HealReProbe": [
+        "catch-business-logic"
+      ],
+      "HealReplayDispatchFailed": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "HealStartCollection": [
+        "catch-business-logic",
+        "computing-intrinsic"
+      ],
+      "IncrementCollectionReadinessPoll": [
+        "computing-intrinsic"
+      ],
+      "IncrementSSMPoll": [
+        "computing-intrinsic"
+      ],
+      "LaunchWeeklyExerciseRun": [
+        "catch-business-logic",
+        "retry-business-logic"
+      ],
+      "MarketHoursGate": [
+        "catch-business-logic",
+        "retry-business-logic"
+      ],
+      "MarketHoursGateChoice": [
+        "choice-beyond-outcome"
+      ],
+      "NotifyMarketHoursBlocked": [
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "NotifyMarketHoursOverrideMalformed": [
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "NotifyMarketHoursUnverified": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "NotifyPreSessionBlocked": [
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "NotifyStopSkippedNotBoxOwner": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "PageCaptureSnapshotIrreversibleFailure": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "PreSessionWindowChoice": [
+        "choice-beyond-outcome"
+      ],
+      "ProbeEODReconcilePrecondition": [
+        "catch-business-logic"
+      ],
+      "PublishCadenceReadDegraded": [
+        "catch-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "PublishCadenceUnknownValueDegraded": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "PublishDataSpotFailureImmediate": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "PublishTraderReconcileDrainUnsettled": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "ReadExerciseCadence": [
+        "catch-business-logic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "RecordMarketHoursOverride": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "RefreshExecutorDeploy": [
+        "catch-business-logic",
+        "retry-business-logic",
+        "task-inline-shell-logic"
+      ],
+      "ResolveBoxOwnership": [
+        "choice-beyond-outcome"
+      ],
+      "SSMReadyChoice": [
+        "choice-beyond-outcome"
+      ],
+      "SkipEODReconcileDataGap": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "StampStartClockUtc": [
+        "computing-intrinsic"
+      ],
+      "StartTradingInstance": [
+        "catch-business-logic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "StopTradingInstance": [
+        "catch-business-logic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "WaitForCaptureSnapshot": [
+        "catch-business-logic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "WaitForCollectionManifests": [
+        "catch-business-logic",
+        "computing-intrinsic"
+      ],
+      "WaitForEOD": [
+        "catch-business-logic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "WaitForRefreshExecutorDeploy": [
+        "catch-business-logic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "WaitForTraderReconcileDrain": [
+        "catch-business-logic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "WeeklyExerciseLaunchFailed": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "WriteCompletionMarkerDegraded": [
+        "computing-intrinsic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ],
+      "WriteCompletionMarkerNormal": [
+        "computing-intrinsic",
+        "retry-business-logic",
+        "task-not-an-entrypoint"
+      ]
     },
     "infrastructure/step_function_groom.json": {
-      "task-not-an-entrypoint": 4,
-      "choice-beyond-outcome": 7
+      "CheckAnyLaunches": [
+        "choice-beyond-outcome"
+      ],
+      "CheckMapLaneOutcomes": [
+        "choice-beyond-outcome"
+      ],
+      "CheckMapLaunchOutcome": [
+        "choice-beyond-outcome"
+      ],
+      "DecideLaunches": [
+        "catch-business-logic"
+      ],
+      "DispatchEndOfSfSweep": [
+        "catch-business-logic"
+      ],
+      "HandleDecideFailure": [
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "MapLaunches": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "map-data-derived"
+      ],
+      "MapLaunches/CheckCompletionMarkerTaskToken": [
+        "catch-business-logic"
+      ],
+      "MapLaunches/CheckForceOnDemand": [
+        "choice-beyond-outcome"
+      ],
+      "MapLaunches/CheckLaunchedCallback": [
+        "choice-beyond-outcome"
+      ],
+      "MapLaunches/CheckRetryBudget": [
+        "choice-beyond-outcome"
+      ],
+      "MapLaunches/HandleFailure": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "MapLaunches/LaunchGroomSpot": [
+        "catch-business-logic"
+      ],
+      "MapLaunches/NotifyRelaunch": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ],
+      "MapLaunches/PrepRelaunch": [
+        "computing-intrinsic"
+      ],
+      "MapLaunches/RelaunchNotifyGate": [
+        "choice-beyond-outcome"
+      ],
+      "NotifyCycleComplete": [
+        "catch-business-logic"
+      ],
+      "NotifySweepDispatchFailure": [
+        "catch-business-logic",
+        "computing-intrinsic",
+        "task-not-an-entrypoint"
+      ]
     }
   }
 }

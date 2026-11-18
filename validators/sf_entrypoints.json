@@ -32,5 +32,6 @@
   "state_machines": {
     "ne-data-collection-eod": "called by step_function_eod_reconcile.json",
     "ne-weekly-freshness-pipeline": "called by step_function_eod_reconcile.json"
-  }
+  },
+  "jobs": {}
 }

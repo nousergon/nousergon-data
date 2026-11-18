@@ -1,63 +1,26 @@
-"""Step Functions states call declared entrypoints only (plan S-46, observe mode).
+"""Enforce the S-46 portability seam for Step Functions definitions.
 
-alpha-engine-config-I12533, under epic alpha-engine-config-I12488 (staging-first
-environments, portability seam 4): "No business logic in Step Functions. Each
-state calls one entrypoint; ordering, retries and gates live in Python, as
-``crucible.daily_chain`` already does. That keeps the SF definitions thin and
-replaceable."
+The lint walks every state (including nested Parallel and Map states) in the
+repository's established definition globs. Tasks may call only registered
+Lambda, Step Functions, or ECS entrypoints. Choices may inspect only
+``$.status``, ``$.ok``, or ``$.error``; retries are limited to the five
+transport errors in ``TRANSPORT_ERRORS`` and at most three attempts. It also
+rejects non-terminal catches, multi-state Parallel branches, data-derived
+Maps and Waits, and computing Step Functions intrinsics.
 
-This lint walks every state, including Parallel branches and Map item
-processors, of every definition in this repo
-(``infrastructure/step_function*.json`` and
-``infrastructure/step-functions/*.asl.json``) and reports four rules:
+Existing findings live in a shrink-only baseline keyed by definition path,
+full nested state path, and rule. Enforcing mode is the default, so either a
+new finding or a stale entry fails CI. ``--update`` can only intersect the
+baseline with current findings and therefore cannot add or substitute an
+entry.
 
-``task-undeclared-entrypoint``
-    A Task invokes a Lambda function or a state machine that is not declared in
-    ``validators/sf_entrypoints.json``, or names it dynamically (``.$``), so
-    no declaration can cover it. Adding an entrypoint is a deliberate,
-    reviewable line in that file, not a side effect of an ASL edit.
-``task-not-an-entrypoint``
-    A Task calls an AWS service directly (``sns:publish``,
-    ``aws-sdk:ec2:startInstances``, ``aws-sdk:ssm:getCommandInvocation`` and so
-    on). That is plumbing or a poll loop written in ASL. Only
-    ``lambda:invoke``, ``states:startExecution`` and ``ssm:sendCommand`` are
-    entrypoint-shaped.
-``task-inline-shell-logic``
-    An ``ssm:sendCommand`` whose command text carries shell control flow
-    (``if``/``while``/``for``/``until``/``case``, ``&&``, ``||``, a shell
-    function). The box should run one entrypoint, and the logic belongs in
-    that entrypoint.
-``choice-beyond-outcome``
-    A Choice that branches on anything other than a task's outcome. A rule
-    may test only an outcome field (``Status``, ``StatusDetails``, ``status``,
-    ``ResponseCode``, ``outcome``, ``ok``, ``success``, ``error`` and similar)
-    by equality or presence. Anything else, such as a skip flag, a role, a
-    deadline or a counter, is a gate or ordering decision written in ASL.
-    JSONata ``Condition`` rules cannot be classified and are reported.
-
-The existing violations are recorded in a shrink-only baseline
-(``validators/sf_entrypoint_baseline.json``, a count per definition file per
-rule), mirroring the S-04 hard-coded-environment guard
-(nousergon-lib ``scripts/hardcoded_env_refs.py``). A count above its baseline
-is NEW, and a count below it is STALE. Lower the ceiling with ``--update``,
-which never raises an entry.
-
-OBSERVE mode, the default, reports in the log, as ``::warning``
-annotations and in the job summary, and exits 0 -- except for a definition in
-``ENFORCED_DEFINITIONS``, whose NEW or STALE rows are ``::error`` and exit 1
-in either mode. ``--mode enforce`` exits 1 on any NEW or STALE finding in any
-definition.
-
-Definitions move from observe to enforce one at a time, by adding a path to
-``ENFORCED_DEFINITIONS``. That set only grows: removing a path loosens the
-guard. An enforced definition can still carry baselined findings; what is
-enforced is that its count never rises and that a removed finding lowers the
-ceiling in the same change (``--update``).
-
-Run locally from the repo root: ``python3 validators/sf_entrypoint_lint.py``
-(``--json`` lists every finding by state). Stdlib only.
-CI: ``.github/workflows/ci.yml`` (``ssm-log-capture-contract-lint`` job).
+Run from the repository root with ``python3 validators/sf_entrypoint_lint.py``.
+The implementation is stdlib-only.
 """
+
+# ASL is recursively shaped, schemaless JSON. Keep strict checking for concrete
+# values while permitting the decoded JSON boundary used throughout this module.
+# pyright: reportExplicitAny=false, reportUnknownArgumentType=false, reportUnknownMemberType=false, reportUnknownParameterType=false, reportUnknownVariableType=false, reportMissingTypeArgument=false
 
 from __future__ import annotations
 
@@ -68,6 +31,7 @@ import re
 import sys
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any, cast
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DECLARED_PATH = REPO_ROOT / "validators" / "sf_entrypoints.json"
@@ -76,7 +40,7 @@ DEFINITION_GLOBS = ("infrastructure/step_function*.json", "infrastructure/step-f
 
 GUARD = "sf-entrypoint-lint"
 TRACKER = "alpha-engine-config-I12533"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 # Definitions graduated from observe to enforce (grow-only; see the docstring).
 # step_function_groom.json (alpha-engine-groom-dispatch) first, 2026-10-23:
 # off the weekly and trading paths, and its baseline was exact (0 new, 0 stale).
@@ -94,11 +58,23 @@ RULES = (
     "task-not-an-entrypoint",
     "task-inline-shell-logic",
     "choice-beyond-outcome",
+    "retry-business-logic",
+    "catch-business-logic",
+    "wait-dynamic",
+    "map-data-derived",
+    "computing-intrinsic",
+    "parallel-business-logic",
 )
 
 LAMBDA_PREFIX = "arn:aws:states:::lambda:invoke"
 STATES_PREFIX = "arn:aws:states:::states:startExecution"
 SSM_SEND = "arn:aws:states:::aws-sdk:ssm:sendCommand"
+ECS_PREFIX = "arn:aws:states:::ecs:runTask"
+TRANSPORT_ERRORS = frozenset({
+    "Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException",
+    "Lambda.TooManyRequestsException", "States.Timeout",
+})
+COMPUTING_INTRINSICS = re.compile(r"States\.(?:MathAdd|ArrayGetItem|StringSplit|Format)\s*\(")
 
 # Leaf names a Choice may branch on: a task's own outcome, never a decision.
 OUTCOME_FIELDS = frozenset({
@@ -115,7 +91,7 @@ SHELL_LOGIC = re.compile(
     r"|(?P<op>&&|\|\||\(\)\s*\{)"
 )
 
-Counts = dict[str, dict[str, int]]
+Counts = dict[str, dict[str, list[str]]]
 
 
 # --------------------------------------------------------------------------
@@ -172,8 +148,11 @@ def choice_is_outcome_only(state: dict) -> bool:
         if "Condition" in rule:
             return False
         for variable, ops in _rule_leaves(rule):
-            leaf = str(variable or "").rsplit(".", 1)[-1].lower()
-            if leaf not in OUTCOME_FIELDS or not ops or any(op not in OUTCOME_OPS for op in ops):
+            path = str(variable or "")
+            leaf = path.rsplit(".", 1)[-1].lower()
+            if path not in {"$.status", "$.ok", "$.error"} or not ops or any(op not in OUTCOME_OPS for op in ops):
+                return False
+            if "IsPresent" in ops and leaf != "error":
                 return False
     return True
 
@@ -181,7 +160,7 @@ def choice_is_outcome_only(state: dict) -> bool:
 def classify_task(state: dict, declared: dict[str, set[str]]) -> tuple[str, str] | None:
     """``(rule, detail)`` for a Task that breaks a rule, else ``None``."""
     resource = str(state.get("Resource") or "")
-    params = state.get("Parameters") or state.get("Arguments") or {}
+    params = cast(dict[str, Any], state.get("Parameters") or state.get("Arguments") or {})
     if resource.startswith(LAMBDA_PREFIX):
         if "FunctionName" not in params:
             return "task-undeclared-entrypoint", "lambda <dynamic FunctionName>"
@@ -196,6 +175,11 @@ def classify_task(state: dict, declared: dict[str, set[str]]) -> tuple[str, str]
         if name not in declared["state_machines"]:
             return "task-undeclared-entrypoint", f"state machine {name}"
         return None
+    if resource.startswith(ECS_PREFIX):
+        job = params.get("JobName") or params.get("job")
+        if not isinstance(job, str) or job not in declared.get("jobs", set()):
+            return "task-undeclared-entrypoint", f"ECS job {job or '<dynamic>'}"
+        return None
     if resource == SSM_SEND:
         text = json.dumps(params.get("Parameters") or {})
         match = SHELL_LOGIC.search(text.replace("\\n", "\n"))
@@ -206,12 +190,73 @@ def classify_task(state: dict, declared: dict[str, set[str]]) -> tuple[str, str]
     return "task-not-an-entrypoint", resource.removeprefix("arn:aws:states:::")
 
 
+def _intrinsic(value: object) -> bool:
+    if isinstance(value, str):
+        return COMPUTING_INTRINSICS.search(value) is not None
+    if isinstance(value, dict):
+        return any(_intrinsic(v) for v in cast(dict[str, object], value).values())
+    if isinstance(value, list):
+        return any(_intrinsic(v) for v in cast(list[object], value))
+    return False
+
+
+def _retry_is_transport_only(state: dict[str, Any]) -> bool:
+    for retry in state.get("Retry") or []:
+        errors = retry.get("ErrorEquals") or []
+        attempts = retry.get("MaxAttempts", 3)
+        if not errors or any(error not in TRANSPORT_ERRORS for error in errors):
+            return False
+        if not isinstance(attempts, int) or attempts > 3:
+            return False
+    return True
+
+
+def _catch_is_allowed(
+    state: dict[str, Any], states: dict[str, dict[str, Any]], declared: dict[str, set[str]],
+) -> bool:
+    for catch in state.get("Catch") or []:
+        target = states.get(catch.get("Next"), {})
+        if target.get("Type") == "Fail":
+            continue
+        if target.get("Type") != "Task" or classify_task(target, declared) is not None:
+            return False
+        name = str(target.get("Parameters", {}).get("FunctionName", "")).lower()
+        if "notify" not in name and "notifier" not in name:
+            return False
+    return True
+
+
+def _parallel_is_allowed(state: dict[str, Any], declared: dict[str, set[str]]) -> bool:
+    branches = state.get("Branches") or []
+    return bool(branches) and all(
+        len(branch.get("States") or {}) == 1
+        and next(iter((branch.get("States") or {}).values())).get("Type") == "Task"
+        and classify_task(next(iter((branch.get("States") or {}).values())), declared) is None
+        for branch in branches
+    )
+
+
 def findings(repo: Path, declared: dict[str, set[str]]) -> list[dict]:
     out: list[dict] = []
     for path in definition_files(repo):
         rel = path.relative_to(repo).as_posix()
         doc = json.loads(path.read_text(encoding="utf-8"))
-        for state_path, state in walk_states(doc.get("States") or {}):
+        top_states = cast(dict[str, dict[str, Any]], doc.get("States") or {})
+        containers: dict[int, dict[str, dict[str, Any]]] = {}
+
+        def index(states: dict[str, dict[str, Any]]) -> None:
+            for candidate in states.values():
+                containers[id(candidate)] = states
+                if candidate.get("Type") == "Parallel":
+                    for branch in candidate.get("Branches") or []:
+                        index(cast(dict[str, dict[str, Any]], branch.get("States") or {}))
+                elif candidate.get("Type") == "Map":
+                    inner = candidate.get("ItemProcessor") or candidate.get("Iterator") or {}
+                    index(cast(dict[str, dict[str, Any]], inner.get("States") or {}))
+
+        index(top_states)
+        for state_path, state in walk_states(top_states):
+            typed_state = cast(dict[str, Any], state)
             kind = state.get("Type")
             hit: tuple[str, str] | None = None
             if kind == "Task":
@@ -220,6 +265,23 @@ def findings(repo: Path, declared: dict[str, set[str]]) -> list[dict]:
                 hit = "choice-beyond-outcome", "branches on a decision, not an outcome"
             if hit:
                 out.append({"path": rel, "state": state_path, "rule": hit[0], "detail": hit[1]})
+            extra: list[tuple[str, str]] = []
+            if not _retry_is_transport_only(typed_state):
+                extra.append(("retry-business-logic", "retry is not limited to transport errors and three attempts"))
+            if state.get("Catch") and not _catch_is_allowed(typed_state, containers[id(state)], declared):
+                extra.append(("catch-business-logic", "catch does not route to Fail or a notify Task"))
+            if kind == "Wait" and ("SecondsPath" in state or "TimestampPath" in state):
+                extra.append(("wait-dynamic", "dynamic scheduling belongs outside ASL"))
+            if kind == "Map" and any(key in state for key in ("ItemsPath", "Items", "Items.$")):
+                extra.append(("map-data-derived", "Map iterates over data"))
+            if kind == "Parallel" and not _parallel_is_allowed(typed_state, declared):
+                extra.append(("parallel-business-logic", "each branch must contain one allowed Task"))
+            if _intrinsic(state):
+                extra.append(("computing-intrinsic", "ASL computes a value"))
+            out.extend(
+                {"path": rel, "state": state_path, "rule": rule, "detail": detail}
+                for rule, detail in extra
+            )
     return out
 
 
@@ -227,15 +289,20 @@ def counts_of(rows: list[dict]) -> Counts:
     out: Counts = {}
     for row in rows:
         per = out.setdefault(row["path"], {})
-        per[row["rule"]] = per.get(row["rule"], 0) + 1
+        per.setdefault(row["state"], []).append(row["rule"])
+    for per in out.values():
+        for rules in per.values():
+            rules.sort()
     return out
 
 
 def load_declared(path: Path) -> dict[str, set[str]]:
     doc = json.loads(path.read_text(encoding="utf-8"))
     out: dict[str, set[str]] = {}
-    for key in ("lambda_functions", "state_machines"):
+    for key in ("lambda_functions", "state_machines", "jobs"):
         entries = doc.get(key)
+        if key == "jobs" and entries is None:
+            entries = {}
         if not isinstance(entries, dict):
             raise SystemExit(f"{path}: {key!r} must be an object of name -> note")
         out[key] = set(entries)
@@ -248,10 +315,11 @@ def load_declared(path: Path) -> dict[str, set[str]]:
 
 
 def totals(counts: Counts) -> dict[str, int]:
-    out = dict.fromkeys(RULES, 0)
+    out: dict[str, int] = dict.fromkeys(RULES, 0)
     for per in counts.values():
-        for rule, n in per.items():
-            out[rule] += n
+        for rules in per.values():
+            for rule in rules:
+                out[rule] += 1
     out["files"] = len(counts)
     return out
 
@@ -268,10 +336,12 @@ def load_baseline(path: Path) -> Counts:
     out: Counts = {}
     for rel, per in files.items():
         if not isinstance(per, dict) or any(
-            r not in RULES or not isinstance(n, int) or n < 1 for r, n in per.items()
+            not isinstance(state, str) or not isinstance(rules, list)
+            or not rules or any(rule not in RULES for rule in rules)
+            for state, rules in per.items()
         ):
             raise SystemExit(f"{path}: bad entry for {rel!r}: {per!r}")
-        out[rel] = dict(per)
+        out[rel] = {state: sorted(rules) for state, rules in per.items()}
     return out
 
 
@@ -286,9 +356,8 @@ def render_baseline(counts: Counts) -> str:
             "finding is removed."
         ),
         "totals": totals(counts),
-        "files": {
-            rel: {r: counts[rel][r] for r in RULES if r in counts[rel]} for rel in sorted(counts)
-        },
+        "files": {rel: {state: counts[rel][state] for state in sorted(counts[rel])}
+                  for rel in sorted(counts)},
     }
     return json.dumps(doc, indent=2) + "\n"
 
@@ -298,13 +367,13 @@ def compare(current: Counts, baseline: Counts) -> tuple[list[dict], list[dict]]:
     new, stale = [], []
     for rel in sorted(set(current) | set(baseline)):
         cur, base = current.get(rel, {}), baseline.get(rel, {})
-        for rule in RULES:
-            c, b = cur.get(rule, 0), base.get(rule, 0)
-            row = {"path": rel, "rule": rule, "baseline": b, "current": c}
-            if c > b:
-                new.append(row)
-            elif c < b:
-                stale.append(row)
+        for state in sorted(set(cur) | set(base)):
+            current_rules = set(cur.get(state, []))
+            baseline_rules = set(base.get(state, []))
+            new.extend({"path": rel, "state": state, "rule": rule, "baseline": 0, "current": 1}
+                       for rule in sorted(current_rules - baseline_rules))
+            stale.extend({"path": rel, "state": state, "rule": rule, "baseline": 1, "current": 0}
+                         for rule in sorted(baseline_rules - current_rules))
     return new, stale
 
 
@@ -313,8 +382,9 @@ def lowered(current: Counts, baseline: Counts) -> Counts:
     out: Counts = {}
     for rel, base in baseline.items():
         cur = current.get(rel, {})
-        per = {r: min(n, cur.get(r, 0)) for r, n in base.items()}
-        per = {r: n for r, n in per.items() if n}
+        per = {state: sorted(set(rules) & set(cur.get(state, [])))
+               for state, rules in base.items()}
+        per = {state: rules for state, rules in per.items() if rules}
         if per:
             out[rel] = per
     return out
@@ -397,7 +467,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--repo", default=str(REPO_ROOT), help="repo root")
     ap.add_argument("--declared", help="declared entrypoints JSON")
     ap.add_argument("--baseline", help="baseline JSON")
-    ap.add_argument("--mode", choices=("observe", "enforce"), default="observe")
+    ap.add_argument("--mode", choices=("observe", "enforce"), default="enforce")
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--init", action="store_true", help="write the first baseline; refuses if one exists")
     g.add_argument("--update", action="store_true", help="lower the baseline to what reproduces; never raises")
