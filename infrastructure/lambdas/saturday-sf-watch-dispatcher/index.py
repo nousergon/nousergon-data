@@ -88,6 +88,7 @@ import logging
 import os
 import urllib.request
 from datetime import date, datetime, timezone
+from typing import Any
 
 import boto3
 from botocore.config import Config
@@ -97,6 +98,7 @@ from nousergon_lib.flow_doctor_fleet import (
     FleetTelegramTopic,
     PIPELINE_OBSERVER_TELEGRAM_TOPICS,
 )
+from nousergon_lib.pipeline_status.roles import EXERCISE_ROLES
 
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
@@ -325,11 +327,11 @@ _HISTORY_MAX_EVENTS = 1000
 _HISTORY_MAX_PAGES = 5
 
 
-def _sf_client():
+def _sf_client() -> Any:  # pyright: ignore[reportExplicitAny]  # untyped boto3 client
     return boto3.client("stepfunctions", region_name=REGION)
 
 
-def _s3_client():
+def _s3_client() -> Any:  # pyright: ignore[reportExplicitAny]  # untyped boto3 client
     return boto3.client("s3", region_name=REGION)
 
 
@@ -462,7 +464,7 @@ def _max_dispatches(cadence_slug: str, pipeline_role: str = "") -> int:
     (``pipeline_role="weekly"``, or absent on manual/recovery invocations)
     is unchanged.
     """
-    if pipeline_role == "exercise":
+    if pipeline_role in EXERCISE_ROLES:
         return _DEFAULT_MAX_DISPATCHES
     return SF_WATCH_MAX_DISPATCHES.get(cadence_slug, _DEFAULT_MAX_DISPATCHES)
 
@@ -574,7 +576,7 @@ def _failure_handling_states(states: dict | None) -> frozenset[str]:
     return frozenset(sink) or _DEFAULT_FAILURE_HANDLING_STATES
 
 
-def _resolve_json_path(data, path: str):
+def _resolve_json_path(data: Any, path: str) -> Any:  # pyright: ignore[reportExplicitAny]
     """Minimal ``$.a.b.c`` dot-path resolver — every ``Variable`` in this
     fleet's ASL Choice rules is a plain dot-path (no array/filter syntax).
     Returns ``None`` on any missing segment or non-dict traversal."""
@@ -589,7 +591,7 @@ def _resolve_json_path(data, path: str):
     return cur
 
 
-def _eval_choice_rule(rule: dict, data) -> bool:
+def _eval_choice_rule(rule: dict, data: Any) -> bool:  # pyright: ignore[reportExplicitAny]
     """Evaluate one ASL Choice rule (incl. And/Or/Not composites) against the
     state's captured input. Best-effort within the caller's try/except — an
     unrecognized comparator (not in ``_ASL_COMPARATORS``) simply fails to
@@ -632,7 +634,7 @@ def _describe_choice_rule(rule: dict) -> str:
 
 
 def _matched_choice_rule(
-    states: dict | None, culprit: str | None, choice_input, sink: frozenset[str],
+    states: dict | None, culprit: str | None, choice_input: Any, sink: frozenset[str],  # pyright: ignore[reportExplicitAny]
 ) -> str | None:
     """For a Choice-type culprit, the specific rule whose ``Next`` routes into
     the failure-handling set AND evaluates True against the captured input —
@@ -985,7 +987,7 @@ def _artifact_key(watch_prefix: str, run_date: str) -> str:
     return f"{watch_prefix}/{run_date}.json"
 
 
-def _load_existing(s3, key: str) -> dict:
+def _load_existing(s3: Any, key: str) -> dict[str, Any]:  # pyright: ignore[reportExplicitAny]
     """Read the existing watch-log for this date (so repeated failures in one
     run accumulate), or a fresh skeleton. ONLY a true absence (404/NoSuchKey)
     is the common first-failure-of-the-day case; every OTHER read error —
@@ -1135,7 +1137,8 @@ def _build_event_record(
 
 
 def _write_watch_log(
-    s3, watch_prefix: str, run_date: str, record: dict, doc: dict | None = None
+    s3: Any, watch_prefix: str, run_date: str, record: dict,  # pyright: ignore[reportExplicitAny, reportMissingTypeArgument, reportUnknownParameterType]
+    doc: dict | None = None,  # pyright: ignore[reportMissingTypeArgument, reportUnknownParameterType]
 ) -> str:
     """Append the event to the date's watch-log and write it back. PRIMARY
     deliverable — RAISES on failure (fail-loud: a broken producer must surface
@@ -1197,7 +1200,7 @@ def _watch_is_acting(record: dict, dispatch: dict) -> bool:
     return dispatch.get("dispatched") is True
 
 
-def _safe_cause_for_telegram(cause, max_len: int = 300):
+def _safe_cause_for_telegram(cause: Any, max_len: int = 300) -> str | None:  # pyright: ignore[reportExplicitAny]
     """Truncate cause string before backtick-wrapping to prevent entity parse errors.
 
     Telegram Markdown parse_mode fails with 400 if an entity delimiter (backtick)
@@ -1492,7 +1495,7 @@ def _maybe_dispatch_agent(
         return {"dispatched": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
-def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
+def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG001 — Lambda contract  # pyright: ignore[reportExplicitAny]
     """EventBridge handler — fires only on a registered fleet SF terminal failure
     (FAILED / TIMED_OUT / ABORTED), per the dedicated rule
     ``alpha-engine-saturday-sf-watch-failed`` (scoped to the three SFs in

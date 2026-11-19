@@ -17,9 +17,12 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+import types
 from pathlib import Path
+from typing import Any
 
 import pytest
+from nousergon_lib.pipeline_status import roles
 
 _INDEX = (
     Path(__file__).resolve().parent.parent
@@ -31,7 +34,7 @@ _INDEX = (
 
 
 @pytest.fixture(scope="module")
-def dispatcher():
+def dispatcher() -> types.ModuleType:
     """Import index.py with its Lambda-only deps stubbed.
 
     The sibling lockstep tests parse this file with `ast` precisely to avoid
@@ -42,8 +45,6 @@ def dispatcher():
     in the test environment; it is only used for notification side effects,
     none of which these pure functions touch.
     """
-    import types
-
     stub = types.ModuleType("flow_doctor_telegram")
     stub.notify_via_flow_doctor = lambda *a, **k: None  # never called by the functions under test
     stub.send_message = lambda *a, **k: None
@@ -64,34 +65,40 @@ def _describe(payload: dict | None) -> dict:
 # ── the discriminator ───────────────────────────────────────────────────────
 
 
-def test_exercise_run_gets_the_conservative_ceiling(dispatcher):
+def test_exercise_run_gets_the_conservative_ceiling(dispatcher: Any) -> None:  # pyright: ignore[reportExplicitAny]
     """The whole point: a weekday exercise failure of the weekly pipeline
     must NOT be handed Saturday's 8."""
     assert dispatcher._max_dispatches("saturday", "exercise") == dispatcher._DEFAULT_MAX_DISPATCHES
     assert dispatcher._max_dispatches("saturday", "exercise") < dispatcher.SF_WATCH_MAX_DISPATCHES["saturday"]
 
 
-def test_the_real_saturday_run_is_unchanged(dispatcher):
+def test_shared_exercise_roles_get_the_conservative_ceiling(dispatcher: Any) -> None:  # pyright: ignore[reportExplicitAny]
+    assert dispatcher.EXERCISE_ROLES is roles.EXERCISE_ROLES
+    for role in roles.EXERCISE_ROLES:
+        assert dispatcher._max_dispatches("saturday", role) == dispatcher._DEFAULT_MAX_DISPATCHES
+
+
+def test_the_real_saturday_run_is_unchanged(dispatcher: Any) -> None:  # pyright: ignore[reportExplicitAny]
     """The fix must not quietly shrink the budget the week's actual belief
     refresh was ruled to have."""
     assert dispatcher._max_dispatches("saturday", "weekly") == dispatcher.SF_WATCH_MAX_DISPATCHES["saturday"]
     assert dispatcher._max_dispatches("saturday", "") == dispatcher.SF_WATCH_MAX_DISPATCHES["saturday"]
 
 
-def test_manual_and_recovery_invocations_keep_their_budget(dispatcher):
+def test_manual_and_recovery_invocations_keep_their_budget(dispatcher: Any) -> None:  # pyright: ignore[reportExplicitAny]
     """Manual / recovery / watch-rerun executions carry other roles (or none)
     and are not exercise runs — they must not be caught by this."""
     for role in ("", "operator-replay", "recovery", "watch-rerun"):
         assert dispatcher._max_dispatches("saturday", role) == dispatcher.SF_WATCH_MAX_DISPATCHES["saturday"]
 
 
-def test_other_pipelines_are_untouched(dispatcher):
+def test_other_pipelines_are_untouched(dispatcher: Any) -> None:  # pyright: ignore[reportExplicitAny]
     for slug in ("weekday", "eod"):
         assert dispatcher._max_dispatches(slug, "") == dispatcher.SF_WATCH_MAX_DISPATCHES[slug]
         assert dispatcher._max_dispatches(slug, "exercise") == dispatcher._DEFAULT_MAX_DISPATCHES
 
 
-def test_unruled_cadence_still_gets_the_conservative_default(dispatcher):
+def test_unruled_cadence_still_gets_the_conservative_default(dispatcher: Any) -> None:  # pyright: ignore[reportExplicitAny]
     """Pre-existing behaviour, re-pinned: a future pipeline registered before
     its budget is ruled must never inherit Saturday's."""
     assert dispatcher._max_dispatches("some-future-cadence", "") == dispatcher._DEFAULT_MAX_DISPATCHES
@@ -100,12 +107,12 @@ def test_unruled_cadence_still_gets_the_conservative_default(dispatcher):
 # ── reading the role off the execution ──────────────────────────────────────
 
 
-def test_role_is_read_from_the_execution_input(dispatcher):
+def test_role_is_read_from_the_execution_input(dispatcher: Any) -> None:  # pyright: ignore[reportExplicitAny]
     assert dispatcher._pipeline_role(_describe({"pipeline_role": "exercise"})) == "exercise"
     assert dispatcher._pipeline_role(_describe({"pipeline_role": "weekly"})) == "weekly"
 
 
-def test_role_is_normalised(dispatcher):
+def test_role_is_normalised(dispatcher: Any) -> None:  # pyright: ignore[reportExplicitAny]
     """The SF Input is hand-editable on a manual rerun; casing/whitespace must
     not silently hand an exercise run the Saturday budget."""
     assert dispatcher._pipeline_role(_describe({"pipeline_role": "  EXERCISE  "})) == "exercise"
@@ -126,7 +133,9 @@ def test_role_is_normalised(dispatcher):
         {"input": json.dumps({"pipeline_role": 7})},
     ],
 )
-def test_unreadable_input_never_raises_and_never_downgrades_saturday(dispatcher, resp):
+def test_unreadable_input_never_raises_and_never_downgrades_saturday(
+    dispatcher: Any, resp: dict | None  # pyright: ignore[reportExplicitAny]
+) -> None:
     """Fail-soft in the SAFE direction. This runs inside the dispatcher's hot
     path; an exception here would take out the whole response plane for a
     pipeline that is already failing. A missing role means 'not known to be an
@@ -138,7 +147,7 @@ def test_unreadable_input_never_raises_and_never_downgrades_saturday(dispatcher,
     assert dispatcher._max_dispatches("saturday", role) == dispatcher.SF_WATCH_MAX_DISPATCHES["saturday"]
 
 
-def test_conservative_default_is_actually_smaller(dispatcher):
+def test_conservative_default_is_actually_smaller(dispatcher: Any) -> None:  # pyright: ignore[reportExplicitAny]
     """Guards the constants themselves — if someone raises _DEFAULT_MAX_DISPATCHES
     to 8, every assertion above still passes while the defect returns."""
     assert dispatcher._DEFAULT_MAX_DISPATCHES < dispatcher.SF_WATCH_MAX_DISPATCHES["saturday"]
