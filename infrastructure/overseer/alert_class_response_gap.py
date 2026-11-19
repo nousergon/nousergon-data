@@ -24,10 +24,6 @@ A class is PAGEABLE here when:
     ``playbook:<name>``, which is already routed to an automated T2 agent
     and so is not in the third state this detector is for.
 
-Every pageable class is checked unconditionally. The backlog found by the
-alpha-engine-config-I8991 sweep was dispositioned under
-alpha-engine-config-I8996.
-
 Usage:
   python infrastructure/overseer/alert_class_response_gap.py \\
     --playbooks infrastructure/overseer/playbooks.yaml
@@ -38,18 +34,31 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import cast
+from typing import Required, TypedDict, cast
 
 import yaml
 
-# Empty compatibility marker for the completed I8996 backlog.
+# Kept as an empty compatibility export; the detector has no grandfather carve-out.
 GRANDFATHERED_CLASSES: frozenset[str] = frozenset()
+
+
+AlertClass = TypedDict(
+    "AlertClass",
+    {
+        "class": Required[str],
+        "severities": list[str],
+        "response": str,
+        "operator_reason": str,
+        "migration_issue": str,
+    },
+    total=False,
+)
 
 _PAGEABLE_SEVERITIES = frozenset({"error", "critical", "dynamic"})
 _PAGEABLE_RESPONSES = frozenset({"drain-queue", "operator"})
 
 
-def is_pageable(alert_class: dict) -> bool:
+def is_pageable(alert_class: AlertClass) -> bool:
     """True when this row's severities/response combination can reach a
     human page with no automated disposition guaranteed."""
     severities = set(alert_class.get("severities", []))
@@ -57,23 +66,26 @@ def is_pageable(alert_class: dict) -> bool:
     return bool(severities & _PAGEABLE_SEVERITIES) and response in _PAGEABLE_RESPONSES
 
 
-def has_disposition_field(alert_class: dict) -> bool:
+def has_disposition_field(alert_class: AlertClass) -> bool:
     return "operator_reason" in alert_class or "migration_issue" in alert_class
 
 
-def find_new_gaps(alert_classes: list[dict]) -> list[str]:
-    """Classes that are pageable and lack both disposition fields."""
+def find_new_gaps(alert_classes: list[AlertClass]) -> list[str]:
+    """Return pageable classes that lack a required disposition field.
+
+    The historical name is retained for callers, but the check is unconditional:
+    removing a disposition from any existing row creates a new registry gap.
+    """
     return sorted(
-        cast(str, c["class"])
+        c["class"]
         for c in alert_classes
-        if is_pageable(c)
-        and not has_disposition_field(c)
+        if is_pageable(c) and not has_disposition_field(c)
     )
 
 
-def _load_alert_classes(playbooks_path: Path) -> list[dict]:
+def _load_alert_classes(playbooks_path: Path) -> list[AlertClass]:
     data = yaml.safe_load(playbooks_path.read_text())
-    return data.get("alert_classes", [])
+    return cast(list[AlertClass], data.get("alert_classes", []))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -91,17 +103,19 @@ def main(argv: list[str] | None = None) -> int:
 
     alert_classes = _load_alert_classes(args.playbooks)
 
-    new_gaps = find_new_gaps(alert_classes)
+    gaps = find_new_gaps(alert_classes)
+
     ok = True
-    if new_gaps:
+    if gaps:
         ok = False
         print(
             "overseer-policy.md invariant 4 violated — pageable alert_classes row(s) "
             "with neither operator_reason nor migration_issue (alpha-engine-config-I8991):",
             file=sys.stderr,
         )
-        for name in new_gaps:
+        for name in gaps:
             print(f"  - {name}", file=sys.stderr)
+
     if ok:
         print(f"alert_class_response_gap: OK ({len(alert_classes)} classes checked)")
         return 0
