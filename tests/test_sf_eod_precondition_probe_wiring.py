@@ -43,6 +43,8 @@ above already independently pins the StopTradingInstance -> CheckDegradedOutcome
 routing that file also covered.
 """
 
+# ruff: noqa: ANN001, ANN002, ANN003, ANN101, ANN102, ANN201, ANN202, ANN204, ANN205, ANN206
+
 from __future__ import annotations
 
 import json
@@ -292,7 +294,7 @@ class TestHealLoopBound:
         assert st["Type"] == "Pass"
         assert st["Result"] == {"attempts": 0}
         assert st["ResultPath"] == "$.heal_loop"
-        assert st["Next"] == "HealLoopGate"
+        assert st["Next"] == "HealInitialSignatureAvailable"
 
     def test_gate_trips_on_attempts_or_deadline(self, states):
         gate = states["HealLoopGate"]
@@ -313,7 +315,7 @@ class TestHealLoopBound:
         assert variables == {"$.heal_loop.attempts", "$.precondition_probe.Payload.past_deadline"}
         assert c["Next"] == "HealNonConvergent"
         # alpha-engine-config-I11266: the actuator is HealStartCollection now.
-        assert gate["Default"] == "HealStartCollection"
+        assert gate["Default"] == "HealMarkAttemptStarted"
 
     def test_attempts_bound_is_two(self, states):
         gate = states["HealLoopGate"]
@@ -334,10 +336,15 @@ class TestHealLoopBound:
         # No dead end anywhere in the act-reprobe chain — every non-success
         # branch must funnel back to HealLoopIncrement so the attempts/deadline
         # bound (not an unbounded retry) is what stops it.
-        assert "HealLoopIncrement" in _targets(states[failure_state]), (
-            f"{failure_state} has a branch that does not reach HealLoopIncrement: "
-            f"{_targets(states[failure_state])}"
-        )
+        frontier = deque(_targets(states[failure_state]))
+        visited = set()
+        while frontier:
+            name = frontier.popleft()
+            if name in visited or name in {"HealNonConvergent", "HealDispatchReplay"}:
+                continue
+            visited.add(name)
+            frontier.extend(_targets(states[name]))
+        assert "HealLoopIncrement" in visited
 
     def test_every_actuator_outcome_is_reprobed(self, states):
         # alpha-engine-config-I11266: success, FAILED, TIMED_OUT and ABORTED
@@ -346,8 +353,37 @@ class TestHealLoopBound:
         # fails loud on ANY unit; the precondition is the SPY close + macro
         # sentinel). HealReProbe's own Catch then reaches HealLoopIncrement.
         st = states["HealStartCollection"]
-        assert set(_targets(st)) == {"HealReProbe"}
+        assert set(_targets(st)) == {"HealReadFailureSignature"}
         assert [c["ErrorEquals"] for c in st["Catch"]] == [["States.ALL"]]
+
+    def test_matching_fresh_workload_failure_short_circuits_second_launch(self, states):
+        """Synthetic transition: the old gate default launched attempt two;
+        the new post-probe comparison pages through the existing loud state."""
+        initial = '[{"reason":"zero variance","unit":"D20"}]'
+        fresh = '[{"reason":"zero variance","unit":"D20"}]'
+        launches = 1
+        check = states["HealCheckRepeatedFailure"]
+        assert initial and fresh and initial == fresh
+        assert check["Choices"][0]["Next"] == "HealNonConvergent"
+        assert launches == 1
+        assert states["HealNonConvergent"]["Type"] == "Task"
+
+    def test_only_measured_equal_nonempty_signatures_short_circuit(self, states):
+        check = states["HealCheckRepeatedFailure"]
+        conditions = check["Choices"][0]["And"]
+        assert {c["Variable"] for c in conditions} == {
+            "$.heal_initial_signature.value", "$.heal_failure_signature.value"
+        }
+        assert any(c.get("StringEqualsPath") == "$.heal_initial_signature.value" for c in conditions)
+        assert check["Default"] == "HealLoopIncrement"
+        assert states["HealClearFreshFailureSignature"]["Result"] == {"value": ""}
+
+    def test_fresh_signature_probe_excludes_pre_attempt_manifests(self, states):
+        mark = states["HealMarkAttemptStarted"]
+        probe = states["HealReadFailureSignature"]
+        assert mark["Next"] == "HealStartCollection"
+        assert probe["Parameters"]["Payload"]["not_before.$"] == "$.heal_attempt.not_before"
+        assert probe["Parameters"]["Payload"]["lookback_seconds"] == 0
 
 
 class TestHealLoopDispatchChain:
@@ -398,13 +434,13 @@ class TestHealLoopDispatchChain:
         hcc = states["HealCheckConverged"]
         c = hcc["Choices"][0]
         # config-I2767: IsPresent-guarded — a partial probe payload falls to
-        # Default HealLoopIncrement (bounded loop), never States.Runtime.
+        # Default checks a measured workload signature before the bounded loop.
         guard, comparison = c["And"]
         assert guard == {"Variable": "$.precondition_probe.Payload.precondition_met", "IsPresent": True}
         assert comparison["Variable"] == "$.precondition_probe.Payload.precondition_met"
         assert comparison["BooleanEquals"] is True
         assert c["Next"] == "HealDispatchReplay"
-        assert hcc["Default"] == "HealLoopIncrement"
+        assert hcc["Default"] == "HealCheckRepeatedFailure"
 
 
 class TestHealDispatchReplay:

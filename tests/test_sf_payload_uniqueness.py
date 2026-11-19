@@ -29,6 +29,8 @@ Composes with [[reference-eventbridge-target-uniqueness-invariant]] +
 [[feedback-audit-findings-become-roadmap-followups]].
 """
 
+# ruff: noqa: ANN001, ANN002, ANN003, ANN101, ANN102, ANN201, ANN202, ANN204, ANN205, ANN206
+
 from __future__ import annotations
 
 import json
@@ -803,6 +805,10 @@ class TestEODSFTopLevelFieldsClosed:
             # HealStartCollection's .sync:2 result is the one actuator path now.
             "heal_collection",
             "heal_error",
+            "heal_initial_signature",
+            "heal_attempt",
+            "heal_failure_signature",
+            "heal_signature_error",
             "heal_replay_dispatch",
             "heal_replay_dispatch_error",
             "heal_replay_dispatch_failed_notify",
@@ -874,7 +880,8 @@ class TestEODSFTopLevelFieldsClosed:
         # EODReconcile, its precondition probe and the heal loop.
         "eod_result", "eod_poll", "eod_skip_notify", "skip_eod_reconcile",
         "skip_post_market_data", "precondition_probe", "ec2_instance_id",
-        "heal_loop", "heal_collection", "heal_error", "heal_replay_dispatch",
+        "heal_loop", "heal_collection", "heal_error", "heal_initial_signature",
+        "heal_attempt", "heal_failure_signature", "heal_signature_error", "heal_replay_dispatch",
         "heal_replay_dispatch_error", "heal_replay_dispatch_failed_notify",
         "heal_converged_notify", "heal_nonconvergent_notify",
         # The exercise tail after the box stop (stop_result is shared: both
