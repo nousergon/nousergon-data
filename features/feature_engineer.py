@@ -21,7 +21,7 @@ Tickers with fewer than ~265 rows should be skipped by the caller.
 
 from __future__ import annotations
 
-from typing import cast
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -1113,19 +1113,17 @@ def compute_features(
 
     # ── v2.0 features — alternative data signals (O10-O12) ────────────────────
 
-    def _safe_float(val: object, default: float = 0.0) -> float:
+    def _safe_float(
+        val: Any,  # pyright: ignore[reportExplicitAny] -- JSON scalar at runtime
+        default: float = 0.0,
+    ) -> float:
         """Coerce to float, treating None as the default."""
-        return float(cast(float | int | str, val)) if val is not None else default
-
-    def _optional_float(val: object) -> float:
-        """Coerce an optional alternative-data input without inventing a value."""
-        return float(cast(float | int | str, val)) if val is not None else float("nan")
+        return float(val) if val is not None else default
 
     # O10: PEAD
     if earnings_data:
-        earnings = cast(dict[str, float | int | str | None], earnings_data)
-        df["earnings_surprise_pct"] = _optional_float(earnings.get("surprise_pct"))
-        days_since = _optional_float(earnings.get("days_since_earnings"))
+        df["earnings_surprise_pct"] = _safe_float(earnings_data.get("surprise_pct"), np.nan)
+        days_since = _safe_float(earnings_data.get("days_since_earnings"), np.nan)
         # Capped at 90 days, as registry.py declares (I13143).
         df["days_since_earnings"] = min(max(days_since, 0.0), 90.0) / 90.0
     else:
@@ -1134,19 +1132,17 @@ def compute_features(
 
     # O11: EPS revision momentum
     if revision_data:
-        revisions = cast(dict[str, float | int | str | None], revision_data)
-        df["eps_revision_4w"] = _optional_float(revisions.get("eps_revision_4w"))
-        df["revision_streak"] = _optional_float(revisions.get("revision_streak"))
+        df["eps_revision_4w"] = _safe_float(revision_data.get("eps_revision_4w"), np.nan)
+        df["revision_streak"] = _safe_float(revision_data.get("revision_streak"), np.nan)
     else:
         df["eps_revision_4w"] = np.nan
         df["revision_streak"] = np.nan
 
     # O12: Options-derived signals
     if options_data:
-        options = cast(dict[str, float | int | str | None], options_data)
-        df["put_call_ratio"] = _optional_float(options.get("put_call_ratio"))
-        df["iv_rank"] = _optional_float(options.get("iv_rank"))
-        atm_iv = _optional_float(options.get("atm_iv"))
+        df["put_call_ratio"] = _safe_float(options_data.get("put_call_ratio"), np.nan)
+        df["iv_rank"] = _safe_float(options_data.get("iv_rank"), np.nan)
+        atm_iv = _safe_float(options_data.get("atm_iv"), np.nan)
         # NOT a look-ahead: this whole O12 options block is an as-of-SNAPSHOT
         # broadcast — `options_data` (atm_iv etc.) is the current, time-axis-less
         # options state, written as one scalar to every row. Pairing the scalar
@@ -1154,11 +1150,8 @@ def compute_features(
         # correct current-state reference; it is never sliced per-decision-date in
         # the PIT replay (config#833). Do NOT "PIT-fix" this to a per-row
         # realized_vol — that would pair a single snapshot IV with historical RV.
-        realized_vol = (
-            float(cast(float | int | str, df["realized_vol_20d"].iloc[-1]))
-            if "realized_vol_20d" in df.columns else 0.0
-        )
-        if not np.isnan(realized_vol) and realized_vol > 0 and not np.isnan(atm_iv) and atm_iv >= 0:
+        realized_vol = df["realized_vol_20d"].iloc[-1] if "realized_vol_20d" in df.columns else 0.0
+        if realized_vol > 0 and atm_iv > 0:
             df["iv_vs_rv"] = atm_iv / realized_vol
         else:
             df["iv_vs_rv"] = np.nan
@@ -1169,23 +1162,22 @@ def compute_features(
 
     # ── v3.0 features — fundamental ratios (quarterly, from FMP) ─────────────
     if fundamental_data:
-        fundamentals = cast(dict[str, object], fundamental_data)
-        df["pe_ratio"] = _safe_float(fundamentals.get("pe_ratio"), 0.0)
-        df["pb_ratio"] = _safe_float(fundamentals.get("pb_ratio"), 0.0)
-        df["debt_to_equity"] = _safe_float(fundamentals.get("debt_to_equity"), 0.0)
-        df["revenue_growth_yoy"] = _safe_float(fundamentals.get("revenue_growth_yoy"), 0.0)
-        df["fcf_yield"] = _safe_float(fundamentals.get("fcf_yield"), 0.0)
-        df["gross_margin"] = _safe_float(fundamentals.get("gross_margin"), 0.0)
-        df["roe"] = _safe_float(fundamentals.get("roe"), 0.0)
-        df["current_ratio"] = _safe_float(fundamentals.get("current_ratio"), 0.0)
+        df["pe_ratio"] = _safe_float(fundamental_data.get("pe_ratio"), 0.0)
+        df["pb_ratio"] = _safe_float(fundamental_data.get("pb_ratio"), 0.0)
+        df["debt_to_equity"] = _safe_float(fundamental_data.get("debt_to_equity"), 0.0)
+        df["revenue_growth_yoy"] = _safe_float(fundamental_data.get("revenue_growth_yoy"), 0.0)
+        df["fcf_yield"] = _safe_float(fundamental_data.get("fcf_yield"), 0.0)
+        df["gross_margin"] = _safe_float(fundamental_data.get("gross_margin"), 0.0)
+        df["roe"] = _safe_float(fundamental_data.get("roe"), 0.0)
+        df["current_ratio"] = _safe_float(fundamental_data.get("current_ratio"), 0.0)
         # Phase 3a of attractiveness-pillars-260520 — Growth + Stewardship pillar substrate.
-        df["revenue_growth_3y"] = _safe_float(fundamentals.get("revenue_growth_3y"), 0.0)
-        df["eps_growth_3y"] = _safe_float(fundamentals.get("eps_growth_3y"), 0.0)
-        df["payout_ratio"] = _safe_float(fundamentals.get("payout_ratio"), 0.0)
-        df["dividend_yield"] = _safe_float(fundamentals.get("dividend_yield"), 0.0)
-        df["capex_growth_5y"] = _safe_float(fundamentals.get("capex_growth_5y"), 0.0)
+        df["revenue_growth_3y"] = _safe_float(fundamental_data.get("revenue_growth_3y"), 0.0)
+        df["eps_growth_3y"] = _safe_float(fundamental_data.get("eps_growth_3y"), 0.0)
+        df["payout_ratio"] = _safe_float(fundamental_data.get("payout_ratio"), 0.0)
+        df["dividend_yield"] = _safe_float(fundamental_data.get("dividend_yield"), 0.0)
+        df["capex_growth_5y"] = _safe_float(fundamental_data.get("capex_growth_5y"), 0.0)
         # SIZE pillar substrate (config#1142) — raw market cap in USD.
-        df["market_cap_raw"] = _safe_float(fundamentals.get("market_cap_raw"), 0.0)
+        df["market_cap_raw"] = _safe_float(fundamental_data.get("market_cap_raw"), 0.0)
     else:
         df["pe_ratio"] = 0.0
         df["pb_ratio"] = 0.0

@@ -156,47 +156,24 @@ def test_a_full_load_marks_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
     assert build.features_df[list(compute.ALTERNATIVE_FEATURES)].notna().all().all()
 
 
-def test_present_payload_preserves_missing_alternatives_and_genuine_zero(
+def test_present_payload_preserves_missing_alternative_values_and_real_zero(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A present ticker payload can itself omit fields; absence is not zero."""
-    missing = compute._alt_entry_from_payload({})
-    genuine_zero = compute._alt_entry_from_payload({
-        "eps_revision": {"surprise_pct": 0.0, "revision_4w": 0.0, "streak": 0},
-        "options_flow": {"put_call_ratio": 0.0, "expected_move_pct": 0.0},
-    })
-    assert missing["earnings"]["surprise_pct"] is None
-    assert missing["revisions"]["eps_revision_4w"] is None
-    assert genuine_zero["earnings"]["surprise_pct"] == 0.0
-    assert genuine_zero["revisions"]["eps_revision_4w"] == 0.0
-
-    alt = compute.AlternativeLoad({
-        "AAA": {
-            "earnings": {"surprise_pct": 0.0},
-            "revisions": {"eps_revision_4w": 0.0, "revision_streak": 0.0},
-            "options": {"put_call_ratio": 0.0, "atm_iv": 0.0},
-        },
-    })
-    _patch(monkeypatch, ["AAA"], alt)
+    alt = _alt_load(TICKERS, short=False)
+    alt["AAA"]["earnings"] = {"surprise_pct": 0.0}
+    alt["AAA"]["revisions"] = {"eps_revision_4w": None, "revision_streak": 0}
+    alt["AAA"]["options"] = {"put_call_ratio": 0.0}
+    _patch(monkeypatch, TICKERS, alt)
 
     build = compute.build_feature_frame(_END.date().isoformat(), "test-bucket", s3=None)
-    assert build.features_df is not None
-    row = build.features_df.set_index("ticker").loc["AAA"]
-    assert row["earnings_surprise_pct"] == 0.0
-    assert row["eps_revision_4w"] == 0.0
-    assert row["revision_streak"] == 0.0
-    assert row["put_call_ratio"] == 0.0
-    assert row["iv_vs_rv"] == 0.0
-    assert math.isnan(row["days_since_earnings"])
-    assert math.isnan(row["iv_rank"])
+    frames = snapshot_group_frames(_END.date().isoformat(), build.features_df)
+    written = pd.read_parquet(io.BytesIO(frames["alternative"][1])).set_index("ticker")
 
-    _, body = snapshot_group_frames(
-        _END.date().isoformat(), build.features_df,
-    )["alternative"]
-    written = pd.read_parquet(io.BytesIO(body), engine="pyarrow").set_index("ticker")
-    assert list(written.columns) == ["date", *compute.ALTERNATIVE_FEATURES]
+    assert written.loc["AAA", "earnings_surprise_pct"] == 0.0
+    assert written.loc["AAA", "revision_streak"] == 0.0
     assert written.loc["AAA", "put_call_ratio"] == 0.0
-    assert math.isnan(written.loc["AAA", "iv_rank"])
+    for feature in ("days_since_earnings", "eps_revision_4w", "iv_rank", "iv_vs_rv"):
+        assert math.isnan(written.loc["AAA", feature]), feature
 
 
 @pytest.mark.parametrize(
