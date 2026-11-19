@@ -145,9 +145,9 @@ kind = "bootstrap"
 
 # ---------------------------------------------------------------------------
 [venvs.dashboard]
-about = "The v1 crucible-dashboard (alpha-engine-dashboard) venv on the weekly-freshness and backtest spot boxes. Both bootstraps force numpy<2 over its lock, so its pyarrow must stay below 26; it retires with the v1 weekly SF."
-pyarrow = ">=25.0.1,<26"
-numpy_below_2 = true
+about = "The v1 crucible-dashboard (alpha-engine-dashboard) venv on the weekly-freshness and backtest spot boxes. Its dependency set allows NumPy 2 and pyarrow 26 or newer; it retires with the v1 weekly SF."
+pyarrow = ">=26.0.1"
+numpy_below_2 = false
 
 [[venvs.dashboard.surfaces]]
 path = "infrastructure/lambdas/weekly-freshness-spot-dispatcher/index.py"
@@ -198,7 +198,7 @@ pyarrow_ignore = []
 
 # ---------------------------------------------------------------------------
 [venvs.crucible]
-about = "The crucible harness (pyproject + uv.lock). pyarrow >=26 is held by Dependabot ignore under Brian's ruling #25 (2026-10-14) until alpha-engine-config-I12318 lifts it; the ignore is declared here so it cannot drift from the data venv unseen."
+about = "The crucible harness (pyproject + uv.lock)."
 pyarrow = ">=25.0.1"
 numpy_below_2 = false
 
@@ -211,7 +211,7 @@ kind = "requirements"
 repo = "crucible"
 path = ".github/dependabot.yml"
 kind = "dependabot"
-pyarrow_ignore = [">=26"]
+pyarrow_ignore = []
 
 [[venvs.crucible.surfaces]]
 repo = "crucible"
@@ -323,7 +323,7 @@ pyarrow_ignore = []
 # Libraries: compatible with every consumer, never equal to one of them.
 
 [libraries.nousergon-lib]
-about = "nousergon-lib, installed from git into every crucible/data venv below. Its pyarrow/numpy live in optional extras ([quant*], [rag], parquet extras). The dashboard venv forces numpy<2 while data needs pyarrow >= 26, so a numpy>=2 floor or a pyarrow>=26 floor here would make one consumer uninstallable."
+about = "nousergon-lib, installed from git into every crucible/data venv below. Its pyarrow/numpy live in optional extras ([quant*], [rag], parquet extras), so its ranges must remain compatible with every consumer."
 repo = "nousergon-lib"
 pyarrow = ">=14.0"
 numpy = ">=1.24"

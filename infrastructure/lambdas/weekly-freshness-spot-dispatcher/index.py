@@ -424,8 +424,6 @@ pip install --upgrade pip -q || fail "pip upgrade failed"
 if [ -f requirements.txt ]; then
   pip install -q -r requirements.txt || fail "dashboard requirements install failed"
 fi
-# numpy<2 pin to match every other spot workload (pyarrow compiled against 1.x).
-pip install -q 'numpy<2' || fail "numpy pin failed"
 chown -R ec2-user:ec2-user /home/ec2-user/alpha-engine-dashboard/.venv || fail "venv chown failed"
 deactivate
 # A SECOND venv, for alpha-engine-data's own code (alpha-engine-config-I7427).
@@ -443,12 +441,8 @@ deactivate
 #
 # (measured 2026-08-15, execution watch-rerun-2026-08-15-2).
 #
-# The two dependency sets CANNOT be merged into one venv: the dashboard venv
-# is pinned `numpy<2` on the line above because every spot workload's pyarrow
-# is compiled against 1.x, and alpha-engine-data declares `numpy>=2.4.6`.
-# Installing data's requirements into the dashboard venv would silently break
-# the pin that fourteen other stages depend on. Two venvs is the only shape
-# that is correct for both.
+# Keep a second venv so the dashboard and alpha-engine-data each run with the
+# dependency set declared by their own repository.
 echo "[weekly-freshness-spot-bootstrap] building alpha-engine-data venv..."
 cd /home/ec2-user/alpha-engine-data
 # python3.12 literally, for the same reason as the dashboard venv above: an
@@ -532,7 +526,9 @@ def _terminate_instance(instance_id: str) -> None:
     spot_dispatch.terminate_on_failure(instance_id, region=REGION, label="weekly-freshness")
 
 
-def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
+def handler(
+    event: dict[str, object], context: object
+) -> dict[str, object]:  # noqa: ARG001 — Lambda contract
     """Step Function handler — launch the weekly pipeline's launcher spot box.
 
     `event` carries `{"force_on_demand": bool}` (defaults False). BOTH SF

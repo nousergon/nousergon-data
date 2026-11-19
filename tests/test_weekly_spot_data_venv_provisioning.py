@@ -13,9 +13,8 @@ once reached its comparison (measured 2026-08-15, weekly-SF execution
     ERROR   [__main__] Drift check failed at stage=arctic_list:
       No module named 'arcticdb'
 
-The two closures cannot be merged: the dashboard venv is pinned ``numpy<2``
-(every spot workload's pyarrow is compiled against 1.x) and alpha-engine-data
-declares ``numpy>=2.4.6``.
+The two closures remain separate so each repository supplies its own dependency
+set without one install overriding the other.
 """
 
 from __future__ import annotations
@@ -34,7 +33,7 @@ def _src() -> str:
     return _DISPATCHER.read_text(encoding="utf-8")
 
 
-def test_bootstrap_creates_the_data_venv():
+def test_bootstrap_creates_the_data_venv() -> None:
     src = _src()
     assert "python3.12 -m venv .venv" in src
     assert '"$PYTHON_BIN" -m venv' not in src, (
@@ -48,7 +47,7 @@ def test_bootstrap_creates_the_data_venv():
     )
 
 
-def test_data_venv_installs_that_repos_own_requirements():
+def test_data_venv_installs_that_repos_own_requirements() -> None:
     src = _src()
     assert ".venv/bin/pip install -q -r requirements.txt" in src, (
         "the data venv must install alpha-engine-data's OWN requirements — "
@@ -63,11 +62,11 @@ def _requirements_krepis_pin() -> str:
     return m.group(1)
 
 
-def _version(v: str) -> tuple:
+def _version(v: str) -> tuple[int, ...]:
     return tuple(int(p) for p in v.split("."))
 
 
-def test_data_venv_carries_the_released_krepis_stage_coverage_contract():
+def test_data_venv_carries_the_released_krepis_stage_coverage_contract() -> None:
     """The box must not resolve a pre-I8155 fallback implementation.
 
     The data venv installs requirements.txt, whose krepis pin is EXACT, so
@@ -85,7 +84,7 @@ def test_data_venv_carries_the_released_krepis_stage_coverage_contract():
     assert pinned >= (0, 59, 78), "pre-rehearsal-namespace krepis"
 
 
-def test_nothing_overrides_the_data_venvs_own_krepis_pin():
+def test_nothing_overrides_the_data_venvs_own_krepis_pin() -> None:
     """alpha-engine-config-I11568: a hard-coded `pip install krepis==0.59.41`
     ran AFTER requirements.txt and downgraded the venv below both the repo's
     own pin and nousergon-lib's krepis>=0.59.52 floor — pip logged the
@@ -97,28 +96,26 @@ def test_nothing_overrides_the_data_venvs_own_krepis_pin():
     assert not overrides, f"the data venv's krepis is overridden: {overrides}"
 
 
-def test_data_venv_is_separate_from_the_dashboard_venv():
-    """The numpy pins are incompatible; one venv cannot serve both."""
+def test_data_venv_is_separate_from_the_dashboard_venv() -> None:
+    """Each repository gets a venv populated from its own requirements."""
     src = _src()
-    assert "pip install -q 'numpy<2'" in src, (
-        "the dashboard venv's numpy<2 pin is what makes a SECOND venv "
-        "mandatory rather than a preference"
+    assert "pip install -q 'numpy<2'" not in src, (
+        "the dashboard venv must resolve the NumPy version allowed by its "
+        "requirements rather than receiving a bootstrap override"
     )
-    data_reqs = (_REPO_ROOT / "requirements.txt").read_text(encoding="utf-8")
-    assert re.search(r"^numpy>=2", data_reqs, re.M), (
-        "alpha-engine-data no longer declares numpy>=2 — re-examine whether "
-        "the two venvs must still be separate before merging them"
+    assert src.count("python3.12 -m venv .venv") == 2, (
+        "the bootstrap must still provision separate dashboard and data venvs"
     )
 
 
-def test_data_venv_is_chowned_to_ec2_user():
+def test_data_venv_is_chowned_to_ec2_user() -> None:
     """Every stage runs as ec2-user via `sudo -u ec2-user`."""
     assert (
         "chown -R ec2-user:ec2-user /home/ec2-user/alpha-engine-data/.venv" in _src()
     )
 
 
-def test_bootstrap_timeout_accounts_for_two_venv_builds():
+def test_bootstrap_timeout_accounts_for_two_venv_builds() -> None:
     src = _src()
     m = re.search(
         r'WEEKLY_SPOT_BOOTSTRAP_TIMEOUT_SECONDS",\s*"(\d+)"', src
@@ -131,7 +128,7 @@ def test_bootstrap_timeout_accounts_for_two_venv_builds():
     )
 
 
-def test_data_venv_failures_are_fatal_not_swallowed():
+def test_data_venv_failures_are_fatal_not_swallowed() -> None:
     """Fail loud: a half-built venv must not reach the health check."""
     src = _src()
     for expected in (
