@@ -207,6 +207,27 @@ CI_WATCH_SIGNATURES_BUCKET = os.environ.get("CI_WATCH_SIGNATURES_BUCKET", "alpha
 CI_WATCH_SIGNATURES_PREFIX = os.environ.get(
     "CI_WATCH_SIGNATURES_PREFIX", "ci_watch/_control/signatures"
 )
+SIGNATURE_PROBE_METRIC_NAMESPACE = "AlphaEngine/CIWatch"
+SIGNATURE_PROBE_FAILURE_METRIC = "SignatureProbeFailures"
+
+
+def _emit_signature_probe_failure_metric(repo: str) -> None:
+    """Emit a countable CloudWatch metric through Embedded Metric Format."""
+    print(json.dumps({  # noqa: T201 — EMF requires a bare JSON log event
+        "_aws": {
+            "Timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
+            "CloudWatchMetrics": [{
+                "Namespace": SIGNATURE_PROBE_METRIC_NAMESPACE,
+                "Dimensions": [["Repository"]],
+                "Metrics": [{
+                    "Name": SIGNATURE_PROBE_FAILURE_METRIC,
+                    "Unit": "Count",
+                }],
+            }],
+        },
+        "Repository": repo,
+        SIGNATURE_PROBE_FAILURE_METRIC: 1,
+    }))
 
 # ── Dispatch record for the mid-run reclaim checker (config#3173) ───────────
 # WHY: ci-watch has no equivalent of Fleet-SF Watch's per-run watch-log — a
@@ -289,6 +310,7 @@ def _known_fixed_signature_exists(repo: str) -> bool:
                 return True
         return False
     except Exception as exc:  # noqa: BLE001 — fail OPEN, never block a launch
+        _emit_signature_probe_failure_metric(repo)
         logger.error(
             "ci-watch signature probe FAILED for repo=%s prefix=%s — failing "
             "OPEN (launching as normal; coverage beats dedup): %s: %s",
@@ -665,7 +687,9 @@ def _launch_ci_watch_spot(repo: str, sha: str, run_id: str, run_url: str,
     return verdict
 
 
-def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
+def handler(
+    event: dict[str, object], context: object | None
+) -> dict[str, object]:  # noqa: ARG001 — Lambda contract
     """Synchronous handler invoked once per real CI failure event. `event`
     carries {"repo", "sha", "run_id", "run_url", "workflow", "branch"} from
     the GHA job's `lambda invoke` payload (RequestResponse).

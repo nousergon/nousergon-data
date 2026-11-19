@@ -700,7 +700,7 @@ def test_signature_marker_without_fix_pr_still_launches(monkeypatch):
     assert out["launched"] is True
 
 
-def test_signature_probe_failure_fails_open_and_still_launches(monkeypatch):
+def test_signature_probe_failure_emits_metric_and_still_launches(monkeypatch, capsys):
     """Any list/read error on the signature probe must fail OPEN — never
     silently treated as a known repeat (binding guardrail, config#2862)."""
     idx = _load(
@@ -715,6 +715,18 @@ def test_signature_probe_failure_fails_open_and_still_launches(monkeypatch):
     out = idx.handler(_event(), None)
     assert out["launched"] is True
     assert out["reason"] == "launched"
+    metrics = [json.loads(line) for line in capsys.readouterr().out.splitlines()
+               if line.startswith('{"_aws"')]
+    assert len(metrics) == 1
+    assert metrics[0]["_aws"]["CloudWatchMetrics"][0]["Namespace"] == "AlphaEngine/CIWatch"
+    assert metrics[0]["SignatureProbeFailures"] == 1
+
+
+def test_successful_signature_probe_does_not_emit_failure_metric(monkeypatch, capsys):
+    idx = _load(monkeypatch, env={"CI_WATCH_DISPATCH_ENABLED": "true"})
+    out = idx.handler(_event(), None)
+    assert out["launched"] is True
+    assert "SignatureProbeFailures" not in capsys.readouterr().out
 
 
 def test_malformed_signature_marker_fails_open_and_still_launches(monkeypatch):
