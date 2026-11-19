@@ -26,6 +26,14 @@ from urllib.parse import urlparse
 
 import pytest
 
+
+def test_dispatch_run_id_export_is_shell_safe_and_optional(monkeypatch):
+    index = _load(monkeypatch)
+    args = ("repo/name", "a" * 40, "1", "https://example.test", "CI", "main", "token")
+    command = index._bootstrap_command(*args, dispatch_run_id="ledger/key with space")
+    assert "export OVERSEER_DISPATCH_RUN_ID='ledger/key with space'" in command
+    assert "export OVERSEER_DISPATCH_RUN_ID=''" in index._bootstrap_command(*args)
+
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 

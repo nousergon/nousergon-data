@@ -80,6 +80,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Protocol
@@ -329,6 +330,7 @@ def _resolve_event_fields(event: dict) -> dict:
     # script's inline default applies (non-router invocation fallback).
     # Regex-validated so its f-string interpolation cannot inject shell.
     model = _optional(event, "model", _MODEL_RE)
+    dispatch_run_id = str(event.get("dispatch_run_id") or "")
     # cause: deliberately unvalidated — arbitrary AWS text, base64-encoded
     # before it ever reaches a shell command (see _bootstrap_command).
     cause = str(event.get("cause") or "")
@@ -363,6 +365,7 @@ def _resolve_event_fields(event: dict) -> dict:
         "is_drill": is_drill,
         "force_on_demand": force_on_demand,
         "model": model,
+        "dispatch_run_id": dispatch_run_id,
         "cause": cause,
         "sf_execution_id": sf_execution_id,
         "dispatch_id": dispatch_id,
@@ -433,6 +436,7 @@ export SF_WATCH_LOG_KEY="{fields['watch_log_key']}"
 export SF_IS_PREFLIGHT="{fields['is_preflight']}"
 export SF_IS_DRILL="{fields['is_drill']}"
 export SF_WATCH_MODEL="{fields.get('model', '')}"
+export OVERSEER_DISPATCH_RUN_ID={shlex.quote(fields.get('dispatch_run_id', ''))}
 exec bash infrastructure/overseer_spot_bootstrap.sh --playbook sf-watch
 """
 

@@ -181,6 +181,26 @@ class TestKillSwitches:
 
 
 class TestLedger:
+    def test_executor_receives_exact_ledger_key_and_caller_value_is_overridden(
+        self, index_mod
+    ):
+        index, fake_boto3 = index_mod
+        lam = _lambda_client_returning(fake_boto3, {"launched": True})
+        index.handler({"playbook": "sf-watch",
+                       "payload": {"dispatch_run_id": "caller-controlled"}}, None)
+
+        sent = json.loads(lam.invoke.call_args.kwargs["Payload"])
+        assert sent["dispatch_run_id"] != "caller-controlled"
+        assert index._write_ledger.call_args.args[0] == sent["dispatch_run_id"]
+
+    def test_invoke_error_uses_the_key_supplied_to_executor(self, index_mod):
+        index, fake_boto3 = index_mod
+        lam = _lambda_client_returning(fake_boto3, {}, function_error="Unhandled")
+        index.handler({"playbook": "ci-watch", "payload": {}}, None)
+
+        sent = json.loads(lam.invoke.call_args.kwargs["Payload"])
+        assert index._write_ledger.call_args.args[0] == sent["dispatch_run_id"]
+
     def test_ledger_written_on_routed_dispatch(self, index_mod):
         index, fake_boto3 = index_mod
         _lambda_client_returning(fake_boto3, {"launched": True, "reason": "launched"})

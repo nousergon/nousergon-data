@@ -240,14 +240,9 @@ def _escalate(playbook: str, reason: str, detail: str, payload: dict) -> dict:
     return {"p1": p1, "paged": paged}
 
 
-def _write_ledger(record: dict) -> str | None:
+def _write_ledger(key: str, record: dict) -> str | None:
     """Best-effort dispatch-ledger write. Secondary surface — a ledger outage
     must never affect the dispatch; recording surface: this WARNING + logs."""
-    now = datetime.now(timezone.utc)
-    key = (
-        f"{LEDGER_PREFIX}/{now:%Y-%m-%d}/"
-        f"{now:%H%M%S}-{record.get('playbook', 'unknown')}-{uuid.uuid4().hex[:8]}.json"
-    )
     try:
         boto3.client("s3", region_name=REGION).put_object(
             Bucket=LEDGER_BUCKET,
@@ -312,6 +307,13 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
 
     function_name = spec["executor_function"]
     executor_payload = _stringify_bools(payload)
+    now = datetime.now(timezone.utc)
+    dispatch_run_id = (
+        f"{LEDGER_PREFIX}/{now:%Y-%m-%d}/"
+        f"{now:%H%M%S}-{playbook_name}-{uuid.uuid4().hex[:8]}.json"
+    )
+    # The router owns this correlation key: callers cannot select or spoof it.
+    executor_payload["dispatch_run_id"] = dispatch_run_id
     # config-I3293 — the registry is the SSoT for the agent's model: inject
     # the playbook's declared `model` into the executor payload unless the
     # caller explicitly overrode it (drills/operator invokes may). Executors
@@ -343,6 +345,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
                   "playbook": playbook_name, "executor_function": function_name,
                   "error": detail, "escalation": escalation}
         result["ledger_key"] = _write_ledger(
+            dispatch_run_id,
             {"playbook": playbook_name, "started_at": started_at,
              "payload": executor_payload, "outcome": result}
         )
@@ -367,6 +370,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         "escalation": escalation,
     }
     result["ledger_key"] = _write_ledger(
+        dispatch_run_id,
         {"playbook": playbook_name, "started_at": started_at,
          "payload": executor_payload, "outcome": {k: result[k] for k in
                                                   ("routed", "verdict", "benign", "escalation")}}

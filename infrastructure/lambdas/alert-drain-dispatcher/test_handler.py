@@ -19,6 +19,15 @@ from unittest.mock import MagicMock
 
 import pytest
 
+
+def test_dispatch_run_id_export_is_shell_safe_and_optional(index_mod):
+    index, _ = index_mod
+    command = index._bootstrap_command(
+        "drain-x", "false", dispatch_run_id="ledger/key with space"
+    )
+    assert "export OVERSEER_DISPATCH_RUN_ID='ledger/key with space'" in command
+    assert "export OVERSEER_DISPATCH_RUN_ID=''" in index._bootstrap_command("drain-x", "false")
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 

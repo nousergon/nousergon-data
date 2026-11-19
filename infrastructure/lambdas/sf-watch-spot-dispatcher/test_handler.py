@@ -35,6 +35,18 @@ import types
 
 import pytest
 
+
+def test_dispatch_run_id_export_is_shell_safe_and_optional(monkeypatch):
+    index = _load(monkeypatch)
+    fields = index._resolve_event_fields(
+        _event(dispatch_run_id="ledger/key with 'quote'")
+    )
+    command = index._bootstrap_command(fields, "token")
+    assert "export OVERSEER_DISPATCH_RUN_ID='ledger/key with '\"'\"'quote'\"'\"''" in command
+    assert "export OVERSEER_DISPATCH_RUN_ID=''" in index._bootstrap_command(
+        index._resolve_event_fields(_event()), "token"
+    )
+
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
