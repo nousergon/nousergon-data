@@ -1006,12 +1006,12 @@ def load_from_s3(
         run_date = _get_latest_date(s3, bucket, s3_prefix)
     if not run_date:
         return None
+    key = f"{s3_prefix}weekly/{run_date}/alternative/{ticker}.json"
     try:
-        key = f"{s3_prefix}weekly/{run_date}/alternative/{ticker}.json"
         obj = s3.get_object(Bucket=bucket, Key=key)
         return json.loads(obj["Body"].read())
-    except Exception:
-        return None
+    except Exception as exc:
+        raise RuntimeError(f"Failed to read alternative payload s3://{bucket}/{key}: {exc}") from exc
 
 
 # -- Ticker resolution -------------------------------------------------------
@@ -1195,20 +1195,10 @@ def _load_promoted_tickers(
     try:
         obj = s3.get_object(Bucket=bucket, Key=signals_key)
         signals = json.loads(obj["Body"].read())
-    except Exception:
-        # Try previous trading days
-        for days_back in range(1, 8):
-            dt = date.fromisoformat(run_date) - timedelta(days=days_back)
-            try_key = f"signals/{dt}/signals.json"
-            try:
-                obj = s3.get_object(Bucket=bucket, Key=try_key)
-                signals = json.loads(obj["Body"].read())
-                logger.info("Using signals from %s (fallback)", dt)
-                break
-            except Exception:
-                continue
-        else:
-            return []
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to load promoted tickers from s3://{bucket}/{signals_key}: {exc}"
+        ) from exc
 
     tickers = set()
 
@@ -1252,8 +1242,10 @@ def _get_latest_date(s3: Any, bucket: str, s3_prefix: str) -> str | None:  # pyr
     try:
         obj = s3.get_object(Bucket=bucket, Key=f"{s3_prefix}latest_weekly.json")
         return json.loads(obj["Body"].read()).get("date")
-    except Exception:
-        return None
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to read latest weekly pointer from s3://{bucket}/{s3_prefix}latest_weekly.json: {exc}"
+        ) from exc
 
 
 # -- Per-ticker alternative data aggregation ----------------------------------

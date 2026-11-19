@@ -251,7 +251,10 @@ def _read_json(s3_client: Any, bucket: str, key: str) -> dict | None:
     try:
         obj = s3_client.get_object(Bucket=bucket, Key=key)
         return json.loads(obj["Body"].read())
-    except Exception:
+    except Exception as exc:  # noqa: BLE001 - deliberate missing-input degrade recorded by collect
+        # Swallows missing/denied/malformed wallet input; collect records ``skipped`` in its
+        # returned phase result, and the primary weekly collection continues without crypto.
+        logger.warning("Crypto input unavailable at s3://%s/%s: %s", bucket, key, exc)
         return None
 
 
