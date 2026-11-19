@@ -1,5 +1,5 @@
-boto3>=1.44.1
-pandas>=2.0
+boto3>=1.44.6
+pandas>=2.3.3
 openpyxl>=3.1.5
 # >=26 needs NumPy 2 (26.0.0 refuses to import under 1.x). No venv built from
 # this file pins numpy<2 any more (alpha-engine-config-I12318): never add one back
@@ -21,7 +21,7 @@ numpy>=2.4.6
 feedparser>=6.0.14
 beautifulsoup4>=4.15.0
 lxml>=6.1.3
-edgartools>=6.0.0
+edgartools>=6.3.0
 voyageai>=0.6.0
 jsonschema>=4.26.0
 arcticdb>=6.28.3
