@@ -1926,7 +1926,7 @@ def build_feature_frame(
                 val = latest[f] if f in latest.index else 0.0
                 if pd.notna(val):
                     row[f] = float(val)
-                elif f in ALL_NULL_EXPECTED:
+                elif f in ALL_NULL_EXPECTED or f in ALTERNATIVE_FEATURES:
                     # alpha-engine-config-I7572: a generic "not yet known" ->
                     # 0.0 fallback silently laundered vwap_divergence_pct's
                     # legitimate NaN (today's VWAP isn't known until the
@@ -1937,6 +1937,10 @@ def build_feature_frame(
                     # documented contract — instead of manufacturing one.
                     row[f] = float("nan")
                 else:
+                    # The remaining groups retain their established fallbacks:
+                    # technical/macro inputs come from the required price
+                    # series, while fundamental defaults are deliberately
+                    # supplied by its collector and are not missing sentinels.
                     row[f] = 0.0
             if not has_alt:
                 _mark_alternative_missing(row)
