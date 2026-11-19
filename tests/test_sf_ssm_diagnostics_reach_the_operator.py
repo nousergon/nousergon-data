@@ -58,11 +58,15 @@ _DEFS = {
 # WaitForRefreshExecutorDeploy is the same state carried by BOTH machines (each
 # boots the box, so each refreshes the checkout) — the uncovered code is the
 # same three pollers, now counted per machine they live in.
-_UNCOVERED_POLLERS = {
-    ("eod", "WaitForCaptureSnapshot"),
-    ("eod", "WaitForRefreshExecutorDeploy"),
-    ("eod_reconcile", "WaitForEOD"),
-    ("eod_reconcile", "WaitForRefreshExecutorDeploy"),
+_UNCOVERED_POLLERS: set[tuple[str, str]] = set()
+
+_EOD_LIVENESS_POLLERS = {
+    ("eod", "WaitForCaptureSnapshot"): "SnapshotStatusError",
+    ("eod", "WaitForRefreshExecutorDeploy"): "RefreshExecutorDeployStatusError",
+    ("eod_reconcile", "WaitForEOD"): "EODStatusError",
+    ("eod_reconcile", "WaitForRefreshExecutorDeploy"): (
+        "RefreshExecutorDeployStatusError"
+    ),
 }
 
 # A field whose value plausibly carries what the script printed.
@@ -160,3 +164,57 @@ def test_output_tails_never_enter_sf_state_via_a_resultselector() -> None:
             assert "StandardOutputContent" not in selector, (
                 f"{which}:{name} maps StandardOutputContent — same class."
             )
+
+
+def test_eod_pollers_use_normalized_bounded_diagnostics_in_observe_mode() -> None:
+    """EOD shares the poller contract without promoting liveness routing."""
+    for (which, name), error_state_name in _EOD_LIVENESS_POLLERS.items():
+        states = _load(which)["States"]
+        state = states[name]
+        selector = state["ResultSelector"]
+
+        assert state["Resource"] == "arn:aws:states:::lambda:invoke"
+        assert state["Parameters"]["FunctionName"].endswith(
+            ":function:alpha-engine-ssm-liveness-poller"
+        )
+        assert selector["detail.$"] == "$.Payload.detail"
+        assert selector["StandardErrorContent.$"] == "$.Payload.stderr_tail"
+        assert "StandardOutputContent.$" not in selector
+
+        # Observe mode is load-bearing: existing Status choices, rather than
+        # the new verdict, continue to decide success/retry/failure outcomes.
+        choice = states[state["Next"]]
+        assert all(
+            item.get("Variable", "").endswith(".Status")
+            for item in choice["Choices"]
+        )
+        registering = [
+            item for item in choice["Choices"]
+            if item.get("StringEquals") == "Registering"
+        ]
+        assert len(registering) == 1
+        assert registering[0]["Next"].endswith("Wait")
+        assert "observe verdict for 5 successful EOD cycles" in state["Comment"]
+
+        # The normalized error is what HandleFailure and CaptureSnapshot's
+        # immediate/exhausted-retry pages serialize into their SNS messages.
+        error_state = states[error_state_name]
+        poll_path = state["ResultPath"]
+        assert error_state["Parameters"]["detail.$"] == f"{poll_path}.detail"
+
+
+def test_liveness_poller_normalizes_absent_output_fields_and_bounds_tails() -> None:
+    """The shared contract makes optional SSM output safe for ASL selectors."""
+    source = (
+        _REPO_ROOT
+        / "infrastructure"
+        / "lambdas"
+        / "ssm-liveness-poller"
+        / "index.py"
+    ).read_text()
+
+    assert 'inv.get("StandardErrorContent") or ""' in source
+    assert 'inv.get("StandardOutputContent") or ""' in source
+    assert '"detail": ""' in source
+    assert "_STDERR_TAIL_CHARS = 1500" in source
+    assert "_STDOUT_TAIL_CHARS = 2000" in source
