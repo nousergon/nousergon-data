@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: ANN001, ANN002, ANN003, ANN201, ANN202
 """The scheduled-automation pause must stay a record, not a comment.
 
 Brian ruling 2026-08-07: every scheduled AWS trigger disabled except the weekly
@@ -954,7 +955,10 @@ def classified_world(module, monkeypatch, request):
         # fix is to stub the enumeration rather than each view of it.
         monkeypatch.setattr(
             module, "_live_alarm_actions",
-            lambda: {n: {"enabled": e, "breaching": True} for n, e in live.items()})
+            lambda: {
+                n: {"enabled": e, "breaching": True, "paging": False}
+                for n, e in live.items()
+            })
     return live
 
 
@@ -1126,6 +1130,23 @@ def test_an_undeclared_breaching_alarm_is_a_finding(module, monkeypatch,
     assert ("alpha-engine-brand-new-probe-dead", "alarm-undeclared") in kinds
 
 
+@pytest.mark.real_alarm_scan
+@pytest.mark.parametrize("action_field", ["aa", "oa"])
+def test_an_undeclared_backstop_alarm_is_a_finding_when_not_breaching(
+        module, monkeypatch, action_field):
+    """AlarmActions and OKActions can each page on a state transition."""
+    action = "arn:aws:sns:us-east-1:123456789012:alpha-engine-alarm-backstop"
+    row = {"n": "alpha-engine-new-transition-page", "e": True,
+           "b": "notBreaching", "aa": [], "oa": []}
+    row[action_field] = [action]
+    monkeypatch.setattr(
+        module, "_aws", lambda args: (0, json.dumps({"a": [row], "t": None}), ""))
+
+    kinds = {(f["trigger"], f["kind"]) for f in module.alarm_coverage_findings()}
+
+    assert ("alpha-engine-new-transition-page", "alarm-undeclared") in kinds
+
+
 def test_a_hand_muted_armed_alarm_is_a_finding(module, monkeypatch, classified_world):
     """A detector muted with no declaration is indistinguishable from a healthy one."""
     monkeypatch.setattr(module, "_live_state", lambda surface, name: "DISABLED")
@@ -1155,8 +1176,8 @@ def test_describe_alarms_pagination_is_followed(module, monkeypatch):
     network.
     """
     pages = [
-        ('{"a": [{"n": "a1", "e": true, "b": "breaching"}], "t": "tok"}', None),
-        ('{"a": [{"n": "a2", "e": false, "b": "breaching"}], "t": null}', "tok"),
+        ('{"a": [{"n": "a1", "e": true, "b": "breaching", "aa": [], "oa": []}], "t": "tok"}', None),
+        ('{"a": [{"n": "a2", "e": false, "b": "breaching", "aa": [], "oa": []}], "t": null}', "tok"),
     ]
     seen: list[str | None] = []
 
@@ -1167,7 +1188,7 @@ def test_describe_alarms_pagination_is_followed(module, monkeypatch):
         return 0, body, ""
 
     monkeypatch.setattr(module, "_aws", fake_aws)
-    assert module._live_breaching_alarms() == {"a1": True, "a2": False}
+    assert module._live_graded_alarms() == {"a1": True, "a2": False}
     assert seen == [None, "tok"], "the second page was never requested"
 
 
@@ -1392,11 +1413,11 @@ def test_declaration_findings_never_move_live_state(module, monkeypatch):
 
 def test_a_hand_muted_undeclared_alarm_is_a_finding(module, monkeypatch):
     """RED proof 4 — the half of the ruling that must not weaken."""
-    world = {e["name"]: {"enabled": False, "breaching": True}
+    world = {e["name"]: {"enabled": False, "breaching": True, "paging": False}
              for e in module.alarm_entries()}
-    world.update({n: {"enabled": True, "breaching": True}
+    world.update({n: {"enabled": True, "breaching": True, "paging": False}
                   for n in module.armed_alarm_names()})
-    world["alpha-engine-some-new-detector"] = {"enabled": False, "breaching": False}
+    world["alpha-engine-some-new-detector"] = {"enabled": False, "breaching": False, "paging": False}
     monkeypatch.setattr(module, "_live_alarm_actions", lambda: world)
     kinds = {(f["trigger"], f["kind"]) for f in module.alarm_coverage_findings()}
     assert ("alpha-engine-some-new-detector", "alarm-undeclared-silence") in kinds, kinds
@@ -1407,11 +1428,11 @@ def test_the_undeclared_silence_scan_is_not_limited_to_breaching_alarms(module, 
     are `notBreaching`; the pre-existing completeness scan enumerated only
     `TreatMissingData=breaching`, so an undeclared mute of any of them was
     invisible to every check in the fleet."""
-    world = {e["name"]: {"enabled": False, "breaching": True}
+    world = {e["name"]: {"enabled": False, "breaching": True, "paging": False}
              for e in module.alarm_entries()}
-    world.update({n: {"enabled": True, "breaching": True}
+    world.update({n: {"enabled": True, "breaching": True, "paging": False}
                   for n in module.armed_alarm_names()})
-    world["alpha-engine-quiet-mute"] = {"enabled": False, "breaching": False}
+    world["alpha-engine-quiet-mute"] = {"enabled": False, "breaching": False, "paging": False}
     monkeypatch.setattr(module, "_live_alarm_actions", lambda: world)
     findings = module.alarm_coverage_findings()
     assert {"alpha-engine-quiet-mute"} == {
@@ -1424,9 +1445,9 @@ def test_the_undeclared_silence_scan_is_not_limited_to_breaching_alarms(module, 
 def test_an_armed_alarm_is_never_reported_as_an_undeclared_silence(module, monkeypatch):
     """`armed-but-silenced` already owns the armed block; two findings for one
     condition is how a report gets skimmed."""
-    world = {e["name"]: {"enabled": False, "breaching": True}
+    world = {e["name"]: {"enabled": False, "breaching": True, "paging": False}
              for e in module.alarm_entries()}
-    world.update({n: {"enabled": False, "breaching": True}
+    world.update({n: {"enabled": False, "breaching": True, "paging": False}
                   for n in module.armed_alarm_names()})
     monkeypatch.setattr(module, "_live_alarm_actions", lambda: world)
     findings = module.alarm_coverage_findings()
@@ -1753,12 +1774,12 @@ def test_group_qualified_kept_schedule_is_not_a_kept_but_missing_finding(
 
 
 def _retired_world(module, *, retired_live: bool):
-    world = {e["name"]: {"enabled": False, "breaching": True}
+    world = {e["name"]: {"enabled": False, "breaching": True, "paging": False}
              for e in module.alarm_entries()}
-    world.update({n: {"enabled": True, "breaching": True}
+    world.update({n: {"enabled": True, "breaching": True, "paging": False}
                   for n in module.armed_alarm_names()})
     if retired_live:
-        world.update({n: {"enabled": False, "breaching": True}
+        world.update({n: {"enabled": False, "breaching": True, "paging": False}
                       for n in module.retired_alarm_names()})
     return world
 
