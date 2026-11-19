@@ -1,3 +1,4 @@
+# ruff: noqa: ANN001, ANN002, ANN003, ANN201, ANN202, ANN204, ANN205, ANN206
 """Unit tests for the synchronous CI-failure -> ci-watch-spot dispatcher.
 
 Hermetic: ``nousergon_lib.ec2_spot`` and ``boto3`` are stubbed in sys.modules
@@ -25,14 +26,6 @@ import types
 from urllib.parse import urlparse
 
 import pytest
-
-
-def test_dispatch_run_id_export_is_shell_safe_and_optional(monkeypatch):
-    index = _load(monkeypatch)
-    args = ("repo/name", "a" * 40, "1", "https://example.test", "CI", "main", "token")
-    command = index._bootstrap_command(*args, dispatch_run_id="ledger/key with space")
-    assert "export OVERSEER_DISPATCH_RUN_ID='ledger/key with space'" in command
-    assert "export OVERSEER_DISPATCH_RUN_ID=''" in index._bootstrap_command(*args)
 
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -794,3 +787,11 @@ def test_drill_skips_signature_probe_entirely(monkeypatch):
     idx._test_s3.list_objects_v2 = _boom_list
     out = idx.handler({"is_drill": "true"}, None)
     assert out["launched"] is True
+
+
+def test_dispatch_run_id_export_is_shell_safe_and_optional(monkeypatch):
+    index = _load(monkeypatch)
+    args = ("repo/name", "a" * 40, "1", "https://example.test/run", "ci", "main", "token")
+    command = index._bootstrap_command(*args, dispatch_run_id="ledger/it's-safe.json")
+    assert "export OVERSEER_DISPATCH_RUN_ID='ledger/it'\"'\"'s-safe.json'" in command
+    assert "export OVERSEER_DISPATCH_RUN_ID=''" in index._bootstrap_command(*args)

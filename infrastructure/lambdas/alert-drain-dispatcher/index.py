@@ -1,3 +1,4 @@
+# pyright: reportExplicitAny=false
 """alpha-engine-alert-drain-dispatcher — launch the Overseer alert-drain agent
 on a dedicated EC2-spot box, twice daily (alpha-engine-config-I2824, epic
 I2821 phase 3).
@@ -42,6 +43,7 @@ import logging
 import os
 import re
 import shlex
+from typing import Any
 from datetime import datetime, timezone
 
 from nousergon_lib import spot_dispatch
@@ -264,7 +266,7 @@ def _terminate_instance(instance_id: str) -> None:
     spot_dispatch.terminate_on_failure(instance_id, region=REGION, label="alert-drain")
 
 
-def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
+def handler(event: dict[str, Any], context: object) -> dict[str, Any]:  # noqa: ARG001 — Lambda contract
     """Synchronous handler invoked by the overseer-dispatcher router (playbook
     ``alert-drain``) when the twice-daily Scheduler fires — or with
     ``{"is_drill": "true"}`` on a canary drill. Clean-JSON contract identical
@@ -276,6 +278,8 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     except _InvalidEvent as exc:
         logger.error("invalid alert-drain event: %s", exc)
         return {"launched": False, "reason": "invalid_event", "error": str(exc)}
+
+    dispatch_run_id = str(event.get("dispatch_run_id") or "")
 
     if not DISPATCH_ENABLED:
         logger.warning("ALERT_DRAIN_DISPATCH_ENABLED=false — drain NOT launched")
@@ -318,10 +322,8 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
 
     try:
         _wait_ssm_online(instance_id)
-        command_id = _send_bootstrap(
-            instance_id, run_id, is_drill, model,
-            str(event.get("dispatch_run_id") or ""),
-        )
+        command_id = _send_bootstrap(instance_id, run_id, is_drill, model,
+                                     dispatch_run_id)
     except Exception as exc:  # noqa: BLE001 — converted to a clean launched:false (router escalates)
         _terminate_instance(instance_id)
         logger.error("alert-drain post-launch step failed for %s: %s: %s",

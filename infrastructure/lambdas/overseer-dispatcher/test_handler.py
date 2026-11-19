@@ -1,3 +1,4 @@
+# ruff: noqa: ANN001, ANN002, ANN003, ANN201, ANN202, ANN204, ANN205, ANN206
 """Handler tests for alpha-engine-overseer-dispatcher (alpha-engine-config-I2823).
 
 Pins the router contract: registry-driven routing to the executor, bool
@@ -181,26 +182,6 @@ class TestKillSwitches:
 
 
 class TestLedger:
-    def test_executor_receives_exact_ledger_key_and_caller_value_is_overridden(
-        self, index_mod
-    ):
-        index, fake_boto3 = index_mod
-        lam = _lambda_client_returning(fake_boto3, {"launched": True})
-        index.handler({"playbook": "sf-watch",
-                       "payload": {"dispatch_run_id": "caller-controlled"}}, None)
-
-        sent = json.loads(lam.invoke.call_args.kwargs["Payload"])
-        assert sent["dispatch_run_id"] != "caller-controlled"
-        assert index._write_ledger.call_args.args[0] == sent["dispatch_run_id"]
-
-    def test_invoke_error_uses_the_key_supplied_to_executor(self, index_mod):
-        index, fake_boto3 = index_mod
-        lam = _lambda_client_returning(fake_boto3, {}, function_error="Unhandled")
-        index.handler({"playbook": "ci-watch", "payload": {}}, None)
-
-        sent = json.loads(lam.invoke.call_args.kwargs["Payload"])
-        assert index._write_ledger.call_args.args[0] == sent["dispatch_run_id"]
-
     def test_ledger_written_on_routed_dispatch(self, index_mod):
         index, fake_boto3 = index_mod
         _lambda_client_returning(fake_boto3, {"launched": True, "reason": "launched"})
@@ -279,3 +260,21 @@ class TestModelInjection:
                       None)
         sent = json.loads(lam.invoke.call_args.kwargs["Payload"])
         assert sent["model"] == "claude-opus-4-8"
+
+
+def test_dispatch_run_id_matches_ledger_key_and_overrides_caller(index_mod):
+    index, fake_boto3 = index_mod
+    lam = _lambda_client_returning(fake_boto3, {"launched": True, "reason": "launched"})
+    index.handler({"playbook": "sf-watch", "payload": {"dispatch_run_id": "caller"}}, None)
+    sent = json.loads(lam.invoke.call_args.kwargs["Payload"])
+    ledger_key = index._write_ledger.call_args.args[0]
+    assert sent["dispatch_run_id"] == ledger_key
+    assert ledger_key != "caller"
+
+
+def test_invoke_error_uses_payload_dispatch_run_id_for_ledger(index_mod):
+    index, fake_boto3 = index_mod
+    lam = _lambda_client_returning(fake_boto3, {}, function_error="Unhandled")
+    index.handler({"playbook": "ci-watch", "payload": {}}, None)
+    sent = json.loads(lam.invoke.call_args.kwargs["Payload"])
+    assert index._write_ledger.call_args.args[0] == sent["dispatch_run_id"]

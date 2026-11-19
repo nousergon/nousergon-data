@@ -1,3 +1,4 @@
+# ruff: noqa: ANN001, ANN002, ANN003, ANN201, ANN202, ANN204, ANN205, ANN206
 """Unit tests for the synchronous SF-failure -> sf-watch-spot dispatcher.
 
 Hermetic: ``nousergon_lib.ec2_spot`` and ``boto3`` are stubbed in sys.modules
@@ -34,18 +35,6 @@ import sys
 import types
 
 import pytest
-
-
-def test_dispatch_run_id_export_is_shell_safe_and_optional(monkeypatch):
-    index = _load(monkeypatch)
-    fields = index._resolve_event_fields(
-        _event(dispatch_run_id="ledger/key with 'quote'")
-    )
-    command = index._bootstrap_command(fields, "token")
-    assert "export OVERSEER_DISPATCH_RUN_ID='ledger/key with '\"'\"'quote'\"'\"''" in command
-    assert "export OVERSEER_DISPATCH_RUN_ID=''" in index._bootstrap_command(
-        index._resolve_event_fields(_event()), "token"
-    )
 
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -1289,3 +1278,16 @@ def test_a_v2_weekly_defer_carries_the_dispatch_id_forward(monkeypatch):
     payload = json.loads(sched["Target"]["Input"])
     assert payload["dispatch_id"] == _V2_DISPATCH_ID
     assert payload["execution_arn"] == ""
+
+
+def test_dispatch_run_id_export_is_shell_safe_and_optional(monkeypatch):
+    index = _load(monkeypatch)
+    fields = {"cause": "", "failed_state_detail": "", "pipeline_name": "p",
+              "cadence_slug": "c", "state_machine_arn": "", "execution_arn": "",
+              "dispatch_id": "", "run_date": "", "failed_state": "",
+              "watch_log_key": "", "is_preflight": "false", "is_drill": "false",
+              "model": "", "dispatch_run_id": "ledger/it's-safe.json"}
+    command = index._bootstrap_command(fields, "token")
+    assert "export OVERSEER_DISPATCH_RUN_ID='ledger/it'\"'\"'s-safe.json'" in command
+    fields.pop("dispatch_run_id")
+    assert "export OVERSEER_DISPATCH_RUN_ID=''" in index._bootstrap_command(fields, "token")

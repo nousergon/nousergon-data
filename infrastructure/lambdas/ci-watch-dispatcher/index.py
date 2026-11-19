@@ -1,3 +1,4 @@
+# pyright: reportExplicitAny=false
 """alpha-engine-ci-watch-dispatcher — launch the Fleet CI Watch diagnose+fix
 agent on a dedicated EC2 spot box, once per real CI failure event.
 
@@ -87,6 +88,7 @@ import logging
 import os
 import re
 import shlex
+from typing import Any
 import uuid
 from datetime import datetime, timezone
 
@@ -557,7 +559,7 @@ def _terminate_instance(instance_id: str) -> None:
 def _launch_ci_watch_spot(repo: str, sha: str, run_id: str, run_url: str,
                           workflow: str, branch: str,
                           is_drill: str = "false", model: str = "",
-                          dispatch_run_id: str = "") -> dict:
+                          dispatch_run_id: str = "") -> dict[str, Any]:
     """Launch + bootstrap the CI-watch box. SYNCHRONOUS contract: every
     anticipated failure mode returns a clean, well-formed launched:false
     rather than raising — see module docstring."""
@@ -671,7 +673,7 @@ def _launch_ci_watch_spot(repo: str, sha: str, run_id: str, run_url: str,
     return verdict
 
 
-def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
+def handler(event: dict[str, Any], context: object) -> dict[str, Any]:  # noqa: ARG001 — Lambda contract
     """Synchronous handler invoked once per real CI failure event. `event`
     carries {"repo", "sha", "run_id", "run_url", "workflow", "branch"} from
     the GHA job's `lambda invoke` payload (RequestResponse).
@@ -698,10 +700,12 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         logger.error("invalid ci-watch event: %s", exc)
         return {"launched": False, "reason": "invalid_event", "error": str(exc)}
 
+    dispatch_run_id = str(event.get("dispatch_run_id") or "")
+
     logger.info(
         "ci-watch trigger: repo=%s sha=%s run_id=%s workflow=%s branch=%s is_drill=%s",
         repo, sha, run_id, workflow, branch, is_drill,
     )
     return _launch_ci_watch_spot(repo, sha, run_id, run_url, workflow, branch,
                                  is_drill=is_drill, model=model,
-                                 dispatch_run_id=str(event.get("dispatch_run_id") or ""))
+                                 dispatch_run_id=dispatch_run_id)
