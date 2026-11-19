@@ -1520,7 +1520,7 @@ def _unpublished_fields(payloads: list[dict]) -> frozenset:
     )
 
 
-def _alt_entry_from_payload(ticker_data: dict) -> dict:
+def _alt_entry_from_payload(ticker_data: dict) -> dict[str, dict[str, object]]:
     """Project one raw per-ticker alt payload onto the feature-store shape.
 
     ``or {}`` rather than ``.get(k, {})`` throughout: a sub-section that is
@@ -1543,7 +1543,7 @@ def _alt_entry_from_payload(ticker_data: dict) -> dict:
     surprise = eps.get("surprise_pct")
     if surprise is None:
         surprises = consensus.get("earnings_surprises") or []
-        surprise = surprises[0].get("surprise_pct") if surprises else 0.0
+        surprise = surprises[0].get("surprise_pct") if surprises else None
     # registry.py documents earnings_surprise_pct as "decimal pct (_pct
     # suffix)" (e.g. 0.01 for 1%), but the producer's surprise_pct is a
     # percent-point number (AAPL 2026-06-30: actual=1.91 vs
@@ -1556,13 +1556,12 @@ def _alt_entry_from_payload(ticker_data: dict) -> dict:
             "surprise_pct": surprise,
             # None, never 0.0, when absent: 0.0 reads as "reported today" and
             # was every ticker's value until the producer wrote the field
-            # (alpha-engine-config-I13143). feature_engineer defaults None
-            # to 90 days.
+            # (alpha-engine-config-I13143).
             "days_since_earnings": eps.get("days_since_earnings"),
         },
         "revisions": {
-            "eps_revision_4w": eps.get("revision_4w", 0.0),
-            "revision_streak": eps.get("streak", 0),
+            "eps_revision_4w": eps.get("revision_4w"),
+            "revision_streak": eps.get("streak"),
         },
         "options": {
             "put_call_ratio": options.get("put_call_ratio"),
@@ -1937,10 +1936,6 @@ def build_feature_frame(
                     # documented contract — instead of manufacturing one.
                     row[f] = float("nan")
                 else:
-                    # The remaining groups retain their established fallbacks:
-                    # technical/macro inputs come from the required price
-                    # series, while fundamental defaults are deliberately
-                    # supplied by its collector and are not missing sentinels.
                     row[f] = 0.0
             if not has_alt:
                 _mark_alternative_missing(row)

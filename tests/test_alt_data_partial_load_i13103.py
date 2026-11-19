@@ -17,14 +17,13 @@ from __future__ import annotations
 
 import io
 import math
-from typing import Any
 
 import numpy as np
 import pandas as pd
 import pytest
 
 from features import compute
-from features.writer import write_feature_snapshot
+from features.writer import snapshot_group_frames
 from tests.test_alt_data_read_coverage import FakeS3, _universe as _alt_universe
 
 _END = pd.Timestamp("2026-09-24")
@@ -54,7 +53,11 @@ def _entry(i: int) -> dict:
     }
 
 
-def _patch(monkeypatch: pytest.MonkeyPatch, tickers: list[str], alt: Any) -> None:
+def _patch(
+    monkeypatch: pytest.MonkeyPatch,
+    tickers: list[str],
+    alt: compute.AlternativeLoad,
+) -> None:
     spy = _stock(300, seed=999)
     price_data = {t: _stock(300, seed=i) for i, t in enumerate(tickers)}
     price_data["SPY"] = spy
@@ -153,41 +156,47 @@ def test_a_full_load_marks_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
     assert build.features_df[list(compute.ALTERNATIVE_FEATURES)].notna().all().all()
 
 
-def test_partial_payload_writes_nan_but_preserves_genuine_zero(
+def test_present_payload_preserves_missing_alternatives_and_genuine_zero(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Missing fields within a loaded payload stay distinct from real zeros."""
-    alt = _alt_load(TICKERS, short=False)
-    alt["AAA"] = {
-        "earnings": {"surprise_pct": 0.0},
-        "revisions": {"eps_revision_4w": 0.0, "revision_streak": 0.0},
-        "options": {"put_call_ratio": 0.0},
-    }
-    _patch(monkeypatch, TICKERS, alt)
+    """A present ticker payload can itself omit fields; absence is not zero."""
+    missing = compute._alt_entry_from_payload({})
+    genuine_zero = compute._alt_entry_from_payload({
+        "eps_revision": {"surprise_pct": 0.0, "revision_4w": 0.0, "streak": 0},
+        "options_flow": {"put_call_ratio": 0.0, "expected_move_pct": 0.0},
+    })
+    assert missing["earnings"]["surprise_pct"] is None
+    assert missing["revisions"]["eps_revision_4w"] is None
+    assert genuine_zero["earnings"]["surprise_pct"] == 0.0
+    assert genuine_zero["revisions"]["eps_revision_4w"] == 0.0
+
+    alt = compute.AlternativeLoad({
+        "AAA": {
+            "earnings": {"surprise_pct": 0.0},
+            "revisions": {"eps_revision_4w": 0.0, "revision_streak": 0.0},
+            "options": {"put_call_ratio": 0.0, "atm_iv": 0.0},
+        },
+    })
+    _patch(monkeypatch, ["AAA"], alt)
 
     build = compute.build_feature_frame(_END.date().isoformat(), "test-bucket", s3=None)
+    assert build.features_df is not None
+    row = build.features_df.set_index("ticker").loc["AAA"]
+    assert row["earnings_surprise_pct"] == 0.0
+    assert row["eps_revision_4w"] == 0.0
+    assert row["revision_streak"] == 0.0
+    assert row["put_call_ratio"] == 0.0
+    assert row["iv_vs_rv"] == 0.0
+    assert math.isnan(row["days_since_earnings"])
+    assert math.isnan(row["iv_rank"])
 
-    class _S3:
-        body: bytes
-
-        def put_object(self, **kwargs: Any) -> None:
-            if kwargs["Key"].endswith("/alternative.parquet"):
-                self.body = kwargs["Body"]
-
-    s3 = _S3()
-    write_feature_snapshot(
-        _END.date().isoformat(), build.features_df, "test-bucket", s3_client=s3
-    )
-    written = pd.read_parquet(io.BytesIO(s3.body)).set_index("ticker")
-
-    genuine_zeros = (
-        "earnings_surprise_pct", "eps_revision_4w", "revision_streak", "put_call_ratio",
-    )
-    for feature in genuine_zeros:
-        assert written.loc["AAA", feature] == 0.0
-    for feature in ("days_since_earnings", "iv_rank", "iv_vs_rv"):
-        assert math.isnan(written.loc["AAA", feature])
+    _, body = snapshot_group_frames(
+        _END.date().isoformat(), build.features_df,
+    )["alternative"]
+    written = pd.read_parquet(io.BytesIO(body), engine="pyarrow").set_index("ticker")
     assert list(written.columns) == ["date", *compute.ALTERNATIVE_FEATURES]
+    assert written.loc["AAA", "put_call_ratio"] == 0.0
+    assert math.isnan(written.loc["AAA", "iv_rank"])
 
 
 @pytest.mark.parametrize(
@@ -199,7 +208,9 @@ def test_partial_payload_writes_nan_but_preserves_genuine_zero(
     ],
 )
 def test_the_loader_reports_a_short_load(
-    unreadable: int, manifest_short: bool, short: bool,
+    unreadable: int,
+    manifest_short: bool,
+    short: bool,
 ) -> None:
     tickers = _alt_universe(20)
     s3 = FakeS3(
