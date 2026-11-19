@@ -9984,7 +9984,80 @@
           "Next": "CheckRunSlotHeldBeforeVacuousRun"
         }
       ],
+      "Default": "CheckExecutionScope"
+    },
+    "CheckExecutionScope": {
+      "Type": "Choice",
+      "Comment": "alpha-engine-config-I13864: route on THIS execution's RunScope verdict, never the cycle-level merged artifact. A recovery that skips producers remains partial even when an earlier execution completed them.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.run_scope_result.Payload.execution_scope_verdict",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.run_scope_result.Payload.execution_scope_verdict",
+              "StringEquals": "partial"
+            }
+          ],
+          "Next": "CheckRunSlotHeldBeforePartialScopeRun"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.run_scope_result.Payload.execution_scope_verdict",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.run_scope_result.Payload.execution_scope_verdict",
+              "StringEquals": "unavailable"
+            }
+          ],
+          "Next": "CheckRunSlotHeldBeforeExecutionScopeUnavailable"
+        }
+      ],
       "Default": "CheckWeeklyCoverageSweepOutcome"
+    },
+    "CheckRunSlotHeldBeforePartialScopeRun": {
+      "Type": "Choice",
+      "Comment": "Release this execution's run-slot before the partial-scope Fail terminal (alpha-engine-config-I13864).",
+      "Choices": [{"Variable": "$.mutex_result", "IsPresent": true, "Next": "ReleaseRunSlotBeforePartialScopeRun"}],
+      "Default": "PartialScopeRun"
+    },
+    "ReleaseRunSlotBeforePartialScopeRun": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:dynamodb:deleteItem",
+      "Parameters": {"TableName": "alpha-engine-sf-execution-mutex", "Key": {"mutex_key": {"S.$": "States.Format('{}#{}#{}', $$.StateMachine.Name, $.pipeline_role, $.run_date)"}}, "ConditionExpression": "execution_arn = :me", "ExpressionAttributeValues": {":me": {"S.$": "$$.Execution.Id"}}},
+      "TimeoutSeconds": 30,
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.run_slot_release_error", "Next": "PartialScopeRun"}],
+      "ResultPath": "$.run_slot_release",
+      "Next": "PartialScopeRun"
+    },
+    "CheckRunSlotHeldBeforeExecutionScopeUnavailable": {
+      "Type": "Choice",
+      "Comment": "Release this execution's run-slot before the unavailable-scope Fail terminal (alpha-engine-config-I13864).",
+      "Choices": [{"Variable": "$.mutex_result", "IsPresent": true, "Next": "ReleaseRunSlotBeforeExecutionScopeUnavailable"}],
+      "Default": "ExecutionScopeUnavailable"
+    },
+    "ReleaseRunSlotBeforeExecutionScopeUnavailable": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:dynamodb:deleteItem",
+      "Parameters": {"TableName": "alpha-engine-sf-execution-mutex", "Key": {"mutex_key": {"S.$": "States.Format('{}#{}#{}', $$.StateMachine.Name, $.pipeline_role, $.run_date)"}}, "ConditionExpression": "execution_arn = :me", "ExpressionAttributeValues": {":me": {"S.$": "$$.Execution.Id"}}},
+      "TimeoutSeconds": 30,
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.run_slot_release_error", "Next": "ExecutionScopeUnavailable"}],
+      "ResultPath": "$.run_slot_release",
+      "Next": "ExecutionScopeUnavailable"
+    },
+    "PartialScopeRun": {
+      "Type": "Fail",
+      "Error": "PartialScopeRun",
+      "CausePath": "States.Format('Weekly freshness pipeline PARTIAL SCOPE - this execution skipped declared producers and cannot report SUCCEEDED (alpha-engine-config-I13864). Run date: {}. Skipped producers: {}.', $.run_date, States.JsonToString($.run_scope_result.Payload.skipped_producers))"
+    },
+    "ExecutionScopeUnavailable": {
+      "Type": "Fail",
+      "Error": "ExecutionScopeUnavailable",
+      "CausePath": "States.Format('Weekly freshness pipeline execution scope was unavailable and cannot report SUCCEEDED (alpha-engine-config-I13864). Run date: {}.', $.run_date)"
     },
     "CheckRunSlotHeldBeforeVacuousRun": {
       "Type": "Choice",

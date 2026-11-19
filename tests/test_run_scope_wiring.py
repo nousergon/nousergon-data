@@ -1,3 +1,4 @@
+# ruff: noqa: ANN001, ANN003, ANN201, ANN202, ANN204
 """RunScope's wiring into the weekly SF (alpha-engine-config-I7620).
 
 The Lambda's own derivation is tested in
@@ -209,3 +210,32 @@ def test_the_s3_artifact_remains_the_fallback_not_the_removal(states):
     ).read_text()
     assert "put_object" in handler
     assert "KEY_TEMPLATE.format(run_date=run_date)" in handler
+
+
+def test_partial_and_unavailable_execution_scope_cannot_succeed(states):
+    """The terminal reads RunScope's in-band, execution-local verdict."""
+    assert states["CheckExecutionDidWork"]["Default"] == "CheckExecutionScope"
+    choice = states["CheckExecutionScope"]
+    routes = {
+        next(c["StringEquals"] for c in rule["And"] if "StringEquals" in c):
+        rule["Next"]
+        for rule in choice["Choices"]
+    }
+    assert routes == {
+        "partial": "CheckRunSlotHeldBeforePartialScopeRun",
+        "unavailable": "CheckRunSlotHeldBeforeExecutionScopeUnavailable",
+    }
+    assert states["PartialScopeRun"]["Type"] == "Fail"
+    assert states["PartialScopeRun"]["Error"] == "PartialScopeRun"
+    assert "skipped_producers" in states["PartialScopeRun"]["CausePath"]
+    assert states["ExecutionScopeUnavailable"]["Type"] == "Fail"
+
+
+def test_scope_failure_routes_release_the_run_slot_first(states):
+    for suffix in ("PartialScopeRun", "ExecutionScopeUnavailable"):
+        check = states[f"CheckRunSlotHeldBefore{suffix}"]
+        assert check["Default"] == suffix
+        assert check["Choices"][0]["Next"] == f"ReleaseRunSlotBefore{suffix}"
+        release = states[f"ReleaseRunSlotBefore{suffix}"]
+        assert release["Next"] == suffix
+        assert release["Catch"][0]["Next"] == suffix

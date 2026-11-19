@@ -1,3 +1,4 @@
+# ruff: noqa: ANN001, ANN003, ANN201, ANN202, ANN204
 #!/usr/bin/env python3
 """Mechanical weekly-SF recovery helper (config#2277).
 
@@ -1203,6 +1204,11 @@ class RerunPlan:
     # why" without anyone having to find the terminal that launched it.
     accept_vacuous_reason: str = ""
 
+    # Per-producer explanations retained by Step Functions.  These are
+    # generated from the recovery plan rather than supplied as one blanket
+    # acknowledgement: every skipped producer remains individually auditable.
+    skipped_producer_reasons: dict[str, str] = field(default_factory=dict)
+
     # alpha-engine-config-I12228: the cycle's collection-readiness anchor (an
     # RFC3339 instant), emitted as ``collection_not_before``. See
     # ``cycle_collection_anchor``. Empty = not derivable; the key is then left
@@ -1273,6 +1279,8 @@ class RerunPlan:
         out.update(self.skip_flags)
         if self.accept_vacuous_reason:
             out["vacuous_rerun_accepted_reason"] = self.accept_vacuous_reason
+        if self.skipped_producer_reasons:
+            out["skipped_producer_reasons"] = self.skipped_producer_reasons
         if self.collection_not_before:
             out["collection_not_before"] = self.collection_not_before
         return out
@@ -2429,6 +2437,10 @@ def main(argv: list | None = None) -> int:
             "(alpha-engine-config-I11075)."
         )
     enterable = enabled_spine_stages(sm_def, plan.rerun_input(), spine)
+    plan.skipped_producer_reasons = {
+        stage: f"{stage} was already completed by the source execution"
+        for stage in spine if stage not in enterable
+    }
     if enterable:
         plan.notes.append(
             "spine stages this input can still enter: " + ", ".join(enterable)

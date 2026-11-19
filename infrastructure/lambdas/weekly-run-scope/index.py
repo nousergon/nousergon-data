@@ -1,3 +1,5 @@
+# ruff: noqa: ANN001, ANN003, ANN201, ANN202, ANN204
+# pyright: reportExplicitAny=false, reportUnknownVariableType=false, reportUnknownMemberType=false, reportUnknownArgumentType=false
 """alpha-engine-weekly-run-scope — the weekly pipeline's own scope, derived.
 
 Tracked as ``alpha-engine-config-I7620``.
@@ -60,6 +62,7 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
+from typing import Any
 
 import boto3
 from krepis.dates import resolve_trading_day
@@ -217,7 +220,7 @@ def _read_incumbent(s3, key: str) -> tuple[dict | None, str | None, bool, str]:
         return None, None, False, f"incumbent unreadable: {code}"
 
 
-def _persist(scope: dict, key: str) -> dict:
+def _persist(scope: dict[str, Any], key: str) -> dict[str, Any]:
     """Accumulate this execution's scope onto the cycle's, and store it.
 
     alpha-engine-config-I8811. The write is CONDITIONAL in both directions:
@@ -357,7 +360,7 @@ def _assert_stage_coverage(
             os.environ["RUN_TOKEN"] = previous
 
 
-def handler(event, _context):
+def handler(event: dict[str, Any], _context: Any) -> dict[str, Any]:
     # Captured at handler ENTRY, before any write this invocation makes
     # (alpha-engine-config-I7214).
     _stage_coverage_started = datetime.now(timezone.utc)
@@ -366,8 +369,9 @@ def handler(event, _context):
     rehearsal = rehearsal_execution(execution_arn)
     state_machine_arn = event.get("state_machine_arn") or ""
     dry_run = bool(event.get("dry_run"))
+    execution_input: dict[str, Any] = event.get("execution_input") or {}
     flags = {
-        key: value for key, value in (event.get("execution_input") or {}).items()
+        key: value for key, value in execution_input.items()
         if key.startswith(_FLAG_PREFIX)
     }
     # Established before the try so the except branch always has a value to
@@ -404,6 +408,11 @@ def handler(event, _context):
             state_machine_arn=state_machine_arn,
             input_flags=flags,
         )
+        reasons: dict[str, str] = execution_input.get("skipped_producer_reasons") or {}
+        scope["skipped_producer_reasons"] = {
+            producer: reasons.get(producer, "")
+            for producer in scope["skipped_producers"]
+        }
         # Both dates ride along: `run_date` stays the resolved trading day (the
         # consumer's existing contract, unchanged), and the raw calendar date
         # the execution actually started on is named explicitly so a reader can
@@ -420,6 +429,7 @@ def handler(event, _context):
             state_machine_arn=state_machine_arn,
         )
         scope["degraded"] = True
+        scope["execution_scope_verdict"] = "unavailable"
         scope["degraded_reason"] = f"{type(exc).__name__}: {exc}"
         scope["calendar_run_date"] = calendar_run_date
         scope["statement"] = (
@@ -467,8 +477,17 @@ def handler(event, _context):
         )
         return scope
 
-    written = _persist(scope, scope_key(run_date, rehearsal))
-    written["stage_coverage"] = _assert_stage_coverage(
+    persisted = _persist(scope, scope_key(run_date, rehearsal))
+    # `_persist` merges the cycle-level artifact.  Return THIS execution's
+    # observation in-band: returning `persisted` let an earlier complete run
+    # conceal a recovery's skipped producers from terminal routing (I13864).
+    scope["persistence"] = {
+        "key": scope_key(run_date, rehearsal),
+        "merged": bool((persisted.get("scope_merge") or {}).get("merged")),
+    }
+    if "scope_merge" in persisted:
+        scope["scope_merge"] = persisted["scope_merge"]
+    scope["stage_coverage"] = _assert_stage_coverage(
         "RunScope", _stage_coverage_started, run_date, rehearsal
     )
-    return written
+    return scope

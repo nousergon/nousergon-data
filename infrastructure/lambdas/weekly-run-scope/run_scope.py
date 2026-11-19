@@ -1,3 +1,5 @@
+# ruff: noqa: ANN001, ANN003, ANN201, ANN202, ANN204
+# pyright: reportExplicitAny=false, reportUnknownVariableType=false, reportUnknownMemberType=false, reportUnknownArgumentType=false
 """Derive the weekly pipeline's own run scope from its definition + execution.
 
 Tracked as ``alpha-engine-config-I7620``.
@@ -972,7 +974,7 @@ def branch_outcome(
     hist: _History,
     work_state: str,
     stops: Iterable[str],
-) -> dict:
+) -> dict[str, Any]:
     """The selected branch's end-to-end result, from its own event chain.
 
     Starts at the LAST entry of ``work_state`` (a relaunched stage is judged by
@@ -1095,8 +1097,8 @@ def build_run_scope(
         key=lambda pair: (len(pair[0]), pair[1]),
     )
 
-    stages: dict[str, dict] = {}
-    after_scope: dict[str, dict] = {}
+    stages: dict[str, dict[str, Any]] = {}
+    after_scope: dict[str, dict[str, Any]] = {}
     for name, gate in sorted(gates.items()):
         decision = decisions.get(name)
         if decision is None and name in ahead:
@@ -1301,6 +1303,28 @@ def build_run_scope(
         counts[row["disposition"]] += 1
     graded = sorted(k for k, v in stages.items() if v["disposition"] in GRADED_DISPOSITIONS)
 
+    skipped = sorted(
+        name for name, row in stages.items() if row["disposition"] == DISABLED
+    )
+    skipped.extend(
+        sorted(
+            name for name, row in after_scope.items()
+            if row.get("input_flag") is True
+        )
+    )
+    unavailable = any(
+        row["disposition"] == NOT_REACHED for row in stages.values()
+    )
+    ran = counts[ENABLED_COMPLETED] + counts[ENABLED_FAILED]
+    if skipped and ran == 0:
+        execution_scope_verdict = "vacuous"
+    elif skipped:
+        execution_scope_verdict = "partial"
+    elif unavailable:
+        execution_scope_verdict = "unavailable"
+    else:
+        execution_scope_verdict = "complete"
+
     return {
         "schema": SCHEMA,
         "schema_version": SCHEMA_VERSION,
@@ -1311,6 +1335,11 @@ def build_run_scope(
         "graded_stages": graded,
         "counts": counts,
         "after_scope": after_scope,
+        # This is deliberately execution-local.  The cycle artifact is merged
+        # across recoveries, but an earlier execution completing a producer
+        # must never turn this execution's skip into a clean terminal.
+        "execution_scope_verdict": execution_scope_verdict,
+        "skipped_producers": skipped,
         "statement": _statement(counts, len(stages), after_scope),
     }
 

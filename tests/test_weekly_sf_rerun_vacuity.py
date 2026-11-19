@@ -1,3 +1,4 @@
+# ruff: noqa: ANN001, ANN003, ANN201, ANN202, ANN204
 """The skip-to-green refusal: `weekly_sf_rerun.py --start` must not dispatch a
 rerun that can enter no substantive stage (alpha-engine-config-I11075, the
 pre-flight half of I9693 deliverable 3).
@@ -136,6 +137,21 @@ def test_the_accepted_reason_rides_into_the_execution_input(mod):
     emitted = plan.rerun_input()
     assert emitted["vacuous_rerun_accepted_reason"] == (
         "completion marker re-stamp, nothing else to run"
+    )
+
+
+def test_skipped_producer_reasons_ride_into_the_execution_input(mod):
+    plan = mod.RerunPlan(
+        run_date="2026-09-18",
+        run_date_provenance="test",
+        original_input={},
+    )
+    plan.skipped_producer_reasons = {
+        "Backtester": "Backtester was completed by the source execution",
+        "Director": "Director was completed by the source execution",
+    }
+    assert plan.rerun_input()["skipped_producer_reasons"] == (
+        plan.skipped_producer_reasons
     )
 
 
