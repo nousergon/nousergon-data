@@ -791,6 +791,7 @@ STAGES: tuple[Stage, ...] = (
         degraded_witness=frozenset({
             "PublishDirectorDegraded", "DirectorSubStatusDegraded",
             "SetDirectorSubStatusDegradedSummary",
+            "PublishDirectorSubStatusDegraded",
             "RecordDirectorDegraded", "RecordDirectorDegradedRetroRefused",
         }),
     ),

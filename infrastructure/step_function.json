@@ -9501,6 +9501,29 @@
         "reasons.$": "States.JsonMerge($.degraded_summary.reasons, States.StringToJson('{\"director\":\"weekly_director_substatus_degraded\"}'), false)"
       },
       "ResultPath": "$.degraded_summary",
+      "Next": "PublishDirectorSubStatusDegraded"
+    },
+    "PublishDirectorSubStatusDegraded": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I11322: named alert on the Director sub-status degraded path, mirroring PublishAggregateCostsDegraded. The hardcoded Subject and Message follow config#1819: Director output is model-authored and must never be interpolated into an alert. The Message deliberately does not name a cause because any errored or unclassified Director leg reaches this state and this state cannot distinguish them.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Weekly Pipeline — Director WARNING (one or more Director legs degraded)",
+        "Message": "Director completed with one or more degraded sub-results. See $.director_result.Payload.degraded_sub_results on the execution record for detail. The alert does not name a cause because this path covers any errored or unclassified Director leg. The run therefore terminates DEGRADED. View pipeline status: https://dashboard.nousergon.ai/pipeline-status",
+        "MessageAttributes": {}
+      },
+      "ResultPath": "$.director_degraded_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Best-effort alert — a publish failure must not block the non-fatal path this alert decorates. $.degraded_summary and $.director_degraded are already set, so the run still terminates DEGRADED.",
+          "ResultPath": "$.director_degraded_notify_error",
+          "Next": "DirectorComplete"
+        }
+      ],
       "Next": "DirectorComplete"
     },
     "DirectorComplete": {

@@ -140,7 +140,9 @@ def test_the_summary_chain_reaches_the_terminal_the_same_way_its_siblings_do(sta
     """I6891's Option-A chokepoint: a fail-open route added later inherits the
     honest terminal by writing ``$.degraded_summary`` and touching
     ``CheckDegradedOutcome`` not at all."""
-    summary = assert_degraded_continuation(states, _SETTER, "DirectorComplete")
+    summary = assert_degraded_continuation(
+        states, _SETTER, "PublishDirectorSubStatusDegraded"
+    )
     params = states[summary]["Parameters"]
     assert params["degraded"] is True
     assert params["reason"] == "weekly_director_substatus_degraded"
@@ -157,32 +159,26 @@ def test_the_degraded_path_converges_on_director_complete(states):
     """Both routes descend from Director's ONE success edge, which is the
     property the rerun deriver's witness asserts. A Director that degraded
     still wrote its plan and must not be re-run."""
-    assert states["Set" + _SETTER + "Summary"]["Next"] == "DirectorComplete"
+    assert states["Set" + _SETTER + "Summary"]["Next"] == "PublishDirectorSubStatusDegraded"
     assert states[_CHOICE]["Default"] == "DirectorComplete"
     assert states["DirectorComplete"]["Next"] == "CheckSkipScannerLeaderboard"
 
 
-def test_there_is_no_named_sns_alert_for_this_family_yet(states):
-    """A deliberate, tracked staging — not an oversight.
-
-    ``PublishAggregateCostsDegraded``'s shape (alpha-engine-config-I8336) is
-    the right one for this family too: registered LAST in
-    ``CheckGateDegradedNotify``, ``$.director_degraded`` folds into
-    ``NotifyCompleteMultipleDegraded``, which deliberately names no specific
-    family, so the operator reads "two or more families degraded, check the
-    execution record". The named alert is a new SUBSTANTIVE Task state, and
-    ``tests/test_pipeline_status_registry_source_check.py`` requires every one
-    of those to carry a ``nousergon_lib.pipeline_status.registry`` entry
-    merged and PINNED in the same PR — a three-repo lockstep against a
-    merge-time-autobumped lib version, which cannot be sequenced inside the
-    2026-09-26 window this change is for. The honest terminal, the family
-    flag and the named ``degraded_summary.reasons.director`` entry all land
-    here and are what I11299's Closes-when asks for; the alert is the
-    refinement. This test exists so adding it later is a deliberate act with
-    a red line to delete, not a silent widening. Tracked:
-    ``alpha-engine-config-I11322``.
-    """
-    assert "PublishDirectorSubStatusDegraded" not in states
+def test_the_named_alert_is_hardcoded_and_best_effort(states):
+    publish = states["PublishDirectorSubStatusDegraded"]
+    assert publish["Type"] == "Task"
+    assert publish["Resource"] == "arn:aws:states:::sns:publish"
+    assert publish["Parameters"]["TopicArn.$"] == "$.sns_topic_arn"
+    assert publish["ResultPath"] == "$.director_degraded_notify"
+    assert "Subject" in publish["Parameters"]
+    assert "Subject.$" not in publish["Parameters"]
+    assert "Director" in publish["Parameters"]["Subject"]
+    assert "Message" in publish["Parameters"]
+    assert "Message.$" not in publish["Parameters"]
+    assert "$.director_result.Payload.degraded_sub_results" in publish["Parameters"]["Message"]
+    assert publish["Next"] == "DirectorComplete"
+    assert publish["Catch"][0]["ErrorEquals"] == ["States.ALL"]
+    assert publish["Catch"][0]["Next"] == "DirectorComplete"
 
 
 # ---------------------------------------------------------------------------
