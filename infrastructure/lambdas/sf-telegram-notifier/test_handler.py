@@ -5,13 +5,19 @@ Telegram API. Each test asserts the exact (text, disable_notification) tuple
 the handler hands to the primitive, plus the return value shape.
 """
 
+# Test fixtures intentionally use pytest's dynamically typed monkeypatch and
+# MagicMock APIs throughout this module.
+# ruff: noqa: ANN001, ANN002, ANN003, ANN201, ANN202, ANN204, ANN205, ANN206
+
 from __future__ import annotations
 
 import io
 import json
 import sys
 import types
+from enum import Enum
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -44,9 +50,52 @@ _fleet_mod.PIPELINE_OBSERVER_TELEGRAM_TOPICS = (
     _FleetTelegramTopic.OPS_HEALTH,
 )
 _lib_pkg.flow_doctor_fleet = _fleet_mod
+_pipeline_status_mod = types.ModuleType("nousergon_lib.pipeline_status")
+
+
+class _RunStatus(str, Enum):
+    RUNNING = "RUNNING"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    TIMED_OUT = "TIMED_OUT"
+    ABORTED = "ABORTED"
+
+
+class _WorkVerdict(str, Enum):
+    COMPLETED = "completed"
+    SKIPPED = "skipped"
+    INCOMPLETE = "incomplete"
+
+
+def _classify_work(*, entered_states: list[str], **_kwargs: object) -> SimpleNamespace:
+    verdict = (
+        _WorkVerdict.SKIPPED
+        if entered_states and entered_states[-1] == "WeeklyRunDaySkip"
+        else _WorkVerdict.COMPLETED
+    )
+    return SimpleNamespace(verdict=verdict)
+
+
+def _entered_states_from_history(events: list[dict[str, object]]) -> list[str]:
+    typed_events = events  # The production helper accepts AWS history mappings.
+    return [
+        str(details["name"])
+        for event in typed_events
+        if isinstance((details := event.get("stateEnteredEventDetails")), dict)
+        and details.get("name")
+    ]
+
+
+_pipeline_status_mod.RunStatus = _RunStatus
+_pipeline_status_mod.WorkOutcome = object
+_pipeline_status_mod.WorkVerdict = _WorkVerdict
+_pipeline_status_mod.classify_work = _classify_work
+_pipeline_status_mod.entered_states_from_history = _entered_states_from_history
+_lib_pkg.pipeline_status = _pipeline_status_mod
 sys.modules["nousergon_lib"] = _lib_pkg
 sys.modules["nousergon_lib.telegram"] = _telegram_mod
 sys.modules["nousergon_lib.flow_doctor_fleet"] = _fleet_mod
+sys.modules["nousergon_lib.pipeline_status"] = _pipeline_status_mod
 
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -194,6 +243,40 @@ def test_succeeded_long_duration_formats_hours_and_minutes():
     index.handler(event, None)
     text = _telegram_mod.send_message.call_args.args[0]
     assert "Duration: 4h 12m" in text
+
+
+def test_short_completed_weekly_run_retains_success_headline(reset_send_message) -> None:
+    reset_send_message.get_execution_history.return_value = {
+        "events": [{"stateEnteredEventDetails": {"name": "WaitForRAGIngestion"}}]
+    }
+    index.handler(_event("SUCCEEDED", stopDate=1_700_000_003_000), None)
+
+    text = _telegram_mod.send_message.call_args.args[0]
+    assert "✅ *Weekly Freshness SF — SUCCEEDED*" in text
+    assert "SKIPPED" not in text
+
+
+def test_long_declared_weekly_gate_out_has_skipped_headline(reset_send_message) -> None:
+    reset_send_message.get_execution_history.return_value = {
+        "events": [
+            {"stateEnteredEventDetails": {"name": "InitializeInput"}},
+            {"stateEnteredEventDetails": {"name": "WeeklyRunDaySkip"}},
+        ]
+    }
+    index.handler(_event("SUCCEEDED", stopDate=1_700_000_900_000), None)
+
+    text = _telegram_mod.send_message.call_args.args[0]
+    assert "⏭️ *Weekly Freshness SF — SKIPPED — not a run day*" in text
+    assert "✅ *Weekly Freshness SF — SUCCEEDED*" not in text
+
+
+def test_unavailable_weekly_history_does_not_claim_skip(reset_send_message) -> None:
+    reset_send_message.get_execution_history.side_effect = RuntimeError("history unavailable")
+    index.handler(_event("SUCCEEDED"), None)
+
+    text = _telegram_mod.send_message.call_args.args[0]
+    assert "✅ *Weekly Freshness SF — SUCCEEDED*" in text
+    assert "SKIPPED" not in text
 
 
 def test_failed_fetches_and_includes_cause(reset_send_message):
