@@ -424,6 +424,41 @@ pip install --upgrade pip -q || fail "pip upgrade failed"
 if [ -f requirements.txt ]; then
   pip install -q -r requirements.txt || fail "dashboard requirements install failed"
 fi
+# Runtime backstop for the ssm_log_capture --correlation-id capability. Keep
+# this floor here, at the one per-boot venv-build chokepoint, rather than in
+# each Step Function command list.
+.venv/bin/python - requirements.txt <<'PY' || fail "dashboard krepis floor assertion failed"
+from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
+import re
+import sys
+
+required = (0, 18, 8)
+required_text = ".".join(str(part) for part in required)
+requirements_path = Path(sys.argv[1])
+pin_match = re.search(
+    r"(?m)^krepis==([^;\\s]+)",
+    requirements_path.read_text(encoding="utf-8") if requirements_path.is_file() else "",
+)
+pin = pin_match.group(1) if pin_match else "<not found>"
+try:
+    installed = version("krepis")
+except PackageNotFoundError:
+    installed = "<absent>"
+
+match = re.fullmatch(r"([0-9]+)\\.([0-9]+)\\.([0-9]+)(.*)", installed)
+release = tuple(int(part) for part in match.groups()[:3]) if match else None
+suffix = match.group(4) if match else ""
+if release is None or release < required or (release == required and suffix):
+    print(
+        "[weekly-freshness-spot-bootstrap] FATAL: "
+        f"installed krepis={{installed}}; required floor={{required_text}}; "
+        f"alpha-engine-dashboard/requirements.txt pin={{pin}}; "
+        "the dashboard venv is built per-boot from that file",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+PY
 # numpy<2 pin to match every other spot workload (pyarrow compiled against 1.x).
 pip install -q 'numpy<2' || fail "numpy pin failed"
 chown -R ec2-user:ec2-user /home/ec2-user/alpha-engine-dashboard/.venv || fail "venv chown failed"
@@ -532,7 +567,9 @@ def _terminate_instance(instance_id: str) -> None:
     spot_dispatch.terminate_on_failure(instance_id, region=REGION, label="weekly-freshness")
 
 
-def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
+def handler(
+    event: dict[str, object], context: object
+) -> dict[str, object]:  # noqa: ARG001 — Lambda contract
     """Step Function handler — launch the weekly pipeline's launcher spot box.
 
     `event` carries `{"force_on_demand": bool}` (defaults False). BOTH SF

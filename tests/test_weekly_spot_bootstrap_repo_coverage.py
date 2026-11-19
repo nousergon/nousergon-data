@@ -29,6 +29,8 @@ from __future__ import annotations
 import json
 import importlib.util
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -50,7 +52,7 @@ def _repos_the_sf_uses() -> set[str]:
     doc = json.loads(_SF_JSON.read_text(encoding="utf-8"))
     found: set[str] = set()
 
-    def walk(node) -> None:
+    def walk(node: object) -> None:
         if isinstance(node, dict):
             for key, val in node.items():
                 if key == "commands.$" and isinstance(val, str):
@@ -97,12 +99,90 @@ def _repos_the_bootstrap_clones() -> set[str]:
     }
 
 
-def test_sf_references_at_least_one_repo():
+def _krepis_floor_assertion() -> str:
+    """Extract the self-contained Python assertion from the rendered shell."""
+    match = re.search(
+        r"\.venv/bin/python - requirements\.txt <<'PY'.*?\n(.*?)\nPY\n",
+        _bootstrap_script(),
+        re.S,
+    )
+    assert match, "bootstrap has no dashboard krepis floor assertion"
+    return match.group(1)
+
+
+def _run_krepis_floor_assertion(tmp_path: Path, installed: str | None) -> subprocess.CompletedProcess[str]:
+    """Run the assertion with isolated package metadata and no network."""
+    packages = tmp_path / "packages"
+    packages.mkdir()
+    if installed is not None:
+        dist_info = packages / f"krepis-{installed}.dist-info"
+        dist_info.mkdir()
+        (dist_info / "METADATA").write_text(
+            f"Metadata-Version: 2.1\nName: krepis\nVersion: {installed}\n",
+            encoding="utf-8",
+        )
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("krepis==0.19.0\n", encoding="utf-8")
+    return subprocess.run(
+        [sys.executable, "-S", "-", str(requirements)],
+        input=_krepis_floor_assertion(),
+        text=True,
+        capture_output=True,
+        env={"PYTHONPATH": str(packages)},
+        check=False,
+    )
+
+
+def test_krepis_floor_assertion_accepts_a_satisfying_install(tmp_path: Path) -> None:
+    result = _run_krepis_floor_assertion(tmp_path, "0.18.8")
+    assert result.returncode == 0, result.stderr
+
+
+def test_krepis_floor_assertion_fails_loudly_for_old_or_missing_install(
+    tmp_path: Path,
+) -> None:
+    for installed, reported in (("0.18.7", "0.18.7"), (None, "<absent>")):
+        case_path = tmp_path / (installed or "missing")
+        case_path.mkdir()
+        result = _run_krepis_floor_assertion(case_path, installed)
+        assert result.returncode != 0
+        assert (
+            f"installed krepis={reported}; required floor=0.18.8; "
+            "alpha-engine-dashboard/requirements.txt pin=0.19.0; "
+            "the dashboard venv is built per-boot from that file"
+        ) in result.stderr
+
+
+def test_sf_commands_do_not_install_packages_at_runtime() -> None:
+    """The floor check must not revive per-state runtime pip installs."""
+    for name in ("step_function.json", "step_function_eod.json"):
+        definition = json.loads((_REPO_ROOT / "infrastructure" / name).read_text())
+        commands: list[str] = []
+
+        def walk(node: object) -> None:
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    if key in {"commands", "commands.$"}:
+                        if isinstance(value, str):
+                            commands.append(value)
+                        elif isinstance(value, list):
+                            commands.extend(str(command) for command in value)
+                    walk(value)
+            elif isinstance(node, list):
+                for value in node:
+                    walk(value)
+
+        walk(definition)
+        rendered = "\n".join(commands)
+        assert not re.search(r"(?:^|\s)(?:python\s+-m\s+)?pip\s+install(?:\s|$)", rendered), name
+
+
+def test_sf_references_at_least_one_repo() -> None:
     """Guard the guard — a broken walker must not silently pass."""
     assert _repos_the_sf_uses(), "no alpha-engine-* checkout paths found in the SF"
 
 
-def test_bootstrap_clones_every_repo_the_sf_uses():
+def test_bootstrap_clones_every_repo_the_sf_uses() -> None:
     used = _repos_the_sf_uses()
     cloned = _repos_the_bootstrap_clones()
     missing = used - cloned
@@ -117,7 +197,7 @@ def test_bootstrap_clones_every_repo_the_sf_uses():
     )
 
 
-def test_every_cloned_repo_is_chowned_to_ec2_user():
+def test_every_cloned_repo_is_chowned_to_ec2_user() -> None:
     """A clone the box cannot write to is as broken as a missing one.
 
     The bootstrap runs as root; every stage runs as ec2-user and does a
