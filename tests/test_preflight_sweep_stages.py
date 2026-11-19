@@ -21,7 +21,9 @@ import json
 import pathlib
 
 import pytest
+import yaml
 
+from infrastructure.preflight_sweep_console import stage_check_id
 from infrastructure.preflight_sweep_stages import (
     BOX_DIR_TO_REPO,
     LAUNCHER_BOX_INSTANCE_REF,
@@ -48,6 +50,7 @@ from infrastructure.preflight_sweep_stages import (  # noqa: E402 — private he
 REPO = pathlib.Path(__file__).resolve().parent.parent
 SF_PATH = REPO / "infrastructure" / "step_function.json"
 MANIFEST_PATH = REPO / "infrastructure" / "preflight_sweep_manifest.json"
+DESCRIPTOR_PATH = REPO / "registry.d" / "ae-preflight-sweep.yaml"
 CONTEXT = {"Execution": {"Name": "preflight-sweep-test", "Id": "arn:test"}}
 
 
@@ -121,6 +124,16 @@ def test_the_derivation_finds_the_pipeline_s_send_command_stages(stages):
     assert "Backtester" in names
     assert "ResearchPredictorParallel.PredictorTraining" in names
     assert "ParityParallel.ParityReplay" in names
+
+
+def test_the_descriptor_declares_the_generated_stage_id_family(stages):
+    descriptor = yaml.safe_load(DESCRIPTOR_PATH.read_text())
+    assert descriptor["facet_families"] == [{"prefix": "ae-preflight-stage-"}]
+
+    prefix = descriptor["facet_families"][0]["prefix"]
+    generated_ids = {stage_check_id(stage.name) for stage in stages}
+    assert generated_ids
+    assert all(component_id.startswith(prefix) for component_id in generated_ids)
 
 
 def test_every_stage_lands_in_exactly_one_classification(stages):
