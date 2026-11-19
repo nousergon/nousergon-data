@@ -242,4 +242,5 @@ EOF
   cat "${RESP}"
   echo ""
   assert_no_function_error "${INVOKE_STDOUT}" "${RESP}"
+  assert_response_field_equals "${RESP}" statusCode 200
 fi

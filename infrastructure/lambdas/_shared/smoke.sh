@@ -160,3 +160,55 @@ assert_sf_lambda_task_not_failed() {
   echo "   not a crash check on the multi-hour groom, only on the dispatch.)" >&2
   return 0
 }
+
+# Assert a handler-specific response contract after assert_no_function_error.
+# EXPECTED_JSON is parsed as JSON, so callers can distinguish booleans and
+# numbers from strings. Dotted field names address nested response objects.
+assert_response_field_equals() {
+  local resp_file="${1:?assert_response_field_equals: response file required}"
+  local field="${2:?assert_response_field_equals: field required}"
+  local expected_json="${3:?assert_response_field_equals: expected JSON required}"
+
+  python3 - "${resp_file}" "${field}" "${expected_json}" <<'PY'
+import json
+import sys
+
+resp_path, field, expected_json = sys.argv[1:]
+try:
+    with open(resp_path, encoding="utf-8") as response_file:
+        value = json.load(response_file)
+    for part in field.split("."):
+        value = value[part]
+    expected = json.loads(expected_json)
+except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
+    print(f"SMOKE FAILED: response does not satisfy field {field!r}: {exc}", file=sys.stderr)
+    sys.exit(1)
+if value != expected:
+    print(
+        f"SMOKE FAILED: expected response field {field!r} to equal "
+        f"{expected!r}, got {value!r}.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+PY
+}
+
+assert_response_field_present() {
+  local resp_file="${1:?assert_response_field_present: response file required}"
+  local field="${2:?assert_response_field_present: field required}"
+
+  python3 - "${resp_file}" "${field}" <<'PY'
+import json
+import sys
+
+resp_path, field = sys.argv[1:]
+try:
+    with open(resp_path, encoding="utf-8") as response_file:
+        value = json.load(response_file)
+    for part in field.split("."):
+        value = value[part]
+except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
+    print(f"SMOKE FAILED: response does not contain required field {field!r}: {exc}", file=sys.stderr)
+    sys.exit(1)
+PY
+}

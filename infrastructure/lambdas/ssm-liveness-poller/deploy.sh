@@ -189,5 +189,6 @@ if $SMOKE; then
   cat "${RESP}"
   echo ""
   assert_no_function_error "${INVOKE_STDOUT}" "${RESP}"
+  assert_response_field_equals "${RESP}" step "smoke"
   rm -f "${RESP}"
 fi

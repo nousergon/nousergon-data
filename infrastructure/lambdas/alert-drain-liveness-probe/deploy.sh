@@ -268,5 +268,6 @@ if $SMOKE; then
     --payload '{}' --region "${REGION}" "${RESP}")
   cat "${RESP}"; echo ""
   assert_no_function_error "${INVOKE_STDOUT}" "${RESP}"
+  assert_response_field_equals "${RESP}" noop true
   rm -f "${RESP}"
 fi
