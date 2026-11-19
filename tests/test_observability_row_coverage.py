@@ -94,6 +94,14 @@ def test_externally_owned_rows_are_declared_and_exist_in_ops():
         )
 
 
+def test_d39_declaration_uses_the_run_record_component_id():
+    """D39's generated declaration binds the board observation to one id."""
+    unit = next(unit for unit in load_units() if unit.unit_id == "D39")
+    path = REGISTRY_D / f"{unit.component_id}.yaml"
+    row = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert row["component_id"] == unit.component_id
+
+
 def test_all_trigger_kinds_resolve_to_a_substrate():
     """Every trigger.kind in use has a deliberate SUBSTRATE_BY_TRIGGER_KIND entry.
 
