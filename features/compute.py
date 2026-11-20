@@ -1706,9 +1706,10 @@ def _expected_alternative_count(
     try:
         obj = s3.get_object(Bucket=bucket, Key=f"{prefix}manifest.json")
         manifest = json.loads(obj["Body"].read())
-    except Exception as exc:  # noqa: BLE001 — absence is reported by the caller
-        log.debug("Alternative manifest unreadable at %smanifest.json: %s", prefix, exc)
-        return None
+    except Exception as exc:
+        raise AlternativeCoverageError(
+            f"Alternative manifest unreadable at {prefix}manifest.json: {exc}"
+        ) from exc
     value = manifest.get("tickers_succeeded")
     return int(value) if isinstance(value, (int, float)) else None
 

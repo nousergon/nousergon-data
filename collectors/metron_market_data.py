@@ -40,6 +40,8 @@ Entry point: ``python -m collectors.metron_market_data [--date YYYY-MM-DD] [--dr
 
 from __future__ import annotations
 
+# pyright: reportExplicitAny=false
+
 import argparse
 import json
 import logging
@@ -323,9 +325,11 @@ def _record_universe_source(name: str, status: str, count: int, detail: str = ""
 
 
 def _read_metron_universe_holdings(bucket: str, s3_client: Any, key: str) -> list[dict]:
-    """Read one Metron universe artifact's ``holdings`` list. Fail-soft per artifact: a
-    missing object / no creds / parse error contributes nothing (logged) rather than
-    aborting the caller's union.
+    """Read one Metron universe artifact's ``holdings`` list.
+
+    A missing, denied, or malformed secondary universe contributes nothing so the
+    primary market-data artifacts can still publish from the other universe source.
+    The WARNING and ``_UNIVERSE_SOURCES`` entry record the coverage loss.
 
     Under a shadow replay the object is read at the VERSION the replayed day's
     run actually saw, not at whatever is current now
@@ -379,10 +383,11 @@ def _read_metron_universe_holdings(bucket: str, s3_client: Any, key: str) -> lis
         ]
         _record_universe_source(_UNIVERSE_SOURCE_NAMES.get(key, key), "ok", len(rows))
         return rows
-    except Exception as e:  # missing object, no creds, parse error, etc.
-        logger.warning("[metron_market_data] %s unavailable (%s) — no contribution", key, e)
+    except Exception as exc:  # noqa: BLE001 - deliberate coverage degrade, recorded below
+        # Swallows missing/denied/malformed secondary input; WARNING + source status record it.
+        logger.warning("[metron_market_data] %s unavailable (%s) — no contribution", key, exc)
         _record_universe_source(
-            _UNIVERSE_SOURCE_NAMES.get(key, key), "unavailable", 0, type(e).__name__
+            _UNIVERSE_SOURCE_NAMES.get(key, key), "unavailable", 0, type(exc).__name__
         )
         return []
 
@@ -1433,7 +1438,10 @@ def _read_json(s3_client: Any, bucket: str, key: str) -> dict | None:
     try:
         obj = s3_client.get_object(Bucket=bucket, Key=key)
         return json.loads(obj["Body"].read())
-    except Exception:
+    except Exception as exc:  # noqa: BLE001 - deliberate derived-input coverage degrade
+        # Swallows missing/denied/malformed derived input; callers record coverage gaps in
+        # their returned phase result, while the primary fresh-data publish can continue.
+        logger.warning("[metron_market_data] derived input %s unavailable: %s", key, exc)
         return None
 
 
@@ -1563,8 +1571,8 @@ def _grade_cardinality(
     bucket: str,
     run_date: str,
     *,
-    denominator,
-    covered,
+    denominator: Any,
+    covered: Any,
     closes_key: str | None,
     write_failure: str | None = None,
 ) -> dict:
@@ -1668,7 +1676,7 @@ D20_SPINE_WINDOW_SESSIONS = 5
 D20_MAX_BAR_LAG_SESSIONS = 1
 
 
-def _grade_spine_window(s3_client: Any, bucket: str, run_date: str, *, denominator) -> dict:
+def _grade_spine_window(s3_client: Any, bucket: str, run_date: str, *, denominator: Any) -> dict[str, Any]:
     """D20's spine-window reading, as one manifest guard entry (`alpha-engine-config-I10780`).
 
     Reads BACK the last :data:`D20_SPINE_WINDOW_SESSIONS` published
@@ -2734,7 +2742,7 @@ def _news_sentiment(yf_symbols: list[str]) -> dict[str, dict]:
     sub = df[df["ticker"].isin(want)]
     for sym, rows in sub.groupby("ticker"):
         row = rows.sort_values("aggregate_date").iloc[-1]  # most recent date wins
-        def _num(col):
+        def _num(col: str) -> float | None:
             v = row.get(col)
             try:
                 f = float(v)
@@ -3874,7 +3882,7 @@ def collect_intraday(
             "indices": len(indices), "fund_proxies": len(fund_proxies), "ratings": len(ratings)}
 
 
-def _record_intraday_run(ctx, bucket: str, result: dict) -> None:
+def _record_intraday_run(ctx: Any, bucket: str, result: Any) -> None:
     """Record what this D37 run read and published, with measured counts.
 
     The two keys the descriptor declares are recorded separately: the quotes
@@ -3937,7 +3945,7 @@ def main(argv: list[str] | None = None) -> int:
         # manifest prefix — ~288 records per day, not ~1.
         captured: dict = {}
 
-        def _intraday_body(run_ctx) -> dict:
+        def _intraday_body(run_ctx: Any) -> dict[str, Any]:
             intra = collect_intraday(bucket=args.bucket, dry_run=args.dry_run, force=args.force,
                                      require_heartbeat=args.require_heartbeat)
             captured["result"] = intra
