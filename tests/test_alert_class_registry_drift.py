@@ -8,6 +8,7 @@ own merge time (``alert_class_pr_guard.py``) without a private checkout.
 Uses synthetic playbooks.yaml trees and synthetic repo source files so the
 test is self-contained and does not depend on network access or live checkouts.
 """
+# ruff: noqa: ANN001, ANN002, ANN003, ANN201, ANN202, ANN204, ANN205, ANN206
 
 from __future__ import annotations
 
@@ -123,6 +124,22 @@ alerts.publish(source="real-source")"""
         text = """publish_ops_digest("digest", source="digest-source")"""
         assert d._find_publish_source_literals(text, Path("dummy.py")) == {"digest-source"}
 
+    def test_notify_via_wrapper(self):
+        text = """notify_via_flow_doctor("message", source="flow-doctor-source")"""
+        assert d._find_publish_source_literals(text, Path("dummy.py")) == {
+            "flow-doctor-source"
+        }
+
+    def test_notify_via_wrapper_source_and_severity(self):
+        text = """notify_via_flow_doctor(
+    "message", source="flow-doctor-source", severity="warning"
+)"""
+        assert d.find_publish_sites(text) == {"flow-doctor-source": "warning"}
+
+    def test_other_notify_via_wrapper_is_supported(self):
+        text = """notify_via_pager("message", source="pager-source", severity=level)"""
+        assert d.find_publish_sites(text) == {"pager-source": "dynamic"}
+
     def test_very_nested_call(self):
         text = """alerts.publish(
     severity="error",
@@ -207,6 +224,19 @@ class TestScanRepo:
         uncovered = d._scan_repo(repo, patterns)
         assert "unregistered-source" in uncovered
         assert "src/module.py" in uncovered["unregistered-source"]
+
+    def test_uncovered_notify_via_source(self, tmp_path):
+        """Operator-reaching notify wrappers participate in registry drift."""
+        patterns = d._build_registry_patterns(_BASIC_CLASSES)
+        repo = _make_repo(tmp_path, "test-repo", {
+            "src/module.py": (
+                'notify_via_flow_doctor("message", source="unregistered-flow-doctor")'
+            ),
+        })
+
+        assert d._scan_repo(repo, patterns) == {
+            "unregistered-flow-doctor": {"src/module.py"}
+        }
 
     def test_skips_test_files(self, tmp_path):
         """Test files should be excluded from scanning."""

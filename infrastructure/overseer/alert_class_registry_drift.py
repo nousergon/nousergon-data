@@ -89,7 +89,7 @@ EXCLUDED_DIR_NAMES: frozenset[str] = frozenset({
 
 # Function/method name patterns that constitute an alert publish call.
 # Covers: alerts.publish, krepis.alerts.publish, publish_ops_alert,
-# publish_observe_alert, publish_ops_digest, etc.
+# publish_observe_alert, publish_ops_digest, notify_via_* wrappers, etc.
 _PUBLISH_CALL_PATTERN = re.compile(
     r"""
     (?:
@@ -97,6 +97,7 @@ _PUBLISH_CALL_PATTERN = re.compile(
         | publish_ops_alert\s*\(
         | publish_observe_alert\s*\(
         | publish_ops_digest\s*\(
+        | notify_via_\w+\s*\(
     )
     """,
     re.VERBOSE,
@@ -500,7 +501,8 @@ _WRAPPER_DEFAULT_SEVERITY: dict[str, str | None] = {
 # Same shapes as _PUBLISH_CALL_PATTERN, but capturing WHICH wrapper — the
 # wrapper decides the default severity when the call site passes none.
 _PUBLISH_CALL_NAMED = re.compile(
-    r"(alerts\.publish|publish_ops_alert|publish_observe_alert|publish_ops_digest)\s*\("
+    r"(alerts\.publish|publish_ops_alert|publish_observe_alert|publish_ops_digest|"
+    r"notify_via_\w+)\s*\("
 )
 
 _SEVERITY_ARG_LITERAL = re.compile(r"""severity\s*=\s*["']([^"']+)["']""")

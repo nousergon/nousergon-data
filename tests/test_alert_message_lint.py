@@ -18,6 +18,7 @@ The three positive controls named in the issue are pinned too, because the
 expensive failure mode for a lint is not missing a defect — it is flagging a
 correct call site, which gets the whole rule switched off within a week.
 """
+# ruff: noqa: ANN001, ANN002, ANN003, ANN201, ANN202, ANN204, ANN205, ANN206
 
 from __future__ import annotations
 
@@ -500,10 +501,10 @@ def test_a_shell_script_that_publishes_nothing_is_an_operator_script():
 
 
 def test_a_flow_doctor_emitter_is_in_scope():
-    """`notify_via_flow_doctor` reaches an operator; the class scanner misses it.
+    """The shared class scanner keeps flow-doctor emitters in lint scope.
 
     `saturday-sf-watch-dispatcher/index.py` and `scheduled-groom-dispatcher/index.py`
-    were out of scope entirely until this shape was added — 4 dedup keys and 6
+    were out of scope entirely before I9490 — 4 dedup keys and 6
     unactionable messages that no guard had ever looked at
     (``alpha-engine-config-I9490``).
     """
