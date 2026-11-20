@@ -32,6 +32,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SF_JSON = _REPO_ROOT / "infrastructure" / "step_function.json"
@@ -52,7 +53,7 @@ def _repos_the_sf_uses() -> set[str]:
     doc = json.loads(_SF_JSON.read_text(encoding="utf-8"))
     found: set[str] = set()
 
-    def walk(node: object) -> None:
+    def walk(node: Any) -> None:
         if isinstance(node, dict):
             for key, val in node.items():
                 if key == "commands.$" and isinstance(val, str):
@@ -99,6 +100,42 @@ def _repos_the_bootstrap_clones() -> set[str]:
     }
 
 
+def _krepis_floor_program() -> str:
+    """Return the no-network Python assertion embedded in the bootstrap."""
+    match = re.search(
+        r"\.venv/bin/python - requirements\.txt <<'PY'.*?\n(.*?)\nPY\n",
+        _bootstrap_script(),
+        re.S,
+    )
+    assert match, "bootstrap has no krepis floor assertion"
+    return match.group(1)
+
+
+def _run_krepis_floor(tmp_path: Path, installed: str | None) -> subprocess.CompletedProcess[str]:
+    """Execute the embedded assertion with local-only distribution metadata."""
+    (tmp_path / "requirements.txt").write_text("krepis==0.19.0\n", encoding="utf-8")
+    if installed is not None:
+        dist_info = tmp_path / f"krepis-{installed}.dist-info"
+        dist_info.mkdir()
+        (dist_info / "METADATA").write_text(
+            f"Metadata-Version: 2.1\nName: krepis\nVersion: {installed}\n",
+            encoding="utf-8",
+        )
+    program = _krepis_floor_program()
+    if installed is None:
+        program = program.replace(
+            'installed = importlib.metadata.version("krepis")',
+            'raise importlib.metadata.PackageNotFoundError("krepis")',
+        )
+    return subprocess.run(
+        [sys.executable, "-c", program, "requirements.txt"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
 def test_sf_references_at_least_one_repo() -> None:
     """Guard the guard — a broken walker must not silently pass."""
     assert _repos_the_sf_uses(), "no alpha-engine-* checkout paths found in the SF"
@@ -137,58 +174,29 @@ def test_every_cloned_repo_is_chowned_to_ec2_user() -> None:
     )
 
 
-def _krepis_floor_program() -> str:
-    """Return the no-network Python assertion embedded in the bootstrap."""
-    match = re.search(
-        r"\.venv/bin/python - \"\$KREPIS_REQUIRED_FLOOR\" requirements\.txt "
-        r"<<'PY'[^\n]*\n(.*?)\nPY\n",
-        _bootstrap_script(),
-        re.S,
-    )
-    assert match, "bootstrap has no krepis floor assertion"
-    return match.group(1)
-
-
-def _run_krepis_floor(tmp_path: Path, installed: str | None) -> subprocess.CompletedProcess[str]:
-    requirements = tmp_path / "requirements.txt"
-    requirements.write_text("krepis==0.19.0\n", encoding="utf-8")
-    result = repr(installed)
-    wrapper = f"""import importlib.metadata
-installed = {result}
-def fake_version(distribution_name: str) -> str:
-    if installed is None:
-        raise importlib.metadata.PackageNotFoundError(distribution_name)
-    return installed
-importlib.metadata.version = fake_version
-exec({_krepis_floor_program()!r})
-"""
-    return subprocess.run(
-        [sys.executable, "-c", wrapper, "0.18.8", str(requirements)],
-        cwd=tmp_path,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-
-
 def test_krepis_floor_accepts_installed_version_at_floor(tmp_path: Path) -> None:
-    """The assertion permits the capability's first supported release."""
     result = _run_krepis_floor(tmp_path, "0.18.8")
+
     assert result.returncode == 0, result.stderr
 
 
 def test_krepis_floor_fails_loudly_for_old_installation(tmp_path: Path) -> None:
-    """A stale per-boot venv aborts with every diagnostic fact operators need."""
     result = _run_krepis_floor(tmp_path, "0.18.7")
+
     assert result.returncode != 0
-    assert "installed version=0.18.7" in result.stderr
-    assert "required floor=0.18.8" in result.stderr
+    assert "installed=0.18.7" in result.stderr
+    assert "required>=0.18.8" in result.stderr
     assert "alpha-engine-dashboard/requirements.txt pin=0.19.0" in result.stderr
     assert "venv is built per boot from that file" in result.stderr
 
 
-def test_krepis_floor_fails_loudly_when_installation_is_missing(tmp_path: Path) -> None:
-    """A missing package is diagnosed rather than becoming a later argparse error."""
+def test_krepis_floor_fails_loudly_when_installation_is_missing(
+    tmp_path: Path,
+) -> None:
     result = _run_krepis_floor(tmp_path, None)
+
     assert result.returncode != 0
-    assert "installed version=absent" in result.stderr
+    assert "installed=<not installed>" in result.stderr
+    assert "required>=0.18.8" in result.stderr
+    assert "alpha-engine-dashboard/requirements.txt pin=0.19.0" in result.stderr
+    assert "venv is built per boot from that file" in result.stderr

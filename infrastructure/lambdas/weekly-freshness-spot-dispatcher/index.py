@@ -424,40 +424,39 @@ pip install --upgrade pip -q || fail "pip upgrade failed"
 if [ -f requirements.txt ]; then
   pip install -q -r requirements.txt || fail "dashboard requirements install failed"
 fi
-# Runtime backstop for ssm_log_capture --correlation-id.  The lockfile remains
-# the installation authority; this assertion only verifies what it installed.
-KREPIS_REQUIRED_FLOOR=0.18.8
-.venv/bin/python - "$KREPIS_REQUIRED_FLOOR" requirements.txt <<'PY' || fail "dashboard krepis floor assertion failed"
+# numpy<2 pin to match every other spot workload (pyarrow compiled against 1.x).
+pip install -q 'numpy<2' || fail "numpy pin failed"
+# Runtime backstop for ssm_log_capture --correlation-id. Keep this floor in
+# one place: requirements.txt remains the authoritative exact version to
+# install, while this assertion diagnoses a stale or otherwise malformed venv.
+.venv/bin/python - requirements.txt <<'PY' || fail "krepis floor assertion failed"
 import importlib.metadata
+import pathlib
 import re
 import sys
-from pathlib import Path
 
 from pip._vendor.packaging.version import Version
 
-required = sys.argv[1]
-requirements_path = sys.argv[2]
-pin = "absent"
-for line in Path(requirements_path).read_text(encoding="utf-8").splitlines() if Path(requirements_path).is_file() else ():
-    match = re.match(r"\\s*krepis\\s*==\\s*([^;\\s]+)", line, re.IGNORECASE)
-    if match:
-        pin = match.group(1)
-        break
+required = Version("0.18.8")
+requirements_path = pathlib.Path(sys.argv[1])
+requirements = requirements_path.read_text(encoding="utf-8")
+pin_match = re.search(r"(?im)^krepis\\s*==\\s*([^\\s;#]+)", requirements)
+pin = pin_match.group(1) if pin_match else "<no exact pin>"
 try:
     installed = importlib.metadata.version("krepis")
 except importlib.metadata.PackageNotFoundError:
-    installed = "absent"
+    installed = "<not installed>"
 
-if installed == "absent" or Version(installed) < Version(required):
-    raise SystemExit(
+if installed == "<not installed>" or Version(installed) < required:
+    print(
         "krepis bootstrap precondition failed: "
-        f"installed version={{installed}}; required floor={{required}}; "
+        f"installed={{installed}}; required>={{required}}; "
         f"alpha-engine-dashboard/requirements.txt pin={{pin}}; "
-        "the dashboard venv is built per boot from that file"
+        "the dashboard venv is built per boot from that file",
+        file=sys.stderr,
     )
+    raise SystemExit(1)
 PY
-# numpy<2 pin to match every other spot workload (pyarrow compiled against 1.x).
-pip install -q 'numpy<2' || fail "numpy pin failed"
 chown -R ec2-user:ec2-user /home/ec2-user/alpha-engine-dashboard/.venv || fail "venv chown failed"
 deactivate
 # A SECOND venv, for alpha-engine-data's own code (alpha-engine-config-I7427).
@@ -565,7 +564,8 @@ def _terminate_instance(instance_id: str) -> None:
 
 
 def handler(
-    event: dict[str, object], context: object
+    event: dict[str, object] | None,
+    context: object,
 ) -> dict[str, object]:  # noqa: ARG001 — Lambda contract
     """Step Function handler — launch the weekly pipeline's launcher spot box.
 
