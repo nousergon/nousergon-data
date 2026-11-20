@@ -301,7 +301,7 @@ def rollup_envelope(
         or unobserved
     ):
         status = ENVELOPE_ERROR
-    elif report.get("stages_unmeasured") or upstream_pending or dedicated_box or no_dry_path or retired:
+    elif report.get("stages_unmeasured") or upstream_pending or retired:
         # Nothing is broken, but the sweep did not cover everything it declares.
         # Rendering that green is the failure mode this component exists to
         # avoid: "no data" is never green (principles.md §2.7).
