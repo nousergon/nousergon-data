@@ -8,6 +8,8 @@ detectors in this fleet have shipped unable to fail, and the specific way this
 one could fail silently is by folding an unmeasured stage into green.
 """
 
+# ruff: noqa: ANN001, ANN002, ANN003, ANN201, ANN202, ANN204
+
 from __future__ import annotations
 
 import datetime as dt
@@ -1055,7 +1057,57 @@ def test_the_rollup_names_the_no_dry_path_stages_rather_than_counting_them(caden
     assert rollup["no_dry_path_stages"] == ["SaturdayHealthCheck"]
     # The no-dry-path row must not cancel out the stage it represents.
     assert rollup["stages_expected"] == 2 and rollup["stages_reported"] == 2
-    assert rollup["status"] == ENVELOPE_ATTENTION
+    assert rollup["status"] == ENVELOPE_OK
+
+
+def test_reported_clean_sweep_with_acknowledged_gaps_has_ok_rollup(cadence):
+    results = [
+        {"stage": f"Measured{i}", "verdict": ps.PASSED} for i in range(14)
+    ]
+    results.extend(
+        {"stage": f"NoDryPath{i}", "verdict": "no_dry_path"} for i in range(7)
+    )
+    results.append({
+        "stage": "Dedicated", "verdict": "unsweepable",
+        "unsweepable_kind": ps.UNSWEEPABLE_DEDICATED_BOX,
+    })
+    report = {
+        "run_id": "r", "measured": True, "outcome": "ok",
+        "stages_declared": 22, "stages_passed": 14,
+        "stages_no_dry_path": 7, "stages_unsweepable": 1,
+        "stages_unsweepable_coverage_defect": 0,
+        "stages_unsweepable_dedicated_box": 1,
+        "coverage_findings": [
+            {"stage": result["stage"], "blocking": False, "finding": "acknowledged"}
+            for result in results if result["verdict"] != ps.PASSED
+        ],
+        "results": results,
+    }
+
+    rollup = rollup_envelope(report, cadence, "t")
+
+    assert rollup["status"] == ENVELOPE_OK
+    assert rollup["stages_unobserved"] == 0
+    assert rollup["dedicated_box_stages"] == ["Dedicated"]
+    assert rollup["no_dry_path_stages"] == [f"NoDryPath{i}" for i in range(7)]
+
+
+def test_reported_sweep_with_a_coverage_defect_has_non_ok_rollup(cadence):
+    report = {
+        "run_id": "r", "measured": True, "outcome": "failed",
+        "stages_declared": 2, "stages_passed": 1, "stages_unsweepable": 1,
+        "stages_unsweepable_coverage_defect": 1,
+        "results": [
+            {"stage": "Measured", "verdict": ps.PASSED},
+            {"stage": "Defect", "verdict": "unsweepable",
+             "unsweepable_kind": ps.UNSWEEPABLE_COVERAGE_DEFECT},
+        ],
+    }
+
+    rollup = rollup_envelope(report, cadence, "t")
+
+    assert rollup["status"] != ENVELOPE_OK
+    assert rollup["stages_unsweepable_coverage_defect"] == 1
 
 
 def test_an_acknowledged_coverage_gap_does_not_turn_the_rollup_red(cadence):
