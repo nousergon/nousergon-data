@@ -24,6 +24,9 @@ the live evidence recorded on I7167, each asserting the sweep WOULD have caught
 what no surface reported.
 """
 
+# This legacy test module predates the repository's production annotation gate.
+# ruff: noqa: ANN001, ANN002, ANN003, ANN201, ANN202, ANN204, ANN205, ANN206
+
 from __future__ import annotations
 
 import json
@@ -1287,17 +1290,23 @@ class _FakeSfn:
     """
 
     def __init__(self, start=None, entered=(), describe_raises=None,
-                 history_raises=None, pages=None):
+                 history_raises=None, pages=None, status="SUCCEEDED",
+                 definition=None):
         self.start = start
         self.entered = list(entered)
         self.describe_raises = describe_raises
         self.history_raises = history_raises
         self.pages = pages
+        self.status = status
+        self.definition = definition
 
     def describe_execution(self, executionArn):  # noqa: N803
         if self.describe_raises:
             raise self.describe_raises
-        return {"startDate": self.start, "status": "SUCCEEDED"}
+        return {"startDate": self.start, "status": self.status}
+
+    def describe_state_machine_for_execution(self, **kw):
+        return {"definition": json.dumps(self.definition)}
 
     def get_execution_history(self, **kw):
         if self.history_raises:
@@ -1321,6 +1330,7 @@ class TestExecutionContext:
         )
         assert ctx.start == EXEC_START
         assert ctx.entered_stages == frozenset({"A", "B"})
+        assert ctx.status == "SUCCEEDED"
         # _FakeSfn's describe_execution carries no 'input' field, so run_mode
         # degrades to UNKNOWN with one context note — never to silence.
         assert ctx.run_mode is None
@@ -1447,8 +1457,63 @@ class TestGatedOutRun:
         assert [f["stage"] for f in doc["defects"]] == ["ReplayConcordance"]
         assert sos.exit_code(doc) == 1
 
-    def test_history_denied_does_not_excuse_anything(self, registry_file):
-        """Losing the history must fail toward asserting, not toward amnesty."""
+    def test_running_execution_reports_downstream_stages_as_pending(
+        self, registry_file
+    ):
+        definition = {
+            "States": {
+                "PredictorTraining": {"Next": "StageOutputSweep"},
+                "StageOutputSweep": {"Next": "ReplayConcordance"},
+                "ReplayConcordance": {"End": True},
+            }
+        }
+        doc = sos.sweep(
+            run_date=RUN_DATE, cycle_date=RUN_DATE, registry_path=registry_file,
+            s3_client=_FakeS3({f"good/{RUN_DATE}.json": EXEC_START}), execution_arn="arn:x",
+            sfn_client=_FakeSfn(
+                start=EXEC_START,
+                entered=["PredictorTraining", "StageOutputSweep"],
+                status="RUNNING", definition=definition,
+            ),
+            alert=False, publish=False, enforce=True,
+        )
+        replay = next(f for f in doc["findings"] if f["stage"] == "ReplayConcordance")
+        assert replay["verdict"] == sos.PENDING_DOWNSTREAM
+        assert doc["defects"] == []
+        assert sos.exit_code(doc) == 0
+
+    def test_terminal_rerun_grades_stages_that_have_entered(self, registry_file):
+        doc = sos.sweep(
+            run_date=RUN_DATE, cycle_date=RUN_DATE, registry_path=registry_file,
+            s3_client=_FakeS3({f"good/{RUN_DATE}.json": EXEC_START}), execution_arn="arn:x",
+            sfn_client=_FakeSfn(
+                start=EXEC_START,
+                entered=["PredictorTraining", "ReplayConcordance"],
+                status="SUCCEEDED",
+            ),
+            alert=False, publish=False, enforce=True,
+        )
+        assert [f["stage"] for f in doc["defects"]] == ["ReplayConcordance"]
+        assert doc["counts"].get(sos.PENDING_DOWNSTREAM, 0) == 0
+
+    def test_running_execution_without_ordering_is_unmeasured(
+        self, registry_file
+    ):
+        doc = sos.sweep(
+            run_date=RUN_DATE, cycle_date=RUN_DATE, registry_path=registry_file,
+            s3_client=_FakeS3({f"good/{RUN_DATE}.json": EXEC_START}), execution_arn="arn:x",
+            sfn_client=_FakeSfn(
+                start=EXEC_START, entered=["PredictorTraining"],
+                status="RUNNING", definition=None,
+            ),
+            alert=False, publish=False, enforce=True,
+        )
+        replay = next(f for f in doc["findings"] if f["stage"] == "ReplayConcordance")
+        assert replay["verdict"] == sos.UNMEASURED
+        assert doc["defects"] == []
+
+    def test_history_denied_is_unmeasured_not_a_defect(self, registry_file):
+        """Losing history is not evidence that any declaring stage ran."""
         s3 = _FakeS3({f"good/{RUN_DATE}.json": EXEC_START + timedelta(hours=1)})
         doc = sos.sweep(
             run_date=RUN_DATE, cycle_date=RUN_DATE, registry_path=registry_file, s3_client=s3,
@@ -1457,7 +1522,8 @@ class TestGatedOutRun:
             alert=False, publish=False, enforce=True,
         )
         assert doc["entered_stages_known"] is False
-        assert [f["stage"] for f in doc["defects"]] == ["ReplayConcordance"]
+        assert doc["defects"] == []
+        assert len(doc["unmeasured"]) == 2
         assert doc["context_notes"]
 
     def test_explicit_arguments_win_over_the_api(self, registry_file):
