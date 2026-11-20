@@ -1,4 +1,3 @@
-# ruff: noqa: ANN001, ANN003, ANN201, ANN202, ANN204
 """The run-scope derivation and handler, against REAL definitions and executions.
 
 Named ``test_handler.py`` because that is the ONLY filename either gate looks
@@ -74,6 +73,25 @@ from run_scope import (
     merge_run_scopes,
     work_entry,
 )
+
+
+def test_execution_scope_classifies_complete_partial_vacuous_and_unavailable():
+    from run_scope import classify_execution_scope
+
+    def scope(*dispositions: str) -> dict:
+        return {
+            "stages": {
+                f"producer-{i}": {"disposition": disposition}
+                for i, disposition in enumerate(dispositions)
+            }
+        }
+
+    assert classify_execution_scope(scope(ENABLED_COMPLETED))["verdict"] == "COMPLETE"
+    partial = classify_execution_scope(scope(ENABLED_COMPLETED, DISABLED))
+    assert partial["verdict"] == "PARTIAL"
+    assert partial["skipped_producers"] == ["producer-1"]
+    assert classify_execution_scope(scope(DISABLED))["verdict"] == "VACUOUS"
+    assert classify_execution_scope({"stages": {}})["verdict"] == "UNAVAILABLE"
 
 _FIXTURES = pathlib.Path(__file__).resolve().parent / "fixtures"
 
@@ -174,8 +192,6 @@ def test_the_all_skip_shell_run_grades_almost_nothing(definition, all_skip_histo
     Scope says what the status code could not: 3 of 29.
     """
     scope = build_run_scope(definition, all_skip_history, run_date="2026-08-15")
-    assert scope["execution_scope_verdict"] == "partial"
-    assert scope["skipped_producers"]
     assert scope["counts"][ENABLED_COMPLETED] == 3
     assert scope["counts"][DISABLED] >= 18
     assert scope["graded_stages"] == [
@@ -194,7 +210,6 @@ def test_the_real_run_names_the_flag_that_disabled_parity(
     did it, which is the fact that was missing.
     """
     scope = build_run_scope(definition, real_run_history, run_date="2026-08-14")
-    assert scope["execution_scope_verdict"] == "partial"
     parity = scope["stages"]["Parity"]
     assert parity["disposition"] == DISABLED
     assert parity["disabled_by"] == "skip_parity"
@@ -1184,11 +1199,8 @@ def test_a_skip_flagged_rerun_cannot_demote_a_scheduled_runs_scope(
     assert refused["Evaluator"]["refused"] == DISABLED
     assert refused["Parity"]["kept_from"] == "arn:scheduled"
     assert any("write REFUSED for stage Parity" in r.message for r in caplog.records)
-    # The artifact remains merged cycle truth, but the in-band return is this
-    # execution's truth so an earlier run cannot conceal the recovery's skips.
-    assert rerun["stages"]["Evaluator"]["disposition"] == DISABLED
-    assert rerun["execution_scope_verdict"] == "partial"
-    assert "Evaluator" in rerun["skipped_producers"]
+    # The returned block is the merged truth, not this execution's derivation.
+    assert rerun["stages"]["Parity"]["disposition"] == DISABLED
 
 
 def test_the_guard_fails_when_removed(

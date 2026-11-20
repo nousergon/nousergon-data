@@ -1,5 +1,3 @@
-# ruff: noqa: ANN001, ANN003, ANN201, ANN202, ANN204
-# pyright: reportExplicitAny=false, reportUnknownVariableType=false, reportUnknownMemberType=false, reportUnknownArgumentType=false
 """Derive the weekly pipeline's own run scope from its definition + execution.
 
 Tracked as ``alpha-engine-config-I7620``.
@@ -85,7 +83,7 @@ the rules below were established rather than assumed.
 """
 from __future__ import annotations
 
-from typing import Any, Iterable
+from typing import Any, Iterable, cast
 
 SCHEMA = "run_scope-1.0.0"
 SCHEMA_VERSION = 1
@@ -94,6 +92,11 @@ DISABLED = "DISABLED"
 ENABLED_COMPLETED = "ENABLED_COMPLETED"
 ENABLED_FAILED = "ENABLED_FAILED"
 NOT_REACHED = "NOT_REACHED"
+
+COMPLETE_SCOPE = "COMPLETE"
+PARTIAL_SCOPE = "PARTIAL"
+VACUOUS_SCOPE = "VACUOUS"
+UNAVAILABLE_SCOPE = "UNAVAILABLE"
 
 #: The closed vocabulary. A disposition outside it is a bug, not a new state.
 DISPOSITIONS = frozenset(
@@ -974,7 +977,7 @@ def branch_outcome(
     hist: _History,
     work_state: str,
     stops: Iterable[str],
-) -> dict[str, Any]:
+) -> dict:
     """The selected branch's end-to-end result, from its own event chain.
 
     Starts at the LAST entry of ``work_state`` (a relaunched stage is judged by
@@ -1097,8 +1100,8 @@ def build_run_scope(
         key=lambda pair: (len(pair[0]), pair[1]),
     )
 
-    stages: dict[str, dict[str, Any]] = {}
-    after_scope: dict[str, dict[str, Any]] = {}
+    stages: dict[str, dict] = {}
+    after_scope: dict[str, dict] = {}
     for name, gate in sorted(gates.items()):
         decision = decisions.get(name)
         if decision is None and name in ahead:
@@ -1303,29 +1306,7 @@ def build_run_scope(
         counts[row["disposition"]] += 1
     graded = sorted(k for k, v in stages.items() if v["disposition"] in GRADED_DISPOSITIONS)
 
-    skipped = sorted(
-        name for name, row in stages.items() if row["disposition"] == DISABLED
-    )
-    skipped.extend(
-        sorted(
-            name for name, row in after_scope.items()
-            if row.get("input_flag") is True
-        )
-    )
-    unavailable = any(
-        row["disposition"] == NOT_REACHED for row in stages.values()
-    )
-    ran = counts[ENABLED_COMPLETED] + counts[ENABLED_FAILED]
-    if skipped and ran == 0:
-        execution_scope_verdict = "vacuous"
-    elif skipped:
-        execution_scope_verdict = "partial"
-    elif unavailable:
-        execution_scope_verdict = "unavailable"
-    else:
-        execution_scope_verdict = "complete"
-
-    return {
+    scope: dict[str, object] = {
         "schema": SCHEMA,
         "schema_version": SCHEMA_VERSION,
         "run_date": run_date,
@@ -1335,12 +1316,61 @@ def build_run_scope(
         "graded_stages": graded,
         "counts": counts,
         "after_scope": after_scope,
-        # This is deliberately execution-local.  The cycle artifact is merged
-        # across recoveries, but an earlier execution completing a producer
-        # must never turn this execution's skip into a clean terminal.
-        "execution_scope_verdict": execution_scope_verdict,
-        "skipped_producers": skipped,
         "statement": _statement(counts, len(stages), after_scope),
+    }
+    scope["execution_scope"] = classify_execution_scope(scope)
+    return scope
+
+
+def classify_execution_scope(scope: dict[str, object]) -> dict[str, object]:
+    """Classify this execution, without consulting a merged cycle artifact.
+
+    A recovery may run after another execution completed the stages it skips.
+    Those cycle-level facts do not make this execution complete: only the rows
+    derived from this execution's history are considered here.
+    """
+    stages = scope.get("stages")
+    if scope.get("degraded") or not isinstance(stages, dict) or not stages:
+        return {
+            "verdict": UNAVAILABLE_SCOPE,
+            "skipped_producers": [],
+            "reason": "this execution's producer scope was unavailable",
+        }
+
+    stage_rows = cast(dict[str, object], stages)
+
+    def disposition(row: object) -> object:
+        if not isinstance(row, dict):
+            return None
+        return cast(dict[str, object], row).get("disposition")
+
+    skipped = sorted(
+        name for name, row in stage_rows.items()
+        if disposition(row) == DISABLED
+    )
+    unobserved = sorted(
+        name for name, row in stage_rows.items()
+        if disposition(row) == NOT_REACHED
+    )
+    completed = sorted(
+        name for name, row in stage_rows.items()
+        if disposition(row) in GRADED_DISPOSITIONS
+    )
+    if not completed:
+        verdict = VACUOUS_SCOPE
+    elif skipped or unobserved:
+        verdict = PARTIAL_SCOPE
+    else:
+        verdict = COMPLETE_SCOPE
+    return {
+        "verdict": verdict,
+        "skipped_producers": skipped,
+        "unobserved_producers": unobserved,
+        "completed_producers": completed,
+        "reason": (
+            f"{verdict.lower()} execution scope: {len(completed)} completed, "
+            f"{len(skipped)} skipped, {len(unobserved)} unobserved"
+        ),
     }
 
 

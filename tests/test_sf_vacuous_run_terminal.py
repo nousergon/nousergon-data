@@ -1,4 +1,3 @@
-# ruff: noqa: ANN001, ANN003, ANN201, ANN202, ANN204
 """The VacuousRun terminal (alpha-engine-config-I9693).
 
 An execution that entered none of the pipeline's declared spine stages must
@@ -78,7 +77,7 @@ def test_the_choice_fires_only_on_an_explicit_boolean_false(states):
     """
     choice = states["CheckExecutionDidWork"]
     assert choice["Type"] == "Choice"
-    assert choice["Default"] == "CheckExecutionScope"
+    assert choice["Default"] == "CheckWeeklyCoverageSweepOutcome"
     assert len(choice["Choices"]) == 1
     rule = choice["Choices"][0]
     assert through_release(states, rule["Next"]) == "VacuousRun"

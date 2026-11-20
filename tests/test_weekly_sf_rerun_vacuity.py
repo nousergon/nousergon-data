@@ -1,4 +1,3 @@
-# ruff: noqa: ANN001, ANN003, ANN201, ANN202, ANN204
 """The skip-to-green refusal: `weekly_sf_rerun.py --start` must not dispatch a
 rerun that can enter no substantive stage (alpha-engine-config-I11075, the
 pre-flight half of I9693 deliverable 3).
@@ -125,6 +124,26 @@ def test_the_escape_hatch_needs_a_reason_and_then_allows_the_dispatch(mod, sf_de
     ) == ()
 
 
+def test_partial_recovery_requires_and_retains_a_reason_per_skipped_producer(
+    mod, sf_def, spine
+):
+    payload = {"skip_scanner": True}
+    with pytest.raises(mod.PartialRerunError):
+        mod.require_partial_rerun_reason(sf_def, WEEKLY_ARN, payload, "")
+    reasons = mod.require_partial_rerun_reason(
+        sf_def, WEEKLY_ARN, payload, "scanner already completed in execution -1"
+    )
+    assert reasons == {"Scanner": "scanner already completed in execution -1"}
+
+    plan = mod.RerunPlan(
+        run_date="2026-09-18",
+        run_date_provenance="test",
+        original_input={},
+        skipped_producer_reasons=reasons,
+    )
+    assert plan.rerun_input()["skipped_producer_reasons"] == reasons
+
+
 def test_the_accepted_reason_rides_into_the_execution_input(mod):
     """`describe-execution` must answer 'why was this empty run dispatched'."""
     plan = mod.RerunPlan(
@@ -137,21 +156,6 @@ def test_the_accepted_reason_rides_into_the_execution_input(mod):
     emitted = plan.rerun_input()
     assert emitted["vacuous_rerun_accepted_reason"] == (
         "completion marker re-stamp, nothing else to run"
-    )
-
-
-def test_skipped_producer_reasons_ride_into_the_execution_input(mod):
-    plan = mod.RerunPlan(
-        run_date="2026-09-18",
-        run_date_provenance="test",
-        original_input={},
-    )
-    plan.skipped_producer_reasons = {
-        "Backtester": "Backtester was completed by the source execution",
-        "Director": "Director was completed by the source execution",
-    }
-    assert plan.rerun_input()["skipped_producer_reasons"] == (
-        plan.skipped_producer_reasons
     )
 
 

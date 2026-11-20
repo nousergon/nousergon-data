@@ -1,4 +1,3 @@
-# ruff: noqa: ANN001, ANN003, ANN201, ANN202, ANN204
 """RunScope's wiring into the weekly SF (alpha-engine-config-I7620).
 
 The Lambda's own derivation is tested in
@@ -45,6 +44,34 @@ def test_it_receives_the_context_values_it_cannot_derive_for_itself(states):
     assert payload["execution_input.$"] == "$$.Execution.Input"
 
 
+def test_execution_local_scope_controls_the_terminal_through_degraded_route(states):
+    choice = states["CheckExecutionScope"]
+    routes = {
+        next(part["StringEquals"] for part in rule["And"] if "StringEquals" in part):
+        rule["Next"]
+        for rule in choice["Choices"]
+    }
+    assert routes == {
+        "PARTIAL": "MarkExecutionScopeIncomplete",
+        "UNAVAILABLE": "MarkExecutionScopeIncomplete",
+    }
+    assert choice["Default"] == "CheckSkipReportCard"
+    assert states["MarkExecutionScopeIncomplete"]["Next"] == "CheckSkipReportCard"
+    assert states["MarkExecutionScopeIncomplete"]["Parameters"]["degraded"] is True
+
+
+def test_completion_markers_retain_the_execution_scope_verdict(states):
+    for name in (
+        "WriteCompletionMarker",
+        "WriteCompletionMarkerCalendar",
+        "WriteCompletionMarkerDegraded",
+        "WriteCompletionMarkerDegradedCalendar",
+    ):
+        body = states[name]["Parameters"]["Body.$"]
+        assert "$.run_scope_result.Payload.execution_scope" in body
+        assert "skipped_producers" in body
+
+
 def test_it_honours_the_shell_run_dry_contract(states):
     """`research_dry` is this pipeline's canonical dry signal.
 
@@ -62,7 +89,7 @@ def test_it_runs_after_every_work_stage_and_before_the_report_card(states):
     fail-opened its substrate health check would produce a card with no scope
     beside it.
     """
-    assert states["RunScope"]["Next"] == "CheckSkipReportCard"
+    assert states["RunScope"]["Next"] == "CheckExecutionScope"
     predecessors = {
         name for name, body in states.items()
         if name != "RunScope" and '"RunScope"' in json.dumps(
@@ -94,7 +121,7 @@ def test_nothing_else_still_routes_straight_to_the_report_card_gate(states):
             {k: v for k, v in body.items() if k != "Comment"}
         )
     }
-    assert stragglers == set()
+    assert stragglers == {"CheckExecutionScope", "MarkExecutionScopeIncomplete"}
 
 
 def test_it_can_never_fail_the_run(states):
@@ -103,7 +130,7 @@ def test_it_can_never_fail_the_run(states):
     failure handler."""
     catches = states["RunScope"]["Catch"]
     assert [c["ErrorEquals"] for c in catches] == [["States.ALL"]]
-    assert all(c["Next"] == "CheckSkipReportCard" for c in catches)
+    assert all(c["Next"] == "CheckExecutionScope" for c in catches)
     assert all(c["ResultPath"] == "$.run_scope_error" for c in catches)
 
 
@@ -210,32 +237,3 @@ def test_the_s3_artifact_remains_the_fallback_not_the_removal(states):
     ).read_text()
     assert "put_object" in handler
     assert "KEY_TEMPLATE.format(run_date=run_date)" in handler
-
-
-def test_partial_and_unavailable_execution_scope_cannot_succeed(states):
-    """The terminal reads RunScope's in-band, execution-local verdict."""
-    assert states["CheckExecutionDidWork"]["Default"] == "CheckExecutionScope"
-    choice = states["CheckExecutionScope"]
-    routes = {
-        next(c["StringEquals"] for c in rule["And"] if "StringEquals" in c):
-        rule["Next"]
-        for rule in choice["Choices"]
-    }
-    assert routes == {
-        "partial": "CheckRunSlotHeldBeforePartialScopeRun",
-        "unavailable": "CheckRunSlotHeldBeforeExecutionScopeUnavailable",
-    }
-    assert states["PartialScopeRun"]["Type"] == "Fail"
-    assert states["PartialScopeRun"]["Error"] == "PartialScopeRun"
-    assert "skipped_producers" in states["PartialScopeRun"]["CausePath"]
-    assert states["ExecutionScopeUnavailable"]["Type"] == "Fail"
-
-
-def test_scope_failure_routes_release_the_run_slot_first(states):
-    for suffix in ("PartialScopeRun", "ExecutionScopeUnavailable"):
-        check = states[f"CheckRunSlotHeldBefore{suffix}"]
-        assert check["Default"] == suffix
-        assert check["Choices"][0]["Next"] == f"ReleaseRunSlotBefore{suffix}"
-        release = states[f"ReleaseRunSlotBefore{suffix}"]
-        assert release["Next"] == suffix
-        assert release["Catch"][0]["Next"] == suffix
