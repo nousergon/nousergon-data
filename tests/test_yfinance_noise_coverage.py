@@ -17,16 +17,42 @@ Existing dedicated test files:
 
 from __future__ import annotations
 
+import ast
+import inspect
 import logging
-from unittest.mock import patch
 
-import pytest
+
+def _call_is_inside_quiet_context(function: object, call_name: str) -> bool:
+    """Return whether ``call_name`` is lexically guarded by quiet_yfinance."""
+    tree = ast.parse(inspect.getsource(function))
+    parents: dict[ast.AST, ast.AST] = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            parents[child] = parent
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = node.func.attr if isinstance(node.func, ast.Attribute) else None
+        if name != call_name:
+            continue
+        ancestor = parents.get(node)
+        while ancestor is not None:
+            if isinstance(ancestor, ast.With) and any(
+                isinstance(item.context_expr, ast.Call)
+                and isinstance(item.context_expr.func, ast.Name)
+                and item.context_expr.func.id == "quiet_yfinance"
+                for item in ancestor.items
+            ):
+                return True
+            ancestor = parents.get(ancestor)
+    return False
 
 
 class TestMacroYfinanceNoise:
     """macro.py _fetch_market_prices uses quiet_yfinance for yf.download."""
 
-    def test_quiet_yfinance_imported(self):
+    def test_quiet_yfinance_imported(self) -> None:
         from collectors import macro
         assert hasattr(macro, "quiet_yfinance") or any(
             "quiet_yfinance" in line for line in open(macro.__file__ or "")
@@ -35,7 +61,7 @@ class TestMacroYfinanceNoise:
         from collectors.macro import quiet_yfinance
         assert quiet_yfinance is not None
 
-    def test_quiet_yfinance_demotes_logger_during_download(self):
+    def test_quiet_yfinance_demotes_logger_during_download(self) -> None:
         """Demonstrate that quiet_yfinance actually suppresses the yfinance
         logger inside _fetch_market_prices's yf.download path."""
         from collectors.macro import _fetch_market_prices, quiet_yfinance
@@ -57,37 +83,29 @@ class TestMacroYfinanceNoise:
 class TestAlternativeYfinanceNoise:
     """alternative.py yfinance .info calls run under quiet_yfinance."""
 
-    def test_quiet_yfinance_imported(self):
+    def test_quiet_yfinance_imported(self) -> None:
         from collectors import alternative
         assert hasattr(alternative, "quiet_yfinance") or any(
             "quiet_yfinance" in line for line in open(alternative.__file__ or "")
         ), "alternative must import quiet_yfinance"
 
-    def test_quiet_yfinance_wraps_info_fetch(self):
-        """Verify the retry loop wraps yf.Ticker(ticker).info in quiet_yfinance
-        by checking logger demotion through the context manager."""
-        from collectors.alternative import quiet_yfinance
-        yf_logger = logging.getLogger("yfinance")
-        yf_logger.setLevel(logging.DEBUG)
-        try:
-            with quiet_yfinance():
-                assert yf_logger.level == logging.CRITICAL
-                assert not yf_logger.isEnabledFor(logging.ERROR)
-            assert yf_logger.level == logging.DEBUG
-        finally:
-            yf_logger.setLevel(logging.NOTSET)
+    def test_quiet_yfinance_wraps_ticker_workers(self) -> None:
+        """The run-level context must cover the concurrent worker lifecycle."""
+        from collectors.alternative import collect
+
+        assert _call_is_inside_quiet_context(collect, "submit")
 
 
 class TestAnalystYfinanceNoise:
     """analyst_sources/yfinance.py fetch method uses quiet_yfinance."""
 
-    def test_quiet_yfinance_imported(self):
+    def test_quiet_yfinance_imported(self) -> None:
         from collectors.analyst_sources import yfinance as yf_analyst
         assert hasattr(yf_analyst, "quiet_yfinance") or any(
             "quiet_yfinance" in line for line in open(yf_analyst.__file__ or "")
         ), "analyst_sources/yfinance.py must import quiet_yfinance"
 
-    def test_quiet_yfinance_wraps_fetch(self):
+    def test_quiet_yfinance_wraps_fetch(self) -> None:
         """Verify the YfinanceAnalystAdapter.fetch method wraps its call in
         quiet_yfinance."""
         from collectors.analyst_sources.yfinance import quiet_yfinance
@@ -103,13 +121,13 @@ class TestAnalystYfinanceNoise:
 class TestWeeklyCollectorChronicHealNoise:
     """weekly_collector.py _self_heal_chronic_polygon_gaps uses quiet_yfinance."""
 
-    def test_quiet_yfinance_imported(self):
+    def test_quiet_yfinance_imported(self) -> None:
         import weekly_collector
         assert any(
             "quiet_yfinance" in line for line in open(weekly_collector.__file__)
         ), "weekly_collector must import quiet_yfinance"
 
-    def test_quiet_yfinance_wraps_download(self):
+    def test_quiet_yfinance_wraps_download(self) -> None:
         """Verify the self-heal path's yf.download runs under quiet_yfinance."""
         import weekly_collector as wc
         from weekly_collector import quiet_yfinance
@@ -120,3 +138,12 @@ class TestWeeklyCollectorChronicHealNoise:
                 assert yf_logger.level == logging.CRITICAL
         finally:
             yf_logger.setLevel(logging.NOTSET)
+
+
+class TestMigrationYfinanceNoise:
+    """The CRSP-basis migration routes its download through the chokepoint."""
+
+    def test_quiet_yfinance_wraps_download(self) -> None:
+        from builders.migrate_universe_crsp_basis import _yfinance_frame
+
+        assert _call_is_inside_quiet_context(_yfinance_frame, "download")
