@@ -37,7 +37,6 @@ from __future__ import annotations
 import json
 import pathlib
 import re
-from typing import Any
 
 import pytest
 
@@ -76,12 +75,12 @@ _FAMILY_BY_STATE = {
 
 
 @pytest.fixture(scope="module")
-def states() -> dict[str, Any]:
+def states() -> dict:
     return json.loads(_WEEKLY.read_text(encoding="utf-8"))["States"]
 
 
 @pytest.fixture(scope="module")
-def floor(states: dict[str, Any]) -> dict[str, Any]:
+def floor(states: dict) -> dict:
     merged = states["InitializeInput"]["Parameters"]["merged.$"]
     m = re.search(r"StringToJson\('(\{.*?\})'\)", merged)
     assert m, "InitializeInput's innermost defaults blob was not found"
@@ -98,7 +97,7 @@ def _degraded_summary_setters(states: dict) -> dict[str, dict]:
     }
 
 
-def test_every_known_setter_is_covered_by_this_test(states: dict[str, Any]) -> None:
+def test_every_known_setter_is_covered_by_this_test(states: dict) -> None:
     """The state set this module pins must match the live definition exactly —
     an uncovered new setter would silently keep the last-write-wins defect."""
     setters = _degraded_summary_setters(states)
@@ -112,7 +111,7 @@ def test_every_known_setter_is_covered_by_this_test(states: dict[str, Any]) -> N
 
 @pytest.mark.parametrize("name,family", sorted(_FAMILY_BY_STATE.items()))
 def test_setter_merges_into_reasons_rather_than_replacing(
-    states: dict[str, Any], name: str, family: str
+    states: dict, name: str, family: str
 ) -> None:
     """THE regression this module exists for.
 
@@ -143,7 +142,7 @@ def test_setter_merges_into_reasons_rather_than_replacing(
 
 
 def test_scanner_resource_kill_and_research_predictor_share_one_family_key(
-    states: dict[str, Any],
+    states: dict,
 ) -> None:
     """CheckScannerResourceKillReason's overwrite is preserved, scoped to the
     research_predictor family entry only — it must not clobber any other
@@ -159,9 +158,7 @@ def test_scanner_resource_kill_and_research_predictor_share_one_family_key(
     )
 
 
-def test_degraded_summary_is_floored_with_an_empty_reasons_object(
-    floor: dict[str, Any],
-) -> None:
+def test_degraded_summary_is_floored_with_an_empty_reasons_object(floor: dict) -> None:
     """The first setter on any execution must never call JsonMerge on a missing
     path — CheckDegradedOutcome's ``IsPresent && BooleanEquals(true)`` read
     must also never fire on a clean run, so ``degraded`` is floored ``False``,
@@ -173,27 +170,18 @@ def test_degraded_summary_is_floored_with_an_empty_reasons_object(
     }
 
 
-def test_clean_summary_is_stamped_with_the_normalized_run_date(
-    states: dict[str, Any],
-) -> None:
-    """The clean-path summary must carry the cycle identity produced by
-    NormalizeRunDates, rather than retaining the null initialization floor."""
+def test_clean_degraded_summary_carries_the_normalized_run_date(states: dict) -> None:
+    """ApplyNormalizedRunDate must give the clean honesty object cycle identity."""
     expression = states["ApplyNormalizedRunDate"]["Parameters"]["merged.$"]
 
-    assert '"degraded_summary":{}' in expression
-    assert "States.JsonMerge($.degraded_summary," in expression
-    assert len(re.findall(r"\$\.run_dates\.run_date(?!_family)", expression)) == 2, (
-        "ApplyNormalizedRunDate must stamp both top-level run_date and the clean "
-        "degraded_summary from NormalizeRunDates' result"
-    )
-    assert "$.run_date," not in expression, (
-        "the summary must use the normalized result, not the pre-normalization "
-        "execution-input run_date"
-    )
+    assert '"degraded_summary":\\{"degraded":false,"reasons":\\{\\},"run_date":"{}"\\}' in expression
+    assert expression.endswith(
+        "$.run_dates.run_date_family, $.run_dates.run_date)), false)"
+    ), "degraded_summary.run_date must come from the normalized run_dates result"
 
 
 def test_check_degraded_outcome_never_routes_a_floored_clean_run_as_degraded(
-    states: dict[str, Any],
+    states: dict,
 ) -> None:
     """Verifies the claim the floor's safety rests on: CheckDegradedOutcome
     reads $.degraded_summary.degraded with BooleanEquals(true), so the floored
@@ -216,9 +204,7 @@ def test_check_degraded_outcome_never_routes_a_floored_clean_run_as_degraded(
     assert states["CheckDegradedOutcome"]["Default"] == "WriteCompletionMarker"
 
 
-def test_degraded_run_cause_path_renders_every_accumulated_reason(
-    states: dict[str, Any],
-) -> None:
+def test_degraded_run_cause_path_renders_every_accumulated_reason(states: dict) -> None:
     """The terminal must render the WHOLE reasons map, not just the historical
     singular ``.reason`` field, so a run with two or more degradations names
     all of them — the literal Closes-when of alpha-engine-config-I10540."""

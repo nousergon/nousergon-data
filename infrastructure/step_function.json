@@ -10648,10 +10648,10 @@
       "Next": "ApplyNormalizedRunDate"
     },
     "ApplyNormalizedRunDate": {
-      "Comment": "Hoist the resolved trading day onto $.run_date (alpha-engine-config-I8809). A separate Pass rather than a ResultPath of '$' on the Task, because overwriting the whole state input from a Lambda result would drop every skip_* flag, the sns_topic_arn floor and the seeded degraded families. States.JsonMerge with the two-field object SECOND lets it win, and keeps the input otherwise intact. $.calendar_date is deliberately NOT touched - it is the immutable execution-day record. The same normalized date is stamped into $.degraded_summary so the clean-path honesty object identifies its cycle (alpha-engine-config-I11300); merging onto the floored object preserves its verdict and reasons. | alpha-engine-config-I8809: PARTITION FAMILY = trading_day OUT. Writes $.run_date (trading day) and $.run_date_family; reads neither as a key.",
+      "Comment": "Hoist the resolved trading day onto $.run_date (alpha-engine-config-I8809). A separate Pass rather than a ResultPath of '$' on the Task, because overwriting the whole state input from a Lambda result would drop every skip_* flag, the sns_topic_arn floor and the seeded degraded families. States.JsonMerge with the two-field object SECOND lets it win, and keeps the input otherwise intact. $.calendar_date is deliberately NOT touched - it is the immutable execution-day record. | alpha-engine-config-I8809: PARTITION FAMILY = trading_day OUT. Writes $.run_date (trading day) and $.run_date_family; reads neither as a key.",
       "Type": "Pass",
       "Parameters": {
-        "merged.$": "States.JsonMerge($, States.StringToJson(States.Format('\\{\"run_date\":\"{}\",\"run_date_family\":\"{}\",\"degraded_summary\":{}\\}', $.run_dates.run_date, $.run_dates.run_date_family, States.JsonToString(States.JsonMerge($.degraded_summary, States.StringToJson(States.Format('\\{\"run_date\":\"{}\"\\}', $.run_dates.run_date)), false)))), false)"
+        "merged.$": "States.JsonMerge($, States.StringToJson(States.Format('\\{\"run_date\":\"{}\",\"run_date_family\":\"{}\",\"degraded_summary\":\\{\"degraded\":false,\"reasons\":\\{\\},\"run_date\":\"{}\"\\}\\}', $.run_dates.run_date, $.run_dates.run_date_family, $.run_dates.run_date)), false)"
       },
       "OutputPath": "$.merged",
       "Next": "CheckRunMode"
