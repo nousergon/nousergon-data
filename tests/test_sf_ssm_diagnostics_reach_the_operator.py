@@ -37,17 +37,8 @@ _DEFS = {
 }
 
 # States whose poll result carries no field containing script output.
-#
-# This list may only ever SHRINK. It is not a carve-out for "these are fine" —
-# every entry is a stage whose failure reaches the operator as an exit code and
-# nothing else, which is strictly worse than the 2026-08-26 preopen failure that
-# at least carried the SSM agent's generic stderr line.
-#
-# alpha-engine-config-I8703 moved the remaining entries to the shared
-# ssm-liveness-poller, which normalises optional SSM output fields and bounds
-# both tails before placing them in detail. Keep the explicit empty set: the
-# two-sided assertions below make any new gap fail while ensuring a fixed entry
-# can never linger as an accepted exception.
+# This set may only ever shrink; alpha-engine-config-I8703 closes the final EOD
+# entries by routing them through the existing liveness poller contract.
 _UNCOVERED_POLLERS: set[tuple[str, str]] = set()
 
 # A field whose value plausibly carries what the script printed.
@@ -118,71 +109,83 @@ def test_every_ssm_poller_carries_a_diagnostic_field() -> None:
     )
 
 
-def test_affected_eod_pollers_use_the_bounded_diagnostic_contract() -> None:
-    """I8703: keep the four migrated loops on the shared poller contract."""
-    affected = {
-        ("eod", "WaitForCaptureSnapshot", "snapshot_poll", "snapshot_result"),
-        (
-            "eod",
-            "WaitForRefreshExecutorDeploy",
-            "refresh_executor_deploy_poll",
-            "refresh_executor_deploy_result",
-        ),
-        ("eod_reconcile", "WaitForEOD", "eod_poll", "eod_result"),
-        (
-            "eod_reconcile",
-            "WaitForRefreshExecutorDeploy",
-            "refresh_executor_deploy_poll",
-            "refresh_executor_deploy_result",
-        ),
-    }
+_AFFECTED_EOD_POLLERS = {
+    ("eod", "WaitForCaptureSnapshot", "snapshot_result.poll", "snapshot_result"),
+    (
+        "eod",
+        "WaitForRefreshExecutorDeploy",
+        "refresh_executor_deploy_result.poll",
+        "refresh_executor_deploy_result",
+    ),
+    ("eod_reconcile", "WaitForEOD", "eod_result.poll", "eod_result"),
+    (
+        "eod_reconcile",
+        "WaitForRefreshExecutorDeploy",
+        "refresh_executor_deploy_result.poll",
+        "refresh_executor_deploy_result",
+    ),
+}
 
-    for which, name, poll, command in affected:
+
+def test_affected_eod_pollers_use_the_bounded_liveness_contract() -> None:
+    """The shared poller normalises optional SSM output fields before ASL sees them.
+
+    Its handler tests exercise missing stdout and empty tails.  This wiring guard
+    proves every affected EOD state consumes that safe contract, retains both
+    bounded diagnostics, and never maps the raw stdout field into state.
+    """
+    for which, name, slot, result in _AFFECTED_EOD_POLLERS:
         state = _load(which)["States"][name]
         assert state["Resource"] == "arn:aws:states:::lambda:invoke"
         payload = state["Parameters"]["Payload"]
-        assert payload["command_id.$"] == f"$.{command}.Command.CommandId"
+        assert payload["command_id.$"] == f"$.{result}.Command.CommandId"
         assert payload["instance_id.$"] == "$.trading_instance_id[0]"
-        assert payload["attempts"] == 0
-        assert payload["ping_misses"] == 0
+        assert payload["attempts.$"] == f"$.{slot}.attempts"
+        assert payload["ping_misses.$"] == f"$.{slot}.ping_misses"
+        assert "alpha-engine-ssm-liveness-poller" in state["Parameters"]["FunctionName"]
+        assert state["ResultSelector"]["detail.$"] == "$.Payload.detail"
+        assert (
+            state["ResultSelector"]["StandardErrorContent.$"] == "$.Payload.stderr_tail"
+        )
+        assert "StandardOutputContent.$" not in state["ResultSelector"]
+        assert "stdout_tail.$" not in state["ResultSelector"]
 
-        selector = state["ResultSelector"]
-        assert selector["detail.$"] == "$.Payload.detail"
-        assert selector["StandardErrorContent.$"] == "$.Payload.stderr_tail"
-        assert "StandardOutputContent.$" not in selector
-        assert "stdout_tail.$" not in selector
-        assert "OBSERVE-ONLY" in state["Comment"]
-        assert "3 successful EOD cycles" in state["Comment"]
 
-
-def test_affected_eod_failures_propagate_detail_to_notifications() -> None:
-    """Terminal normalizers must retain detail before SNS serialises error."""
-    cases = {
-        "eod": {
-            "SnapshotStatusError": "$.snapshot_poll.detail",
-            "RefreshExecutorDeployStatusError": (
-                "$.refresh_executor_deploy_poll.detail"
-            ),
-        },
-        "eod_reconcile": {
-            "EODStatusError": "$.eod_poll.detail",
-            "RefreshExecutorDeployStatusError": (
-                "$.refresh_executor_deploy_poll.detail"
-            ),
-        },
+def test_affected_eod_failures_copy_diagnostic_detail_into_error() -> None:
+    """Terminal pages serialize an error that names what the script reported."""
+    expected = {
+        ("eod", "SnapshotStatusError", "snapshot_result.poll"),
+        (
+            "eod",
+            "RefreshExecutorDeployStatusError",
+            "refresh_executor_deploy_result.poll",
+        ),
+        ("eod_reconcile", "EODStatusError", "eod_result.poll"),
+        (
+            "eod_reconcile",
+            "RefreshExecutorDeployStatusError",
+            "refresh_executor_deploy_result.poll",
+        ),
     }
-    for which, states in cases.items():
-        definition = _load(which)["States"]
-        for name, detail_path in states.items():
-            assert definition[name]["Parameters"]["detail.$"] == detail_path
+    for which, name, slot in expected:
+        params = _load(which)["States"][name]["Parameters"]
+        assert params["detail.$"] == f"$.{slot}.detail"
 
-    eod = _load("eod")["States"]
-    assert "$.error" in eod["PageCaptureSnapshotFailureImmediate"][
-        "Parameters"
-    ]["Message.$"]
-    assert "$.error" in eod["PageCaptureSnapshotIrreversibleFailure"][
-        "Parameters"
-    ]["Message.$"]
+
+def test_eod_liveness_classification_is_observe_only_for_five_cycles() -> None:
+    """Status keeps routing outcomes while verdict is visible but unread."""
+    for which, name, _, _ in _AFFECTED_EOD_POLLERS:
+        definition = _load(which)
+        state = definition["States"][name]
+        assert "OBSERVE mode" in state["Comment"]
+        assert "5 consecutive EOD cycles" in state["Comment"]
+        result_path = state["ResultPath"]
+        choice = definition["States"][state["Next"]]
+        assert all(
+            branch["Variable"] == f"{result_path}.Status"
+            for branch in choice["Choices"]
+        )
+        assert "verdict.$" in state["ResultSelector"]
 
 
 def test_output_tails_never_enter_sf_state_via_a_resultselector() -> None:
