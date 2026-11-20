@@ -28,4 +28,4 @@ permissions:
 
 jobs:
   empty-pr-guard:
-    uses: nousergon/nousergon-lib/.github/workflows/empty-pr-guard.yml@4193735c2417b4f5c2f7b73694b6da250e41fa0d  # nousergon-lib main 2026-10-30
+    uses: nousergon/nousergon-lib/.github/workflows/empty-pr-guard.yml@5a25747acef77df590f979ae381accacb6eb0c32  # nousergon-lib main 2026-10-30
