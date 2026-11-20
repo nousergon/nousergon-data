@@ -35,6 +35,10 @@ from typing import Protocol, cast
 
 logger = logging.getLogger(__name__)
 
+# SEC's published fair-access ceiling.  Filing pipelines use the same value
+# both for pacing and for their pre-request wall-clock budget projection.
+EDGAR_REQUESTS_PER_SECOND = 10
+
 
 class _Response(Protocol):
     """The slice of ``requests.Response`` this module reads."""
@@ -66,30 +70,6 @@ DEFAULT_CACHE_PATH = os.environ.get(
 # across days.
 DEFAULT_TTL_SECONDS = 12 * 3600  # 12h
 
-# SEC's published fair-access ceiling.  Ingestion preflights use one shared
-# value rather than letting individual EDGAR callers invent their own sleep or
-# wall-clock assumptions.
-EDGAR_REQUESTS_PER_SECOND = 10
-DEFAULT_EDGAR_BUDGET_SECONDS = 300.0
-
-
-def projected_edgar_seconds(requests: int) -> float:
-    """Return minimum wall-clock for ``requests`` at SEC's declared limit."""
-    return requests / EDGAR_REQUESTS_PER_SECOND
-
-
-def check_edgar_budget(
-    requests: int, *, budget_seconds: float = DEFAULT_EDGAR_BUDGET_SECONDS
-) -> float:
-    """Validate projected EDGAR work and return its minimum duration."""
-    projected = projected_edgar_seconds(requests)
-    if projected > budget_seconds:
-        raise RuntimeError(
-            f"EDGAR preflight: {requests} requests project to {projected:.1f}s, "
-            f"exceeding the {budget_seconds:.1f}s budget"
-        )
-    return projected
-
 
 def load_cik_map(
     *,
@@ -100,7 +80,6 @@ def load_cik_map(
     ttl_seconds: float = DEFAULT_TTL_SECONDS,
     headers: Mapping[str, str] | None = None,
     monotonic_time: Callable[[], float] = time.time,
-    request_started: Callable[[], None] | None = None,
 ) -> dict[str, str]:
     """Return ``{TICKER: cik_str}`` for the full EDGAR universe.
 
@@ -127,8 +106,6 @@ def load_cik_map(
         import requests as http  # local import: mirrors existing call sites
 
     try:
-        if request_started is not None:
-            request_started()
         resp = http.get(
             _COMPANY_TICKERS_URL,
             headers=headers or {"User-Agent": "AlphaEngine research@nousergon.ai"},

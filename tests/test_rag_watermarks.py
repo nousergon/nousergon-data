@@ -17,19 +17,19 @@ from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from unittest.mock import MagicMock
 
-from pytest import MonkeyPatch
+import pytest
+
+from rag.pipelines import ingest_8k_filings, ingest_sec_filings
 
 from rag.pipelines._watermarks import (
     WatermarkStore,
     resolve_outstanding,
 )
-from rag.pipelines import ingest_8k_filings, ingest_sec_filings
-from rag.pipelines.source_yield import SourceYield
 
 NOW = datetime(2026, 7, 30, 12, 0, tzinfo=timezone.utc)
 
 
-def _s3(marks: dict | None = None, *, readable: bool = True) -> MagicMock:
+def _s3(marks: dict[str, str] | None = None, *, readable: bool = True) -> MagicMock:
     s3 = MagicMock()
     if not readable:
         s3.get_object.side_effect = RuntimeError("AccessDenied")
@@ -43,7 +43,9 @@ def _s3(marks: dict | None = None, *, readable: bool = True) -> MagicMock:
     return s3
 
 
-def _store(marks: dict | None = None, *, readable: bool = True) -> WatermarkStore:
+def _store(
+    marks: dict[str, str] | None = None, *, readable: bool = True,
+) -> WatermarkStore:
     return WatermarkStore("news", s3_client=_s3(marks, readable=readable))
 
 
@@ -176,38 +178,33 @@ def test_store_key_is_per_source_so_pipelines_cannot_contend() -> None:
         WatermarkStore("sec_edgar", s3_client=MagicMock()).key
 
 
-def test_sec_filings_current_keys_issue_zero_vendor_requests(monkeypatch: MonkeyPatch) -> None:
-    fresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    forms = ["10-K", "10-Q"]
-    wm = WatermarkStore(
-        ingest_sec_filings.WATERMARK_SOURCE,
-        s3_client=_s3({f"AAPL|{form}": fresh for form in forms}),
-    )
-    search = MagicMock()
-    monkeypatch.setattr(ingest_sec_filings, "_search_filings", search)
+def test_current_sec_filing_keys_make_no_vendor_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MagicMock()
+    store.get.return_value = datetime.now(timezone.utc)
+    monkeypatch.setattr(ingest_sec_filings, "WatermarkStore", lambda _source: store)
+    vendor = MagicMock(side_effect=AssertionError("vendor request"))
+    monkeypatch.setattr(ingest_sec_filings.requests, "get", vendor)
+    monkeypatch.setattr(ingest_sec_filings, "write_yield", MagicMock())
+    monkeypatch.setattr("sys.argv", ["ingest_sec_filings", "--tickers", "AAPL"])
 
-    total = ingest_sec_filings._run_gap_fill(
-        ["AAPL"], form_types=forms, max_days=730, dry_run=False,
-        watermark=wm, stats=SourceYield(source="sec_filings"),
-    )
+    ingest_sec_filings.main()
 
-    assert total == 0
-    search.assert_not_called()
+    vendor.assert_not_called()
 
 
-def test_8k_current_key_issues_zero_vendor_requests(monkeypatch: MonkeyPatch) -> None:
-    fresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    wm = WatermarkStore(
-        ingest_8k_filings.WATERMARK_SOURCE,
-        s3_client=_s3({"AAPL|8-K": fresh}),
-    )
-    search = MagicMock()
-    monkeypatch.setattr(ingest_8k_filings, "_search_8k_filings", search)
+def test_current_8k_key_makes_no_vendor_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MagicMock()
+    store.get.return_value = datetime.now(timezone.utc)
+    monkeypatch.setattr(ingest_8k_filings, "WatermarkStore", lambda _source: store)
+    vendor = MagicMock(side_effect=AssertionError("vendor request"))
+    monkeypatch.setattr(ingest_8k_filings.requests, "get", vendor)
+    monkeypatch.setattr(ingest_8k_filings, "write_yield", MagicMock())
+    monkeypatch.setattr("sys.argv", ["ingest_8k_filings", "--tickers", "AAPL"])
 
-    total = ingest_8k_filings._run_gap_fill(
-        ["AAPL"], max_days=365, dry_run=False, watermark=wm,
-        stats=SourceYield(source="8k_events"),
-    )
+    ingest_8k_filings.main()
 
-    assert total == 0
-    search.assert_not_called()
+    vendor.assert_not_called()
