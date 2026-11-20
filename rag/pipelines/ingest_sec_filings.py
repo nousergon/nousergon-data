@@ -18,9 +18,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import json
 import logging
-import os
 import re
 import time
 from datetime import date, timedelta
@@ -134,10 +132,18 @@ _CHUNK_OVERLAP = 50
 # with a shared ``/tmp`` file cache (mtime TTL) so only the FIRST step in a
 # run (or day) actually hits EDGAR.
 
-from rag.pipelines._cik_lookup import load_cik_map  # noqa: E402
+from rag.pipelines._cik_lookup import check_edgar_budget, load_cik_map  # noqa: E402
+from rag.pipelines._watermarks import WatermarkStore, resolve_outstanding  # noqa: E402
 from rag.pipelines.source_yield import SourceYield, write_yield  # noqa: E402
 
 _CIK_CACHE: dict[str, str] = {}
+_edgar_requests_spent = 0
+WATERMARK_SOURCE = "sec_filings"
+
+
+def _record_edgar_request() -> None:
+    global _edgar_requests_spent
+    _edgar_requests_spent += 1
 
 
 def _get_cik(ticker: str) -> str | None:
@@ -145,13 +151,17 @@ def _get_cik(ticker: str) -> str | None:
     if ticker in _CIK_CACHE:
         return _CIK_CACHE[ticker]
 
-    _CIK_CACHE.update(load_cik_map(http=requests, headers=_SEC_HEADERS))
+    _CIK_CACHE.update(load_cik_map(
+        http=requests, headers=_SEC_HEADERS, request_started=_record_edgar_request,
+    ))
     return _CIK_CACHE.get(ticker.upper())
 
 
 # ── Filing search via EDGAR submissions API ──────────────────────────────────
 
-def _search_filings(ticker: str, form_types: list[str], lookback_days: int = 730) -> list[dict]:
+def _search_filings(
+    ticker: str, form_types: list[str], lookback_days: int = 730
+) -> list[dict[str, str]] | None:
     """Search SEC EDGAR for recent filings using the submissions API.
 
     Uses https://data.sec.gov/submissions/CIK{cik}.json which returns
@@ -160,21 +170,22 @@ def _search_filings(ticker: str, form_types: list[str], lookback_days: int = 730
     cik = _get_cik(ticker)
     if not cik:
         logger.warning("No CIK found for %s", ticker)
-        return []
+        return None
 
     cik_padded = cik.zfill(10)
     url = f"https://data.sec.gov/submissions/CIK{cik_padded}.json"
 
     try:
         time.sleep(0.12)  # SEC rate limit: 10 req/sec
+        _record_edgar_request()
         resp = requests.get(url, headers=_SEC_HEADERS, timeout=15)
         if resp.status_code != 200:
             logger.warning("EDGAR submissions API returned %d for %s", resp.status_code, ticker)
-            return []
+            return None
         data = resp.json()
     except Exception as e:
         logger.warning("EDGAR submissions API failed for %s: %s", ticker, e)
-        return []
+        return None
 
     cutoff = date.today() - timedelta(days=lookback_days)
     form_type_set = set(f.upper() for f in form_types)
@@ -228,6 +239,7 @@ def _download_filing_html(url: str) -> str | None:
     """Download filing document from EDGAR Archives."""
     try:
         time.sleep(0.12)
+        _record_edgar_request()
         resp = requests.get(url, headers=_SEC_HEADERS, timeout=60)
         if resp.status_code == 200 and len(resp.text) > 1000:
             return resp.text
@@ -492,6 +504,7 @@ def ingest_ticker(
     lookback_days: int = 730,
     dry_run: bool = False,
     stats: SourceYield | None = None,
+    watermark: WatermarkStore | None = None,
 ) -> int:
     """Ingest SEC filings for a single ticker. Returns count ingested.
 
@@ -508,14 +521,19 @@ def ingest_ticker(
         stats = SourceYield(source="sec_filings")
 
     filings = _search_filings(ticker, form_types, lookback_days)
+    if filings is None:
+        stats.fail("search_failed")
+        return 0
     stats.discovered += len(filings)
 
     ingested = 0
+    complete = {form_type: True for form_type in form_types}
     for filing in filings:
         filed_date_str = filing.get("filed_date", "")
         try:
             filed_date = date.fromisoformat(filed_date_str[:10])
         except ValueError:
+            complete[filing.get("form_type", "")] = False
             continue
 
         form_type = filing["form_type"]
@@ -533,6 +551,7 @@ def ingest_ticker(
         if not html:
             logger.warning("Could not download %s %s %s", ticker, form_type, filed_date)
             stats.fail("download_failed")
+            complete[form_type] = False
             continue
 
         sections = _extract_sections(html, form_type=form_type)
@@ -549,6 +568,7 @@ def ingest_ticker(
                 ticker, form_type, filed_date, filing.get("url"),
             )
             stats.fail("no_sections")
+            complete[form_type] = False
             continue
 
         all_chunks = []
@@ -560,6 +580,7 @@ def ingest_ticker(
                 })
 
         if not all_chunks:
+            complete[form_type] = False
             continue
 
         embeddings = embed_texts([c["content"] for c in all_chunks])
@@ -579,13 +600,72 @@ def ingest_ticker(
         if doc_id:
             ingested += 1
             stats.ingested += 1
+        else:
+            complete[form_type] = False
+
+    if watermark is not None and not dry_run:
+        for form_type, succeeded in complete.items():
+            if succeeded:
+                watermark.advance(ticker, form_type)
 
     return ingested
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
-def main():
+def _run_gap_fill(
+    tickers: list[str],
+    *,
+    form_types: list[str],
+    max_days: int,
+    dry_run: bool,
+    watermark: WatermarkStore,
+    stats: SourceYield,
+) -> int:
+    """Resolve per-form gaps before EDGAR access and ingest only that work."""
+    global _edgar_requests_spent
+    _edgar_requests_spent = 0
+    work: dict[str, tuple[list[str], int]] = {}
+    for ticker in tickers:
+        outstanding_forms: list[str] = []
+        oldest_hours = 0
+        for form_type in form_types:
+            outstanding, hours = resolve_outstanding(
+                [ticker], watermark, doc_type=form_type,
+                max_hours=max_days * 24, min_hours=24,
+            )
+            if outstanding:
+                outstanding_forms.append(form_type)
+                oldest_hours = max(oldest_hours, hours)
+        if outstanding_forms:
+            work[ticker] = (outstanding_forms, oldest_hours)
+
+    projected = check_edgar_budget(len(work))
+    logger.info(
+        "SEC filings preflight: outstanding_gaps=%d edgar_requests=%d "
+        "projected_seconds=%.1f budget_seconds=300.0",
+        sum(len(forms) for forms, _ in work.values()), len(work), projected,
+    )
+    total = 0
+    started = time.monotonic()
+    for ticker, (forms, hours) in work.items():
+        total += ingest_ticker(
+            ticker, form_types=forms, lookback_days=max(1, (hours + 23) // 24),
+            dry_run=dry_run, stats=stats, watermark=watermark,
+        )
+    if not dry_run:
+        watermark.flush()
+    logger.info(
+        "SEC filings run: fetched=%d skipped_present=%d outstanding_gaps=%d "
+        "edgar_requests_spent=%d elapsed_seconds=%.1f budget_seconds=300.0",
+        stats.ingested, stats.already_held,
+        sum(len(forms) for forms, _ in work.values()), _edgar_requests_spent,
+        time.monotonic() - started,
+    )
+    return total
+
+
+def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     parser = argparse.ArgumentParser(description="Ingest SEC filings into RAG store")
@@ -609,10 +689,11 @@ def main():
 
     lookback_days = args.lookback_years * 365
     stats = SourceYield(source="sec_filings", scope=len(tickers))
-    total = 0
-    for ticker in tickers:
-        n = ingest_ticker(ticker, lookback_days=lookback_days, dry_run=args.dry_run, stats=stats)
-        total += n
+    watermark = WatermarkStore(WATERMARK_SOURCE)
+    total = _run_gap_fill(
+        tickers, form_types=list(DEFAULT_FORM_TYPES), max_days=lookback_days,
+        dry_run=args.dry_run, watermark=watermark, stats=stats,
+    )
 
     logger.info(
         "Total: %d filings ingested for %d tickers (%d offered, %d already held, failures=%s)",

@@ -20,9 +20,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import json
 import logging
-import os
 import re
 import time
 from datetime import date, timedelta
@@ -66,37 +64,51 @@ _CHUNK_OVERLAP = 50
 # doesn't re-download company_tickers.json if another pipeline step
 # already fetched it this run/day.
 
-from rag.pipelines._cik_lookup import load_cik_map  # noqa: E402
+from rag.pipelines._cik_lookup import check_edgar_budget, load_cik_map  # noqa: E402
+from rag.pipelines._watermarks import WatermarkStore, resolve_outstanding  # noqa: E402
 from rag.pipelines.source_yield import SourceYield, write_yield  # noqa: E402
 
 _CIK_CACHE: dict[str, str] = {}
+_edgar_requests_spent = 0
+WATERMARK_SOURCE = "8k_events"
+WATERMARK_DOC_TYPE = "8-K"
+
+
+def _record_edgar_request() -> None:
+    global _edgar_requests_spent
+    _edgar_requests_spent += 1
 
 
 def _get_cik(ticker: str) -> str | None:
     if ticker in _CIK_CACHE:
         return _CIK_CACHE[ticker]
-    _CIK_CACHE.update(load_cik_map(http=requests, headers=_SEC_HEADERS))
+    _CIK_CACHE.update(load_cik_map(
+        http=requests, headers=_SEC_HEADERS, request_started=_record_edgar_request,
+    ))
     return _CIK_CACHE.get(ticker.upper())
 
 
-def _search_8k_filings(ticker: str, lookback_days: int = 365) -> list[dict]:
+def _search_8k_filings(
+    ticker: str, lookback_days: int = 365
+) -> list[dict[str, str]] | None:
     """Search for 8-K filings via EDGAR submissions API."""
     cik = _get_cik(ticker)
     if not cik:
-        return []
+        return None
 
     cik_padded = cik.zfill(10)
     url = f"https://data.sec.gov/submissions/CIK{cik_padded}.json"
 
     try:
         time.sleep(0.12)
+        _record_edgar_request()
         resp = requests.get(url, headers=_SEC_HEADERS, timeout=15)
         if resp.status_code != 200:
-            return []
+            return None
         data = resp.json()
     except Exception as e:
         logger.warning("EDGAR API failed for %s: %s", ticker, e)
-        return []
+        return None
 
     cutoff = date.today() - timedelta(days=lookback_days)
     results = []
@@ -139,6 +151,7 @@ def _download_and_extract(url: str) -> str | None:
     """Download 8-K filing and extract text content."""
     try:
         time.sleep(0.12)
+        _record_edgar_request()
         resp = requests.get(url, headers=_SEC_HEADERS, timeout=60)
         if resp.status_code != 200 or len(resp.text) < 200:
             return None
@@ -188,6 +201,7 @@ def ingest_ticker(
     lookback_days: int = 365,
     dry_run: bool = False,
     stats: SourceYield | None = None,
+    watermark: WatermarkStore | None = None,
 ) -> int:
     """Ingest 8-K filings for a single ticker. Returns count ingested."""
     from nousergon_lib.rag.embeddings import embed_texts
@@ -196,14 +210,19 @@ def ingest_ticker(
     if stats is None:
         stats = SourceYield(source="8k_events")
     filings = _search_8k_filings(ticker, lookback_days)
+    if filings is None:
+        stats.fail("search_failed")
+        return 0
     stats.discovered += len(filings)
     ingested = 0
 
+    complete = True
     for filing in filings:
         filed_str = filing.get("filed_date", "")
         try:
             filed_date = date.fromisoformat(filed_str[:10])
         except ValueError:
+            complete = False
             continue
 
         if document_exists(ticker, "8-K", filed_date, "sec_edgar"):
@@ -218,6 +237,7 @@ def ingest_ticker(
         text = _download_and_extract(filing["url"])
         if not text or len(text) < 200:
             stats.fail("no_text")
+            complete = False
             continue
 
         # Detect material items for section labeling
@@ -228,6 +248,7 @@ def ingest_ticker(
 
         chunks_text = _chunk_text(text)
         if not chunks_text:
+            complete = False
             continue
 
         all_chunks = [{"content": c, "section_label": section_label} for c in chunks_text]
@@ -253,11 +274,63 @@ def ingest_ticker(
         if doc_id:
             ingested += 1
             stats.ingested += 1
+        else:
+            complete = False
+
+    # A successful empty discovery is confirmation that this key is current.
+    # Never advance a dry run or past any filing which failed to become held.
+    if watermark is not None and not dry_run and complete:
+        watermark.advance(ticker, WATERMARK_DOC_TYPE)
 
     return ingested
 
 
-def main():
+def _run_gap_fill(
+    tickers: list[str],
+    *,
+    max_days: int,
+    dry_run: bool,
+    watermark: WatermarkStore,
+    stats: SourceYield,
+) -> int:
+    """Resolve 8-K gaps before EDGAR access, then ingest outstanding work."""
+    global _edgar_requests_spent
+    _edgar_requests_spent = 0
+    outstanding, hours = resolve_outstanding(
+        tickers,
+        watermark,
+        doc_type=WATERMARK_DOC_TYPE,
+        max_hours=max_days * 24,
+        min_hours=24,
+    )
+    projected = check_edgar_budget(len(outstanding))
+    logger.info(
+        "8-K preflight: outstanding_gaps=%d edgar_requests=%d "
+        "projected_seconds=%.1f budget_seconds=300.0",
+        len(outstanding), len(outstanding), projected,
+    )
+    total = 0
+    started = time.monotonic()
+    for ticker in outstanding:
+        total += ingest_ticker(
+            ticker,
+            lookback_days=max(1, (hours + 23) // 24),
+            dry_run=dry_run,
+            stats=stats,
+            watermark=watermark,
+        )
+    if not dry_run:
+        watermark.flush()
+    logger.info(
+        "8-K run: fetched=%d skipped_present=%d outstanding_gaps=%d "
+        "edgar_requests_spent=%d elapsed_seconds=%.1f budget_seconds=300.0",
+        stats.ingested, stats.already_held, len(outstanding), _edgar_requests_spent,
+        time.monotonic() - started,
+    )
+    return total
+
+
+def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     parser = argparse.ArgumentParser(description="Ingest 8-K filings into RAG store")
@@ -280,10 +353,11 @@ def main():
         return
 
     stats = SourceYield(source="8k_events", scope=len(tickers))
-    total = 0
-    for ticker in tickers:
-        n = ingest_ticker(ticker, lookback_days=args.lookback_days, dry_run=args.dry_run, stats=stats)
-        total += n
+    watermark = WatermarkStore(WATERMARK_SOURCE)
+    total = _run_gap_fill(
+        tickers, max_days=args.lookback_days, dry_run=args.dry_run,
+        watermark=watermark, stats=stats,
+    )
 
     logger.info("Total: %d 8-K filings ingested for %d tickers", total, len(tickers))
     write_yield(stats)
