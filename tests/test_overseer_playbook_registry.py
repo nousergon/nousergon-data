@@ -22,6 +22,10 @@ in a different repo — so they carry ``workflow_file``/``repo`` instead, which
 this test module checks separately below.
 """
 
+# This legacy contract module predates the repository's annotation gate. New
+# tests below are annotated; retain the established test signatures elsewhere.
+# ruff: noqa: ANN001, ANN201, ANN202
+
 from __future__ import annotations
 
 import json
@@ -417,6 +421,51 @@ def test_known_bus_sources_have_rows():
                   "alpha-engine-backtester/optimizer/live_key_reconciliation.py",
                   "cloudwatch-alarm:*"):
         assert known in sources, f"known emitter {known!r} has no alert-class row"
+
+
+def test_i9461_alert_sources_are_declared() -> None:
+    """The I9449 sweep's emitters retain their exact delivery contracts."""
+    expected = {
+        "alpha-engine-backtester/analysis/parity_alarms.py":
+            (["error"], "bus", "drain-queue", None),
+        "stage-coverage-sweep/*": (["error"], "bus", "drain-queue", None),
+        "router-funded-depth":
+            (["warning", "critical"], "bus", "drain-queue", None),
+        "alpha-engine/infrastructure/health_checker.sh":
+            (["error"], "bus", "drain-queue", None),
+        "raw-sns:infrastructure/lambdas/sweep-artifact-monitor/index.py":
+            (["error"], "none", "operator", "alpha-engine-config-I2908"),
+        "raw-telegram:infrastructure/lambdas/spot-orphan-reaper/index.py":
+            (["warning"], "none", "operator", "alpha-engine-config-I2908"),
+        "raw-sns:scripts/weekly_sf_silence_deadman.py":
+            (["critical"], "none", "operator", "alpha-engine-config-I2908"),
+    }
+    for source, (severities, intake, response, migration_issue) in expected.items():
+        rows = [row for row in REGISTRY["alert_classes"] if row["source"] == source]
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["severities"] == severities
+        assert row["intake"] == intake
+        assert row["response"] == response
+        if migration_issue is not None:
+            assert row["migration_issue"] == migration_issue
+        else:
+            assert row.get("operator_reason")
+
+
+def test_i9461_existing_rows_remain_unique() -> None:
+    """I9461 must not replace its two live rows or duplicate their sources."""
+    expected = {
+        "alpha-engine-predictor/analysis/observe_leaderboard.py::build_observe_leaderboard":
+            (["warning"], "bus", "drain-queue"),
+        "alpha-engine-backtester/optimizer/producer_arena.py::run_arena_cycle":
+            (["error"], "bus", "drain-queue"),
+    }
+    for source, contract in expected.items():
+        rows = [row for row in REGISTRY["alert_classes"] if row["source"] == source]
+        assert len(rows) == 1
+        row = rows[0]
+        assert (row["severities"], row["intake"], row["response"]) == contract
 
 
 # crucible-backtester's spot EXIT trap (infrastructure/_spot_common.sh::cleanup)
