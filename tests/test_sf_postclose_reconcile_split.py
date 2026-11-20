@@ -31,6 +31,8 @@ the files that already owned it (skip-gates, readiness wait, heal loop,
 capture-snapshot retry), each now pointed at the machine its states live in.
 """
 
+# ruff: noqa: ANN001, ANN002, ANN003, ANN101, ANN102, ANN201, ANN202, ANN204, ANN205, ANN206
+
 from __future__ import annotations
 
 import json
@@ -108,7 +110,10 @@ _COLLECTOR_DEPENDENT = {
     "ProbeEODReconcilePrecondition", "CheckSkipEODReconcile", "EODReconcile", "WaitForEOD",
     "CheckEODStatus", "EODStatusError", "EODWait", "SkipEODReconcileDataGap",
     "SetDegradedFlag", "CheckHealLoopEligible", "InitHealLoop", "HealLoopGate",
-    "HealStartCollection", "HealReProbe", "HealCheckConverged", "HealLoopIncrement",
+    "HealInitialSignatureAvailable", "HealCaptureInitialFailureSignature",
+    "HealClearInitialFailureSignature", "HealMarkAttemptStarted", "HealStartCollection",
+    "HealReadFailureSignature", "HealClearFreshFailureSignature", "HealReProbe",
+    "HealCheckConverged", "HealCheckRepeatedFailure", "HealLoopIncrement",
     "HealDispatchReplay", "HealReplayDispatchFailed", "HealConvergedNotify",
     "HealNonConvergent",
 }

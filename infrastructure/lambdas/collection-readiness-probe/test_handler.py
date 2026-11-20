@@ -5,6 +5,8 @@ pin the consumer-side semantics (ready / settled / lookback) against the REAL
 predicate and the committed unit descriptors, never a stub of either.
 """
 
+# ruff: noqa: ANN001, ANN002, ANN003, ANN101, ANN102, ANN201, ANN202, ANN204, ANN205, ANN206
+
 from __future__ import annotations
 
 import importlib.util
@@ -123,6 +125,28 @@ def test_settled_but_not_ready_when_the_run_failed(probe):
     assert out["ready"] is False and out["settled"] is True
     assert out["failed"] == ["D20"] and out["missing"] == []
     assert out["failure_mode"] == "run_not_ok"
+    assert out["failure_signature"] == (
+        '[{"reason":"RuntimeError: vendor 429","unit":"D20"}]'
+    )
+
+
+def test_failure_signature_ignores_manifest_identity_and_requires_a_reason(probe):
+    first = probe({_D20_KEY: _d20(status="failed", reason="same failure", outputs=[])})
+    signature = first.handler(_event(), None)["readiness"]["failure_signature"]
+    newer = _d20(
+        run_id="01K5BBBBBBBBBBBBBBBBBBBBBB",
+        status="failed",
+        reason="same failure",
+        outputs=[],
+        finished="2026-09-24T23:10:00Z",
+    )
+    out = probe({"data_collection/runs/D20/2026-09-24/different-name.json": newer}).handler(
+        _event(), None
+    )["readiness"]
+    assert out["failure_signature"] == signature
+    assert probe({_D20_KEY: _d20(status="failed", reason="", outputs=[])}).handler(
+        _event(), None
+    )["readiness"]["failure_signature"] == ""
 
 
 def test_a_weekly_failure_the_producers_retry_can_still_fix_is_not_settled(probe):
