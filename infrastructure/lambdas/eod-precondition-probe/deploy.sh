@@ -176,6 +176,6 @@ if $SMOKE; then
   cat "${RESP}"
   echo ""
   assert_no_function_error "${INVOKE_STDOUT}" "${RESP}"
-  assert_response_field_present "${RESP}" precondition_met
+  assert_json_response_field "${RESP}" "run_date" "\"${TODAY}\""
   rm -f "${RESP}"
 fi

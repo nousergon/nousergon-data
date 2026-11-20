@@ -337,7 +337,7 @@ if $SMOKE; then
     "${RESP}")
   cat "${RESP}"
   echo ""
-  # SMOKE_SEMANTIC_EXEMPTION: the success branch starts the real EOD workflow and is intentionally unreachable on demand when EOD already ran
   assert_no_function_error "${INVOKE_STDOUT}" "${RESP}"
+  # SMOKE_SEMANTIC_EXEMPTION: starting EOD depends on the live trading-day and run state and cannot be forced safely.
   rm -f "${RESP}"
 fi

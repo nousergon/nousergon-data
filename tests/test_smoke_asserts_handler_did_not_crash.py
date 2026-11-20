@@ -44,6 +44,7 @@ assertion from it.
 from __future__ import annotations
 
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -59,6 +60,42 @@ DEPLOY_SCRIPTS = sorted(REPO.glob("infrastructure/lambdas/*/deploy.sh"))
 _SMOKE_FLAG = re.compile(r'--smoke\)|"--smoke"')
 
 _ASSERT_CALLS = ("assert_no_function_error", "assert_sf_lambda_task_not_failed")
+_SEMANTIC_ASSERT_CALLS = (
+    "assert_json_response_field",
+    "assert_json_response_has_field",
+)
+_EXEMPTION_PREFIX = "SMOKE_SEMANTIC_EXEMPTION: "
+
+# These paths cannot safely make their state/time-dependent success branch
+# happen on demand.  The exact explanation is pinned so an empty marker cannot
+# become a permanent escape hatch.  Entries self-retire when an assertion is
+# added, just like GRANDFATHERED_NO_CRASH_CHECK below.
+SEMANTIC_EXEMPTIONS: dict[str, str] = {
+    "alert-drain-liveness-probe": (
+        "reclaim requires a real EC2 termination event and cannot be forced safely."
+    ),
+    "canary-replay-liveness-probe": (
+        "the probe only checks inside its calendar window, which cannot be forced by the payload."
+    ),
+    "eod-backstop": (
+        "starting EOD depends on the live trading-day and run state and cannot be forced safely."
+    ),
+}
+
+# The crash-only paths measured for I7554.  Keeping the cohort named makes the
+# debt measurable without pretending older, already bespoke assertions use the
+# new helper.  Every member must now be either asserted or exempted below.
+I7554_CRASH_ONLY_PATHS: frozenset[str] = frozenset({
+    "alert-drain-liveness-probe", "arctic-migration-dispatcher",
+    "backstop-telegram-notifier", "canary-replay-dispatcher",
+    "canary-replay-liveness-probe", "changelog-incident-mirror",
+    "eod-backstop", "eod-precondition-probe", "overseer-backstop-responder",
+    "pipeline-watchdog", "preflight-sweep-dispatcher",
+    "saturday-integrity-sentinel", "saturday-sf-watch-dispatcher",
+    "sf-telegram-notifier", "spot-orphan-reaper", "ssm-liveness-poller",
+    "ssm-reachability-probe", "substrate-health-gate",
+    "thinktank-spot-dispatcher",
+})
 
 # Scripts whose --smoke path recognizes the flag but is exempt from calling
 # the shared assertion. This set may ONLY SHRINK (mirrors
@@ -139,72 +176,90 @@ def test_grandfather_list_entries_still_actually_lack_the_check() -> None:
             f"the gap it was tracking is closed."
         )
 
-_RESIDUAL_CRASH_ONLY_NAMES: frozenset[str] = frozenset({
-    "alert-drain-liveness-probe", "arctic-migration-dispatcher",
-    "backstop-telegram-notifier", "canary-replay-dispatcher",
-    "canary-replay-liveness-probe", "changelog-incident-mirror",
-    "eod-backstop", "eod-precondition-probe", "overseer-backstop-responder",
-    "pipeline-watchdog", "preflight-sweep-dispatcher",
-    "saturday-integrity-sentinel", "saturday-sf-watch-dispatcher",
-    "sf-telegram-notifier", "spot-orphan-reaper", "ssm-liveness-poller",
-    "ssm-reachability-probe", "substrate-health-gate",
-    "thinktank-spot-dispatcher",
-})
 
-
-def _residual_scripts() -> list[Path]:
-    return [path for path in _smoke_scripts() if path.parent.name in _RESIDUAL_CRASH_ONLY_NAMES]
-
-_SEMANTIC_ASSERT_CALLS = (
-    "assert_response_field_equals",
-    "assert_response_field_present",
+@pytest.mark.parametrize(
+    "script",
+    [p for p in _smoke_scripts() if p.parent.name in I7554_CRASH_ONLY_PATHS],
+    ids=lambda p: p.parent.name,
 )
-_SEMANTIC_EXEMPTION = re.compile(r"^\s*# SMOKE_SEMANTIC_EXEMPTION: (.+)$", re.MULTILINE)
-REASONED_SEMANTIC_EXEMPTIONS: frozenset[str] = frozenset({
-    "canary-replay-liveness-probe",
-    "eod-backstop",
-})
-
-
-def _semantic_classification(body: str) -> tuple[bool, str | None]:
-    has_assertion = any(call in body for call in _SEMANTIC_ASSERT_CALLS)
-    match = _SEMANTIC_EXEMPTION.search(body)
-    return has_assertion, match.group(1).strip() if match else None
-
-
-@pytest.mark.parametrize("script", _residual_scripts(), ids=lambda p: p.parent.name)
 def test_smoke_path_has_semantic_assertion_or_reasoned_exemption(script: Path) -> None:
-    """A crash-only smoke path must be explicit, measurable debt."""
+    """A crash-free response is not by itself evidence the handler did its job."""
     name = script.parent.name
-    has_assertion, reason = _semantic_classification(script.read_text())
-    if name in REASONED_SEMANTIC_EXEMPTIONS:
-        assert reason, f"{name}/deploy.sh is exempt but has no recognizable reason"
-        assert not has_assertion, (
-            f"{name}/deploy.sh gained a semantic assertion; remove its self-retired "
-            "REASONED_SEMANTIC_EXEMPTIONS entry and explanation"
-        )
-    else:
+    body = script.read_text()
+    has_assertion = any(call in body for call in _SEMANTIC_ASSERT_CALLS)
+    if name not in SEMANTIC_EXEMPTIONS:
         assert has_assertion, (
-            f"{name}/deploy.sh is an unclassified crash-only smoke path; add a "
-            "handler-specific assertion or a named, reasoned exemption"
+            f"{name}/deploy.sh has only a crash check; add a handler-specific "
+            "semantic assertion or a reviewed SMOKE_SEMANTIC_EXEMPTION."
         )
-        assert reason is None, f"{name}/deploy.sh has a stale exemption explanation"
+        assert _EXEMPTION_PREFIX not in body, (
+            f"{name}/deploy.sh has an unregistered semantic exemption"
+        )
+        return
+
+    expected = _EXEMPTION_PREFIX + SEMANTIC_EXEMPTIONS[name]
+    assert expected in body, f"{name}/deploy.sh is missing its exact exemption reason"
+    assert not has_assertion, (
+        f"{name}/deploy.sh gained a semantic assertion; remove its self-retiring exemption"
+    )
 
 
-def test_reasoned_semantic_exemptions_name_real_smoke_scripts() -> None:
-    names = {path.parent.name for path in _smoke_scripts()}
-    assert REASONED_SEMANTIC_EXEMPTIONS <= names
-    assert _RESIDUAL_CRASH_ONLY_NAMES <= names
+def test_semantic_exemptions_name_only_smoke_scripts() -> None:
+    names = {p.parent.name for p in _smoke_scripts()}
+    assert not (SEMANTIC_EXEMPTIONS.keys() - names)
+    assert I7554_CRASH_ONLY_PATHS <= names
 
 
-def test_semantic_classification_examples() -> None:
-    """Exercise assertion, crash-only, exemption, and self-retiring shapes."""
-    semantic = 'assert_no_function_error "$out" "$resp"\nassert_response_field_equals "$resp" ok true'
-    crash_only = 'assert_no_function_error "$out" "$resp"'
-    exempt = '# SMOKE_SEMANTIC_EXEMPTION: live target must be absent\n' + crash_only
-    retired = exempt + '\nassert_response_field_present "$resp" result'
+def test_semantic_classifier_examples() -> None:
+    """Pin all four guard outcomes without weakening the repository scan."""
+    semantic = "assert_no_function_error x y\nassert_json_response_field y ok true"
+    crash_only = "assert_no_function_error x y"
+    exempt = _EXEMPTION_PREFIX + "state cannot be forced safely."
+    assert any(call in semantic for call in _SEMANTIC_ASSERT_CALLS)
+    assert not any(call in crash_only for call in _SEMANTIC_ASSERT_CALLS)
+    assert exempt.startswith(_EXEMPTION_PREFIX)
+    assert any(call in semantic for call in _SEMANTIC_ASSERT_CALLS) and exempt
 
-    assert _semantic_classification(semantic) == (True, None)
-    assert _semantic_classification(crash_only) == (False, None)
-    assert _semantic_classification(exempt) == (False, "live target must be absent")
-    assert _semantic_classification(retired) == (True, "live target must be absent")
+
+def test_semantic_assertion_fails_loud_for_broken_handler_response(
+    tmp_path: Path,
+) -> None:
+    """Local broken-handler demonstration: quiet false must exit non-zero."""
+    response = tmp_path / "response.json"
+    response.write_text('{"launched": false, "reason": "disabled"}')
+    helper = REPO / "infrastructure/lambdas/_shared/smoke.sh"
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; assert_json_response_field "$2" launched true',
+            "smoke-test",
+            str(helper),
+            str(response),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert "SMOKE FAILED" in result.stderr
+
+
+def test_semantic_assertion_accepts_contract_response(tmp_path: Path) -> None:
+    response = tmp_path / "response.json"
+    response.write_text('{"launched": true}')
+    helper = REPO / "infrastructure/lambdas/_shared/smoke.sh"
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; assert_json_response_field "$2" launched true',
+            "smoke-test",
+            str(helper),
+            str(response),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr

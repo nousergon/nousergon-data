@@ -184,6 +184,6 @@ if $SMOKE; then
   cat "${RESP}"
   echo ""
   assert_no_function_error "${INVOKE_STDOUT}" "${RESP}"
-  assert_response_field_equals "${RESP}" instance_id "i-018eb3307a21329bf"
+  assert_json_response_field "${RESP}" "verdict" '"HEALTHY"'
   rm -f "${RESP}"
 fi

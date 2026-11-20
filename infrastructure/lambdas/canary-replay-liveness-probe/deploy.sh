@@ -224,6 +224,6 @@ if $SMOKE; then
     "${RESP}")
   cat "${RESP}"
   echo ""
-  # SMOKE_SEMANTIC_EXEMPTION: the success branch is time-window and live-marker dependent; an on-demand invoke cannot force it
   assert_no_function_error "${INVOKE_STDOUT}" "${RESP}"
+  # SMOKE_SEMANTIC_EXEMPTION: the probe only checks inside its calendar window, which cannot be forced by the payload.
 fi
