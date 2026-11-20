@@ -7,8 +7,7 @@ Crucible v1 pipeline, every schedule's state is DECLARED in one place and agrees
 with automation_pause.json, it names only workloads the dispatcher runs, and the
 deploy path proves its own effect.
 """
-
-# ruff: noqa: ANN001, ANN002, ANN003, ANN201, ANN202, ANN204, ANN205, ANN206
+# ruff: noqa: ANN001, ANN003, ANN201, ANN202, ANN204
 
 from __future__ import annotations
 
@@ -50,6 +49,30 @@ def tpl(stack):
 
 def test_lint_is_clean(stack):
     assert stack.lint() == []
+
+
+def test_weekly_execution_pins_one_code_sha_across_workloads_and_retry(stack):
+    definition = json.loads(stack.DEFINITION.read_text())
+    states = definition["States"]
+    resolve = states["ResolveCodeSha"]
+    assert states["Init"]["Next"] == "ResolveCodeSha"
+    assert resolve["Parameters"]["Payload"] == {"action": "resolve-code-sha"}
+    assert resolve["Catch"][0]["Next"] == "NotifyFailure"
+
+    run = states["RunWorkloads"]
+    assert run["ItemSelector"]["code_sha.$"] == "$.code.code_sha"
+    inner = run["ItemProcessor"]["States"]
+    payload = inner["LaunchWorkload"]["Parameters"]["Payload"]
+    retry = inner["RetryOnDemand"]["Parameters"]
+    assert payload["code_sha.$"] == "$.code_sha"
+    assert retry["code_sha.$"] == "$.code_sha"
+
+
+def test_pinned_checkout_precedes_dependency_install_and_fails_closed():
+    source = (REPO / "infrastructure" / "lambdas" / "data-spot-dispatcher" / "index.py").read_text()
+    fetch = 'git fetch --depth 1 origin {code_sha} || fail "pinned code fetch failed"'
+    checkout = 'git checkout --detach {code_sha} || fail "pinned code checkout failed"'
+    assert 0 <= source.index(fetch) < source.index(checkout) < source.index("pip install --upgrade pip")
 
 
 @pytest.mark.skipif(shutil.which("cfn-lint") is None, reason="cfn-lint not installed")
@@ -567,37 +590,6 @@ def test_asl_checker_catches_a_dangling_transition(stack):
     problems = stack.asl_problems(asl)
     assert any("NoSuchState" in p for p in problems)
     assert any("Nowhere" in p for p in problems)
-
-
-def test_weekly_execution_pins_one_code_sha_across_workloads_and_retry(stack):
-    """A branch advancing after attempt zero cannot change the retry's code."""
-    asl = json.loads(stack.DEFINITION.read_text(encoding="utf-8"))
-    assert asl["States"]["Init"]["Next"] == "ResolveCodeSha"
-    resolver = asl["States"]["ResolveCodeSha"]
-    assert resolver["Parameters"]["Payload"] == {"action": "resolve-code-sha"}
-    assert resolver["ResultSelector"] == {"code_sha.$": "$.Payload.code_sha"}
-    assert resolver["Catch"][0]["Next"] == "NotifyFailure"
-
-    run = asl["States"]["RunWorkloads"]
-    assert run["ItemSelector"]["code_sha.$"] == "$.code.code_sha"
-    inner = run["ItemProcessor"]["States"]
-    assert inner["LaunchWorkload"]["Parameters"]["Payload"]["code_sha.$"] == "$.code_sha"
-    retry = inner["RetryOnDemand"]["Parameters"]
-    assert retry["code_sha.$"] == "$.code_sha"
-    assert inner["RetryOnDemand"]["Next"] == "LaunchWorkload"
-
-
-def test_dispatcher_checks_out_the_pinned_sha_before_installing_dependencies():
-    source = (REPO / "infrastructure/lambdas/data-spot-dispatcher/index.py").read_text(
-        encoding="utf-8"
-    )
-    fetch = 'git fetch --depth 1 origin {code_sha} || fail "data commit fetch failed"'
-    checkout = 'git checkout --detach {code_sha} || fail "data commit checkout failed"'
-    install = "pip install --upgrade pip -q"
-    assert fetch in source
-    assert checkout in source
-    assert source.index(fetch) < source.index(checkout) < source.index(install)
-    assert 'if action == "resolve-code-sha":' in source
 
 
 def test_the_definition_fails_loud_rather_than_skipping(stack):

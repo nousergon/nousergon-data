@@ -17,17 +17,13 @@
     },
     "ResolveCodeSha": {
       "Type": "Task",
-      "Comment": "Resolve the data repository branch once per execution. Every workload attempt receives this immutable commit; a resolution failure fails the execution rather than dispatching an unpinned branch head.",
+      "Comment": "Resolve main once per execution. Every workload and its on-demand retry checks out this immutable nousergon-data commit; resolution failure fails loud rather than using a moving branch head.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "${DispatcherFunctionArn}",
-        "Payload": {
-          "action": "resolve-code-sha"
-        }
+        "Payload": {"action": "resolve-code-sha"}
       },
-      "ResultSelector": {
-        "code_sha.$": "$.Payload.code_sha"
-      },
+      "ResultSelector": {"code_sha.$": "$.Payload.code_sha"},
       "ResultPath": "$.code",
       "Catch": [
         {
