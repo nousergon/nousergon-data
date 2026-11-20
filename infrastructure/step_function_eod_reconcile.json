@@ -628,16 +628,18 @@
     },
     "WaitForEOD": {
       "Type": "Task",
-      "Comment": "alpha-engine-config-I8703: observe-only liveness-aware poll iteration. The existing Status-based Choice remains authoritative for terminal routing; observe verdict for 5 successful EOD cycles before a separate promotion change.",
+      "Comment": "alpha-engine-config-I8703: route this EOD SSM poll through the shared liveness poller so absent output fields are normalised and bounded output tails reach failure notifications in detail. Liveness classification is OBSERVE-ONLY: downstream routing still reads Status, preserving every success, pending, retry and failure outcome. Promote verdict-based routing only in a separate change after 3 successful EOD cycles.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-ssm-liveness-poller",
         "Payload": {
           "instance_id.$": "$.trading_instance_id[0]",
           "command_id.$": "$.eod_result.Command.CommandId",
-          "max_attempts": 80,
-          "max_ping_misses": 1,
-          "step": "eod-reconcile"
+          "max_attempts": 42,
+          "max_ping_misses": 3,
+          "step": "eod-reconcile",
+          "attempts": 0,
+          "ping_misses": 0
         }
       },
       "TimeoutSeconds": 20,
@@ -700,11 +702,6 @@
         {
           "Variable": "$.eod_poll.Status",
           "StringEquals": "Delayed",
-          "Next": "EODWait"
-        },
-        {
-          "Variable": "$.eod_poll.Status",
-          "StringEquals": "Registering",
           "Next": "EODWait"
         }
       ],
@@ -813,16 +810,18 @@
     },
     "WaitForRefreshExecutorDeploy": {
       "Type": "Task",
-      "Comment": "alpha-engine-config-I8703: observe-only liveness-aware poll iteration. The existing Status-based Choice remains authoritative for terminal routing; observe verdict for 5 successful EOD cycles before a separate promotion change.",
+      "Comment": "alpha-engine-config-I8703: route this EOD SSM poll through the shared liveness poller so absent output fields are normalised and bounded output tails reach failure notifications in detail. Liveness classification is OBSERVE-ONLY: downstream routing still reads Status, preserving every success, pending, retry and failure outcome. Promote verdict-based routing only in a separate change after 3 successful EOD cycles.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-ssm-liveness-poller",
         "Payload": {
           "instance_id.$": "$.trading_instance_id[0]",
           "command_id.$": "$.refresh_executor_deploy_result.Command.CommandId",
-          "max_attempts": 80,
-          "max_ping_misses": 1,
-          "step": "refresh-executor-deploy"
+          "max_attempts": 42,
+          "max_ping_misses": 3,
+          "step": "refresh-executor-deploy",
+          "attempts": 0,
+          "ping_misses": 0
         }
       },
       "TimeoutSeconds": 20,
@@ -885,11 +884,6 @@
         {
           "Variable": "$.refresh_executor_deploy_poll.Status",
           "StringEquals": "Delayed",
-          "Next": "RefreshExecutorDeployWait"
-        },
-        {
-          "Variable": "$.refresh_executor_deploy_poll.Status",
-          "StringEquals": "Registering",
           "Next": "RefreshExecutorDeployWait"
         }
       ],

@@ -43,31 +43,12 @@ _DEFS = {
 # nothing else, which is strictly worse than the 2026-08-26 preopen failure that
 # at least carried the SSM agent's generic stderr line.
 #
-# All three use the DIRECT `aws-sdk:ssm:getCommandInvocation` integration rather
-# than the ssm-liveness-poller Lambda, and their ResultSelectors lift only
-# Status / ResponseCode / StatusDetails / CommandId / InstanceId. The one-line
-# fix — adding `StandardErrorContent.$` and `StandardOutputContent.$` — is NOT
-# obviously safe: a ResultSelector `.$` path that is absent in the response
-# raises States.Runtime, killing the stage it was meant to explain, and the EOD
-# pipeline cannot be rehearsed on demand (sf-pipeline-policy.md §7a). Tracked
-# with the two options in alpha-engine-config-I8703; consolidating them onto the
-# Lambda poller, which normalises absent fields, is the recommended route.
-#
-# alpha-engine-config-I11269 (post-close split, 2026-09-30): no new poller was
-# written. WaitForEOD MOVED, byte-identical, into the reconcile machine, and
-# WaitForRefreshExecutorDeploy is the same state carried by BOTH machines (each
-# boots the box, so each refreshes the checkout) — the uncovered code is the
-# same three pollers, now counted per machine they live in.
+# alpha-engine-config-I8703 moved the remaining entries to the shared
+# ssm-liveness-poller, which normalises optional SSM output fields and bounds
+# both tails before placing them in detail. Keep the explicit empty set: the
+# two-sided assertions below make any new gap fail while ensuring a fixed entry
+# can never linger as an accepted exception.
 _UNCOVERED_POLLERS: set[tuple[str, str]] = set()
-
-_EOD_LIVENESS_POLLERS = {
-    ("eod", "WaitForCaptureSnapshot"): "SnapshotStatusError",
-    ("eod", "WaitForRefreshExecutorDeploy"): "RefreshExecutorDeployStatusError",
-    ("eod_reconcile", "WaitForEOD"): "EODStatusError",
-    ("eod_reconcile", "WaitForRefreshExecutorDeploy"): (
-        "RefreshExecutorDeployStatusError"
-    ),
-}
 
 # A field whose value plausibly carries what the script printed.
 _DIAGNOSTIC_FIELDS = ("StandardErrorContent", "StandardOutputContent", "detail")
@@ -137,6 +118,73 @@ def test_every_ssm_poller_carries_a_diagnostic_field() -> None:
     )
 
 
+def test_affected_eod_pollers_use_the_bounded_diagnostic_contract() -> None:
+    """I8703: keep the four migrated loops on the shared poller contract."""
+    affected = {
+        ("eod", "WaitForCaptureSnapshot", "snapshot_poll", "snapshot_result"),
+        (
+            "eod",
+            "WaitForRefreshExecutorDeploy",
+            "refresh_executor_deploy_poll",
+            "refresh_executor_deploy_result",
+        ),
+        ("eod_reconcile", "WaitForEOD", "eod_poll", "eod_result"),
+        (
+            "eod_reconcile",
+            "WaitForRefreshExecutorDeploy",
+            "refresh_executor_deploy_poll",
+            "refresh_executor_deploy_result",
+        ),
+    }
+
+    for which, name, poll, command in affected:
+        state = _load(which)["States"][name]
+        assert state["Resource"] == "arn:aws:states:::lambda:invoke"
+        payload = state["Parameters"]["Payload"]
+        assert payload["command_id.$"] == f"$.{command}.Command.CommandId"
+        assert payload["instance_id.$"] == "$.trading_instance_id[0]"
+        assert payload["attempts"] == 0
+        assert payload["ping_misses"] == 0
+
+        selector = state["ResultSelector"]
+        assert selector["detail.$"] == "$.Payload.detail"
+        assert selector["StandardErrorContent.$"] == "$.Payload.stderr_tail"
+        assert "StandardOutputContent.$" not in selector
+        assert "stdout_tail.$" not in selector
+        assert "OBSERVE-ONLY" in state["Comment"]
+        assert "3 successful EOD cycles" in state["Comment"]
+
+
+def test_affected_eod_failures_propagate_detail_to_notifications() -> None:
+    """Terminal normalizers must retain detail before SNS serialises error."""
+    cases = {
+        "eod": {
+            "SnapshotStatusError": "$.snapshot_poll.detail",
+            "RefreshExecutorDeployStatusError": (
+                "$.refresh_executor_deploy_poll.detail"
+            ),
+        },
+        "eod_reconcile": {
+            "EODStatusError": "$.eod_poll.detail",
+            "RefreshExecutorDeployStatusError": (
+                "$.refresh_executor_deploy_poll.detail"
+            ),
+        },
+    }
+    for which, states in cases.items():
+        definition = _load(which)["States"]
+        for name, detail_path in states.items():
+            assert definition[name]["Parameters"]["detail.$"] == detail_path
+
+    eod = _load("eod")["States"]
+    assert "$.error" in eod["PageCaptureSnapshotFailureImmediate"][
+        "Parameters"
+    ]["Message.$"]
+    assert "$.error" in eod["PageCaptureSnapshotIrreversibleFailure"][
+        "Parameters"
+    ]["Message.$"]
+
+
 def test_output_tails_never_enter_sf_state_via_a_resultselector() -> None:
     """The tails ride in `detail`, and must NOT be mapped as their own fields.
 
@@ -164,57 +212,3 @@ def test_output_tails_never_enter_sf_state_via_a_resultselector() -> None:
             assert "StandardOutputContent" not in selector, (
                 f"{which}:{name} maps StandardOutputContent — same class."
             )
-
-
-def test_eod_pollers_use_normalized_bounded_diagnostics_in_observe_mode() -> None:
-    """EOD shares the poller contract without promoting liveness routing."""
-    for (which, name), error_state_name in _EOD_LIVENESS_POLLERS.items():
-        states = _load(which)["States"]
-        state = states[name]
-        selector = state["ResultSelector"]
-
-        assert state["Resource"] == "arn:aws:states:::lambda:invoke"
-        assert state["Parameters"]["FunctionName"].endswith(
-            ":function:alpha-engine-ssm-liveness-poller"
-        )
-        assert selector["detail.$"] == "$.Payload.detail"
-        assert selector["StandardErrorContent.$"] == "$.Payload.stderr_tail"
-        assert "StandardOutputContent.$" not in selector
-
-        # Observe mode is load-bearing: existing Status choices, rather than
-        # the new verdict, continue to decide success/retry/failure outcomes.
-        choice = states[state["Next"]]
-        assert all(
-            item.get("Variable", "").endswith(".Status")
-            for item in choice["Choices"]
-        )
-        registering = [
-            item for item in choice["Choices"]
-            if item.get("StringEquals") == "Registering"
-        ]
-        assert len(registering) == 1
-        assert registering[0]["Next"].endswith("Wait")
-        assert "observe verdict for 5 successful EOD cycles" in state["Comment"]
-
-        # The normalized error is what HandleFailure and CaptureSnapshot's
-        # immediate/exhausted-retry pages serialize into their SNS messages.
-        error_state = states[error_state_name]
-        poll_path = state["ResultPath"]
-        assert error_state["Parameters"]["detail.$"] == f"{poll_path}.detail"
-
-
-def test_liveness_poller_normalizes_absent_output_fields_and_bounds_tails() -> None:
-    """The shared contract makes optional SSM output safe for ASL selectors."""
-    source = (
-        _REPO_ROOT
-        / "infrastructure"
-        / "lambdas"
-        / "ssm-liveness-poller"
-        / "index.py"
-    ).read_text()
-
-    assert 'inv.get("StandardErrorContent") or ""' in source
-    assert 'inv.get("StandardOutputContent") or ""' in source
-    assert '"detail": ""' in source
-    assert "_STDERR_TAIL_CHARS = 1500" in source
-    assert "_STDOUT_TAIL_CHARS = 2000" in source
