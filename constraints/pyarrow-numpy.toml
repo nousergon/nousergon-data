@@ -145,7 +145,7 @@ kind = "bootstrap"
 
 # ---------------------------------------------------------------------------
 [venvs.dashboard]
-about = "The v1 crucible-dashboard (alpha-engine-dashboard) venv on the weekly-freshness and backtest spot boxes. Its dependency set allows NumPy 2 and pyarrow 26 or newer; it retires with the v1 weekly SF."
+about = "The v1 crucible-dashboard (alpha-engine-dashboard) venv on the weekly-freshness and backtest spot boxes. Its dependency set allows NumPy 2 and pyarrow 26 or newer."
 pyarrow = ">=26.0.1"
 numpy_below_2 = false
 
@@ -323,7 +323,7 @@ pyarrow_ignore = []
 # Libraries: compatible with every consumer, never equal to one of them.
 
 [libraries.nousergon-lib]
-about = "nousergon-lib, installed from git into every crucible/data venv below. Its pyarrow/numpy live in optional extras ([quant*], [rag], parquet extras), so its ranges must remain compatible with every consumer."
+about = "nousergon-lib, installed from git into every crucible/data venv below. Its pyarrow/numpy live in optional extras ([quant*], [rag], parquet extras). The dashboard venv forces numpy<2 while data needs pyarrow >= 26, so a numpy>=2 floor or a pyarrow>=26 floor here would make one consumer uninstallable."
 repo = "nousergon-lib"
 pyarrow = ">=14.0"
 numpy = ">=1.24"

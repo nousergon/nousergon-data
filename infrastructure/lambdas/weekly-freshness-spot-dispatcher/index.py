@@ -441,8 +441,8 @@ deactivate
 #
 # (measured 2026-08-15, execution watch-rerun-2026-08-15-2).
 #
-# Keep a second venv so the dashboard and alpha-engine-data each run with the
-# dependency set declared by their own repository.
+# Keep a separate data venv: the dashboard and data checkouts each own their
+# dependency closure, and the weekly stages invoke both interpreters.
 echo "[weekly-freshness-spot-bootstrap] building alpha-engine-data venv..."
 cd /home/ec2-user/alpha-engine-data
 # python3.12 literally, for the same reason as the dashboard venv above: an
@@ -526,9 +526,7 @@ def _terminate_instance(instance_id: str) -> None:
     spot_dispatch.terminate_on_failure(instance_id, region=REGION, label="weekly-freshness")
 
 
-def handler(
-    event: dict[str, object], context: object
-) -> dict[str, object]:  # noqa: ARG001 — Lambda contract
+def handler(event: dict[str, object], context: object) -> dict[str, object]:  # noqa: ARG001 — Lambda contract
     """Step Function handler — launch the weekly pipeline's launcher spot box.
 
     `event` carries `{"force_on_demand": bool}` (defaults False). BOTH SF

@@ -13,8 +13,8 @@ once reached its comparison (measured 2026-08-15, weekly-SF execution
     ERROR   [__main__] Drift check failed at stage=arctic_list:
       No module named 'arcticdb'
 
-The two closures remain separate so each repository supplies its own dependency
-set without one install overriding the other.
+The two closures remain separate because the dashboard and data checkouts own
+different dependency sets and weekly stages invoke both interpreters.
 """
 
 from __future__ import annotations
@@ -62,7 +62,7 @@ def _requirements_krepis_pin() -> str:
     return m.group(1)
 
 
-def _version(v: str) -> tuple[int, ...]:
+def _version(v: str) -> tuple:
     return tuple(int(p) for p in v.split("."))
 
 
@@ -97,14 +97,16 @@ def test_nothing_overrides_the_data_venvs_own_krepis_pin() -> None:
 
 
 def test_data_venv_is_separate_from_the_dashboard_venv() -> None:
-    """Each repository gets a venv populated from its own requirements."""
+    """Each checkout gets its own dependency closure."""
     src = _src()
     assert "pip install -q 'numpy<2'" not in src, (
-        "the dashboard venv must resolve the NumPy version allowed by its "
-        "requirements rather than receiving a bootstrap override"
+        "the dashboard venv must use the NumPy version resolved by its own "
+        "requirements"
     )
+    assert "cd /home/ec2-user/alpha-engine-dashboard" in src
+    assert "cd /home/ec2-user/alpha-engine-data" in src
     assert src.count("python3.12 -m venv .venv") == 2, (
-        "the bootstrap must still provision separate dashboard and data venvs"
+        "the bootstrap must continue provisioning separate dashboard and data venvs"
     )
 
 
