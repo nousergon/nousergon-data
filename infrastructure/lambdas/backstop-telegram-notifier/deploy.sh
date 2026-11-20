@@ -219,6 +219,6 @@ EOF
   cat "${RESP}"
   echo ""
   assert_no_function_error "${INVOKE_STDOUT}" "${RESP}"
-  assert_json_response_field "${RESP}" "status" '"ok"'
+  assert_json_response_field_equals "${RESP}" sent 1
   rm -f "${RESP}"
 fi

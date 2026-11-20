@@ -1,7 +1,6 @@
 # shellcheck shell=bash
 #
-# smoke.sh — the ONE assertion every deploy.sh's --smoke path calls after
-# invoking its Lambda: did the handler CRASH. Nothing else.
+# smoke.sh — shared assertions for every deploy.sh's --smoke path.
 # (alpha-engine-config-I7535, following the I7379 fix on one script.)
 #
 # WHY. `aws lambda invoke` exits 0 when the handler RAISES — a handler
@@ -99,66 +98,57 @@ sys.exit(0)
 PY
 }
 
-# Assert one handler-specific response field.  EXPECTED is JSON (so booleans,
-# numbers and strings are compared without grep/quoting ambiguities).
-assert_json_response_field() {
-  local resp_file="${1:?assert_json_response_field: response file required}"
-  local field="${2:?assert_json_response_field: field required}"
-  local expected="${3:?assert_json_response_field: expected JSON required}"
+# Assert one top-level field in a handler's JSON response.  The expected value
+# is itself JSON, so callers can distinguish booleans/numbers from strings.
+# This deliberately lives beside the universal crash assertion: deploy scripts
+# supply the per-handler contract, while parsing and fail-loud diagnostics stay
+# shared (policy-shared-code).
+assert_json_response_field_equals() {
+  local resp_file="${1:?assert_json_response_field_equals: response file required}"
+  local field="${2:?assert_json_response_field_equals: field required}"
+  local expected_json="${3:?assert_json_response_field_equals: expected JSON required}"
 
-  python3 - "${resp_file}" "${field}" "${expected}" <<'PY'
+  python3 - "${resp_file}" "${field}" "${expected_json}" <<'PY'
 import json
 import sys
 
-path, field, expected_json = sys.argv[1:]
+resp_path, field, expected_json = sys.argv[1:]
 try:
-    with open(path, encoding="utf-8") as response:
-        body = json.load(response)
+    with open(resp_path, encoding="utf-8") as stream:
+        response = json.load(stream)
     expected = json.loads(expected_json)
 except (OSError, json.JSONDecodeError) as exc:
-    print(f"SMOKE FAILED: cannot read semantic response: {exc}", file=sys.stderr)
+    print(f"SMOKE FAILED: cannot read semantic response contract: {exc}", file=sys.stderr)
     sys.exit(1)
 
-actual = body
-for component in field.split("."):
-    if not isinstance(actual, dict) or component not in actual:
-        print(f"SMOKE FAILED: response lacks expected field {field!r}: {body!r}", file=sys.stderr)
-        sys.exit(1)
-    actual = actual[component]
-if actual != expected:
+if not isinstance(response, dict) or response.get(field) != expected:
+    actual = response.get(field) if isinstance(response, dict) else response
     print(
-        f"SMOKE FAILED: response field {field!r} was {actual!r}, expected {expected!r}",
+        f"SMOKE FAILED: expected response field {field!r} to equal "
+        f"{expected!r}; got {actual!r}.",
         file=sys.stderr,
     )
     sys.exit(1)
 PY
 }
 
-# Some contracts have a state-dependent result but still expose proof that the
-# work was performed.  In those cases the presence of that proof is semantic;
-# an empty/quiet response is not.
-assert_json_response_has_field() {
-  local resp_file="${1:?assert_json_response_has_field: response file required}"
-  local field="${2:?assert_json_response_has_field: field required}"
-
+assert_json_response_field_present() {
+  local resp_file="${1:?assert_json_response_field_present: response file required}"
+  local field="${2:?assert_json_response_field_present: field required}"
   python3 - "${resp_file}" "${field}" <<'PY'
 import json
 import sys
 
-path, field = sys.argv[1:]
+resp_path, field = sys.argv[1:]
 try:
-    with open(path, encoding="utf-8") as response:
-        body = json.load(response)
+    with open(resp_path, encoding="utf-8") as stream:
+        response = json.load(stream)
 except (OSError, json.JSONDecodeError) as exc:
-    print(f"SMOKE FAILED: cannot read semantic response: {exc}", file=sys.stderr)
+    print(f"SMOKE FAILED: cannot read semantic response contract: {exc}", file=sys.stderr)
     sys.exit(1)
-
-actual = body
-for component in field.split("."):
-    if not isinstance(actual, dict) or component not in actual:
-        print(f"SMOKE FAILED: response lacks expected field {field!r}: {body!r}", file=sys.stderr)
-        sys.exit(1)
-    actual = actual[component]
+if not isinstance(response, dict) or field not in response or response[field] in (None, ""):
+    print(f"SMOKE FAILED: response lacks non-empty field {field!r}.", file=sys.stderr)
+    sys.exit(1)
 PY
 }
 

@@ -224,6 +224,6 @@ if $SMOKE; then
     "${RESP}")
   cat "${RESP}"
   echo ""
+  # SMOKE_SEMANTIC_EXEMPTION: success depends on a real run marker and the live checking window; the read-only payload cannot create either.
   assert_no_function_error "${INVOKE_STDOUT}" "${RESP}"
-  # SMOKE_SEMANTIC_EXEMPTION: the probe only checks inside its calendar window, which cannot be forced by the payload.
 fi

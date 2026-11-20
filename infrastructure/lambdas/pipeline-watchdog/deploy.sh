@@ -307,6 +307,6 @@ if $SMOKE; then
   cat "${RESP}"
   echo ""
   assert_no_function_error "${INVOKE_STDOUT}" "${RESP}"
-  assert_json_response_has_field "${RESP}" "checks"
+  assert_json_response_field_present "${RESP}" fired_at_utc
   rm -f "${RESP}"
 fi

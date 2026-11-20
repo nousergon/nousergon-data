@@ -340,6 +340,6 @@ EOF
   cat "${RESP}"
   echo ""
   assert_no_function_error "${INVOKE_STDOUT}" "${RESP}"
-  assert_json_response_field "${RESP}" "recorded" "true"
+  assert_json_response_field_equals "${RESP}" recorded true
   rm -f "${RESP}"
 fi
