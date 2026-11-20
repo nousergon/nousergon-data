@@ -3246,10 +3246,10 @@ def _self_heal_chronic_polygon_gaps(
       1. Read ArcticDB universe ``last_date``.
       2. If ``last_date >= target_date``, skip (already fresh — common case
          after the first heal lands).
-      3. Else yfinance-fetch an overlapping window through ``target_date``.
-         If an overlapping close changed (for example, because a dividend
-         changed yfinance's adjustment factor), re-fetch the full cached
-         history so old and new rows stay on one adjusted basis.
+      3. Else yfinance-fetch ``[last_date, target_date]`` OHLCV so the last
+         stored row overlaps the response.  If its adjusted close changed,
+         re-fetch the whole cached range: a dividend has restated history and
+         appending the short response would leave two adjustment scales.
       4. Append the new rows to ``predictor/price_cache/{ticker}.parquet``
          (dedupe by date keep="last" so repeated heals are idempotent). Wave 3
          PR1 mirrors the put to ``reference/price_cache/{ticker}.parquet`` via
@@ -3305,6 +3305,7 @@ def _self_heal_chronic_polygon_gaps(
         return summary
 
     import pandas as _pd
+    from pandas import DataFrame as _DataFrame
 
     for ticker in chronic_tickers:
         try:
@@ -3325,7 +3326,7 @@ def _self_heal_chronic_polygon_gaps(
                 continue
 
             start_ts = (
-                (existing_last - _pd.Timedelta(days=7))
+                existing_last
                 if existing_last is not None
                 else (target_ts - _pd.Timedelta(days=30))
             )
@@ -3345,6 +3346,8 @@ def _self_heal_chronic_polygon_gaps(
                     # stall is capped rather than eating the whole state timeout.
                     timeout=30,
                 )
+            if not isinstance(yf_df, _DataFrame):
+                raise TypeError("yfinance returned a non-DataFrame result")
             if isinstance(yf_df.columns, _pd.MultiIndex):
                 yf_df.columns = yf_df.columns.get_level_values(0)
 
@@ -3356,7 +3359,9 @@ def _self_heal_chronic_polygon_gaps(
                 continue
 
             ohlcv_cols = ["Open", "High", "Low", "Close", "Volume"]
-            new_rows = yf_df[[c for c in ohlcv_cols if c in yf_df.columns]].copy()
+            fetched_rows: _DataFrame = yf_df.loc[
+                :, [c for c in ohlcv_cols if c in yf_df.columns]
+            ].copy()
 
             # Wave 3 PR4 (cutover): read via the read-prefix chain (now
             # ``reference/price_cache/`` only) for the existing-rows union,
@@ -3364,7 +3369,7 @@ def _self_heal_chronic_polygon_gaps(
             # only). Post-cutover both chains resolve to the reference home;
             # the legacy ``predictor/price_cache/`` tree is removed live via
             # ``aws s3 rm`` (see builders/_price_cache_writeboth.py).
-            existing_pcache = _pd.DataFrame(columns=ohlcv_cols)
+            existing_pcache: _DataFrame = _pd.DataFrame(columns=ohlcv_cols)
             for _read_prefix in _price_cache_read_prefixes():
                 try:
                     obj = s3.get_object(
@@ -3377,46 +3382,61 @@ def _self_heal_chronic_polygon_gaps(
                 except s3.exceptions.NoSuchKey:
                     continue
 
-            overlap: _pd.Index = existing_pcache.index.intersection(new_rows.index)  # pyright: ignore[reportUnknownVariableType,reportUnknownMemberType,reportAttributeAccessIssue]
-            if "Close" in existing_pcache and "Close" in new_rows and len(overlap):  # pyright: ignore[reportUnknownArgumentType]
-                old_close: _pd.Series = existing_pcache.loc[overlap, "Close"].astype(float)  # pyright: ignore[reportUnknownVariableType,reportUnknownMemberType]
-                fresh_close: _pd.Series = new_rows.loc[overlap, "Close"].astype(float)  # pyright: ignore[reportUnknownVariableType,reportUnknownMemberType,reportAttributeAccessIssue]
-                close_scale: _pd.Series = old_close.abs().clip(lower=1.0)  # pyright: ignore[reportUnknownVariableType,reportUnknownMemberType]
-                adjustment_changed: bool = bool((  # pyright: ignore[reportUnknownArgumentType,reportUnknownMemberType]
-                    (old_close - fresh_close).abs() > close_scale * 1e-6  # pyright: ignore[reportUnknownMemberType]
-                ).any())
-                if adjustment_changed:
-                    full_start = _pd.Timestamp(  # pyright: ignore[reportUnknownVariableType,reportUnknownMemberType]
-                        str(existing_pcache.index.min())  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType]
-                    ).normalize()  # pyright: ignore[reportAttributeAccessIssue]
-                    with quiet_yfinance():
-                        yf_df = _yf.download(  # pyright: ignore[reportUnknownMemberType]
-                            ticker,
-                            start=full_start.strftime("%Y-%m-%d"),  # pyright: ignore[reportUnknownMemberType]
-                            end=end_excl.strftime("%Y-%m-%d"),
-                            progress=False,
-                            auto_adjust=True,
-                            timeout=30,
-                        )
-                    if not isinstance(yf_df, _pd.DataFrame):
-                        raise TypeError("yfinance returned a non-DataFrame result")
-                    if isinstance(yf_df.columns, _pd.MultiIndex):
-                        yf_df.columns = yf_df.columns.get_level_values(0)  # pyright: ignore[reportUnknownMemberType]
-                    yf_df = yf_df[  # pyright: ignore[reportUnknownVariableType]
-                        (yf_df.index >= full_start) & (yf_df.index <= target_ts)
-                    ]
-                    if yf_df.empty:  # pyright: ignore[reportUnknownMemberType]
-                        raise ValueError(
-                            "yfinance returned no rows for full-history adjustment refresh"
-                        )
-                    new_rows = yf_df[  # pyright: ignore[reportUnknownVariableType,reportUnknownMemberType]
-                        [c for c in ohlcv_cols if c in yf_df.columns]  # pyright: ignore[reportUnknownMemberType]
-                    ].copy()
+            # Validate the stored side before a full-history replacement can
+            # hide a corrupt future row from the write-time guard below.
+            if not dry_run:
+                _assert_no_bar_after(
+                    existing_pcache.index,
+                    target_date,
+                    artifact=f"price_cache/{ticker}.parquet",
+                )
 
-            combined_pcache = _pd.concat([existing_pcache, new_rows])
+            # auto_adjust=True restates all pre-ex-date rows when a dividend
+            # enters the requested window.  Compare the deliberately
+            # overlapping boundary row before appending; a changed close means
+            # the cached history is on the old adjustment scale and must be
+            # replaced, not joined to the new scale.
+            adjustment_changed = bool(
+                existing_last is not None
+                and existing_last in existing_pcache.index
+                and existing_last in fetched_rows.index
+                and "Close" in existing_pcache
+                and "Close" in fetched_rows
+                and float(existing_pcache.at[existing_last, "Close"])
+                != float(fetched_rows.at[existing_last, "Close"])
+            )
+            if adjustment_changed:
+                full_start = _pd.Timestamp(str(existing_pcache.index.min())).normalize()
+                with quiet_yfinance():
+                    full_df = _yf.download(
+                        ticker,
+                        start=full_start.strftime("%Y-%m-%d"),
+                        end=end_excl.strftime("%Y-%m-%d"),
+                        progress=False,
+                        auto_adjust=True,
+                        timeout=30,
+                    )
+                if not isinstance(full_df, _DataFrame):
+                    raise TypeError("yfinance returned a non-DataFrame full history")
+                if isinstance(full_df.columns, _pd.MultiIndex):
+                    full_df.columns = full_df.columns.get_level_values(0)
+                full_df = full_df[
+                    (full_df.index >= full_start) & (full_df.index <= target_ts)
+                ]
+                if full_df.empty:
+                    raise ValueError("yfinance returned no rows for full-history restatement")
+                combined_pcache = full_df[
+                    [c for c in ohlcv_cols if c in full_df.columns]
+                ].copy()
+            else:
+                combined_pcache = _pd.concat([existing_pcache, fetched_rows])
+
             combined_pcache = combined_pcache[
                 ~combined_pcache.index.duplicated(keep="last")
             ].sort_index()
+            new_rows = fetched_rows[
+                fetched_rows.index > existing_last
+            ] if existing_last is not None else fetched_rows
 
             if not dry_run:
                 try:
