@@ -85,7 +85,7 @@ import urllib.request
 from collections import defaultdict
 from dataclasses import replace as dc_replace
 from datetime import date, datetime, timedelta, timezone
-from typing import Any
+from typing import Any, cast
 
 import boto3
 import yaml
@@ -573,9 +573,11 @@ def apply_dynamic_severity(
     specs: list[ArtifactSpec],
     critical_arms_by_id: dict[str, list[str]],
 ) -> tuple[list[ArtifactSpec], set[str]]:
-    """Coerce effective severity to ``critical`` for rows whose
+    """Apply champion-dependent policy to rows whose
     ``critical_while_champion_arm`` names the live champion arm
-    (config-I3086). Returns ``(specs, coerced_ids)``.
+    (config-I3086). Returns ``(specs, champion_dependent_ids)``; the IDs
+    include rows already declared critical because they still need the
+    champion freshness floor in :func:`_run_probe_pass`.
 
     Root incident: ``research_free_backfill`` was correctly
     ``severity=warning`` at registration (observational backfill); the
@@ -591,18 +593,57 @@ def apply_dynamic_severity(
     coerced: set[str] = set()
     for spec in specs:
         arms = critical_arms_by_id.get(spec.artifact_id)
-        if arms and spec.severity != "critical" and (read_failed or arm in arms):
-            logger.info(
-                "dynamic severity (config-I3086): %s %s→critical "
-                "(champion_arm=%s%s)",
-                spec.artifact_id, spec.severity, arm,
-                "; pointer unreadable — fail-loud coercion" if read_failed else "",
-            )
-            out.append(dc_replace(spec, severity="critical"))
+        if arms and (read_failed or arm in arms):
             coerced.add(spec.artifact_id)
+            if spec.severity != "critical":
+                logger.info(
+                    "dynamic severity (config-I3086): %s %s→critical "
+                    "(champion_arm=%s%s)",
+                    spec.artifact_id, spec.severity, arm,
+                    "; pointer unreadable — fail-loud coercion" if read_failed else "",
+                )
+                out.append(dc_replace(spec, severity="critical"))
+            else:
+                out.append(spec)
         else:
             out.append(spec)
     return out, coerced
+
+
+def _apply_champion_freshness_floor(
+    spec: ArtifactSpec,
+    result: CheckResult,
+    now: datetime,
+) -> CheckResult:
+    """Fail a champion dependency written before the last closed session.
+
+    This monitor-side re-grade deliberately leaves nousergon-lib's shared
+    cadence floor unchanged. It only tightens a ``fresh`` verdict, so any
+    independently stricter deadline or cadence verdict remains intact.
+    """
+    if result.state != "fresh" or result.last_modified is None:
+        return result
+
+    floor = datetime.combine(
+        cast(date, last_closed_trading_day(now)), datetime.min.time(), timezone.utc
+    )
+    if result.last_modified >= floor:
+        return result
+
+    violated_minutes = max(
+        1, int((floor - result.last_modified).total_seconds() // 60)
+    )
+    return dc_replace(
+        result,
+        state="stale",
+        sla_violated_by_minutes=violated_minutes,
+        reason=(
+            f"{result.reason}; champion dependency {spec.artifact_id} "
+            "last_modified="
+            f"{result.last_modified.isoformat()} older than monitor-side "
+            f"freshness floor {floor.isoformat()}"
+        ),
+    )
 
 
 # ── Producer-trigger suppression (alpha-engine-config-I6570) ────────────────
@@ -4664,7 +4705,9 @@ def _handle_intraday(s3_client: Any, now: datetime, started_at: float) -> dict:
      run_evidence_prefix_by_id) = (
         load_registry_with_recovery(s3_client, REGISTRY_BUCKET, REGISTRY_KEY)
     )
-    specs, _coerced = apply_dynamic_severity(s3_client, specs, critical_arms_by_id)
+    specs, champion_dependent_ids = apply_dynamic_severity(
+        s3_client, specs, critical_arms_by_id
+    )
     intraday_specs = [s for s in specs if s.artifact_id in INTRADAY_ARTIFACT_IDS]
     missing_ids = INTRADAY_ARTIFACT_IDS - {s.artifact_id for s in intraday_specs}
     if missing_ids:
@@ -4710,6 +4753,7 @@ def _handle_intraday(s3_client: Any, now: datetime, started_at: float) -> dict:
         # it is threaded so there is exactly one way check_freshness is called.
         list_cache=_new_list_cache(),
         run_evidence_prefix_by_id=run_evidence_prefix_by_id,
+        champion_dependent_ids=champion_dependent_ids,
     )
 
     duration_seconds = round(time.time() - started_at, 2)
@@ -4747,6 +4791,7 @@ def _run_probe_pass(
     list_cache: dict | None = None,
     run_evidence_prefix_by_id: dict[str, str] | None = None,
     precomputed_results: dict[str, CheckResult] | None = None,
+    champion_dependent_ids: set[str] | None = None,
 ) -> tuple[
     list[tuple[ArtifactSpec, CheckResult]], int, int, int, dict[str, int],
     dict[str, Any],
@@ -4836,6 +4881,8 @@ def _run_probe_pass(
             result, exc = precomputed_results[spec.artifact_id], None
         else:
             result, exc = _check_one(s3_client, spec, now, list_cache=list_cache)
+        if spec.artifact_id in (champion_dependent_ids or set()):
+            result = _apply_champion_freshness_floor(spec, result, now)
         if exc is not None:
             per_spec_exceptions += 1
             logger.warning(
@@ -5296,6 +5343,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         # config-I6831 — lifts a suppression where the producer RAN.
         run_evidence_prefix_by_id=run_evidence_prefix_by_id,
         precomputed_results=precomputed_results,
+        champion_dependent_ids=coerced_ids,
     )
     t_spec_loop_done = time.time()
     owning_by_id = pass_telemetry["owning_by_id"]

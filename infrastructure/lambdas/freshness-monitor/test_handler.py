@@ -2071,6 +2071,122 @@ def test_dynamic_severity_no_listed_rows_skips_pointer_read(fake_s3):
     assert calls == []
 
 
+def test_champion_policy_includes_rows_already_declared_critical(fake_s3):
+    """The freshness floor is champion-dependent even when severity needs no
+    coercion."""
+    fake_s3._registry_body = _CHAMPION_ARM_REGISTRY
+    import dataclasses
+    import index
+    specs, _r, arms, _esc, _rem, _pt, _do, _rev = index.load_registry_with_recovery(
+        fake_s3, "b", "k"
+    )
+    specs[0] = dataclasses.replace(specs[0], severity="critical")
+    _keyed_get_object(fake_s3, {
+        index.CHAMPION_POINTER_KEY:
+            b'{"schema_version": 1, "champion": "scanner_predictor_direct"}',
+    })
+
+    effective_specs, champion_ids = index.apply_dynamic_severity(
+        fake_s3, specs, arms
+    )
+
+    assert effective_specs[0].severity == "critical"
+    assert champion_ids == {"champion_feed"}
+
+
+@pytest.mark.parametrize(
+    ("now", "last_modified", "expected_state", "expected_floor"),
+    [
+        # A Saturday write remains usable Monday before the close, but is
+        # stale by Tuesday's daily probe: one closed trading session later.
+        (
+            datetime(2026, 8, 10, 12, tzinfo=timezone.utc),
+            datetime(2026, 8, 8, 11, 31, 1, tzinfo=timezone.utc),
+            "fresh",
+            None,
+        ),
+        (
+            datetime(2026, 8, 11, 12, tzinfo=timezone.utc),
+            datetime(2026, 8, 8, 11, 31, 1, tzinfo=timezone.utc),
+            "stale",
+            "2026-08-10T00:00:00+00:00",
+        ),
+        # MLK Day (2026-01-19) is not a trading session. Tuesday pre-open
+        # still uses Friday; Wednesday advances the floor to Tuesday.
+        (
+            datetime(2026, 1, 20, 12, tzinfo=timezone.utc),
+            datetime(2026, 1, 16, 18, tzinfo=timezone.utc),
+            "fresh",
+            None,
+        ),
+        (
+            datetime(2026, 1, 21, 12, tzinfo=timezone.utc),
+            datetime(2026, 1, 16, 18, tzinfo=timezone.utc),
+            "stale",
+            "2026-01-20T00:00:00+00:00",
+        ),
+    ],
+)
+def test_champion_freshness_floor_is_at_most_one_closed_trading_day(
+    now, last_modified, expected_state, expected_floor,
+):
+    import index
+    spec = index.ArtifactSpec(
+        artifact_id="research_free_backfill",
+        s3_bucket="alpha-engine-research",
+        s3_key_template=(
+            "predictor/research_free_backfill/"
+            "predictor_outcomes_research_free.parquet"
+        ),
+        cadence="eod_sf",
+        sla_minutes_after_cron=360,
+        severity="critical",
+        owner_repo="nousergon-data",
+        created_at=date(2026, 1, 1),
+    )
+    substrate_result = index.CheckResult(
+        state="fresh",
+        last_modified=last_modified,
+        reason="fresh under shared eod_sf floor",
+    )
+
+    result = index._apply_champion_freshness_floor(spec, substrate_result, now)
+
+    assert result.state == expected_state
+    if expected_floor is not None:
+        assert expected_floor in result.reason
+        # A dynamically-critical champion dependency reaches the critical
+        # page decision as soon as the monitor-side floor marks it stale.
+        assert index._maybe_alert(spec, result, now) is True
+
+
+def test_champion_floor_does_not_change_nonmatching_row_verdict():
+    """Only IDs returned by champion resolution are re-graded in the pass."""
+    import index
+    spec = index.ArtifactSpec(
+        artifact_id="research_free_backfill",
+        s3_bucket="alpha-engine-research",
+        s3_key_template="predictor/research_free_backfill/feed.parquet",
+        cadence="eod_sf",
+        sla_minutes_after_cron=360,
+        severity="warning",
+        owner_repo="nousergon-data",
+        created_at=date(2026, 1, 1),
+    )
+    result = index.CheckResult(
+        state="fresh",
+        last_modified=datetime(2026, 8, 8, 11, 31, tzinfo=timezone.utc),
+    )
+
+    pairs, *_rest = index._run_probe_pass(
+        mock.Mock(), [spec], {}, datetime(2026, 8, 11, 12, tzinfo=timezone.utc),
+        precomputed_results={spec.artifact_id: result},
+        champion_dependent_ids=set(),
+    )
+
+    assert pairs[0][1] is result
+
+
 def _warning_spec_and_missing_result(index):
     from nousergon_lib.artifact_freshness import CheckResult
     spec = index.ArtifactSpec(
