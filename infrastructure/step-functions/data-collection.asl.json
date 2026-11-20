@@ -13,6 +13,29 @@
         "verify_units.$": "$.verify_units",
         "started_at.$": "$$.Execution.StartTime"
       },
+      "Next": "ResolveCodeSha"
+    },
+    "ResolveCodeSha": {
+      "Type": "Task",
+      "Comment": "Resolve the data repository branch once per execution. Every workload attempt receives this immutable commit; a resolution failure fails the execution rather than dispatching an unpinned branch head.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${DispatcherFunctionArn}",
+        "Payload": {
+          "action": "resolve-code-sha"
+        }
+      },
+      "ResultSelector": {
+        "code_sha.$": "$.Payload.code_sha"
+      },
+      "ResultPath": "$.code",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "NotifyFailure"
+        }
+      ],
       "Next": "CheckRequireTradingDay"
     },
     "CheckRequireTradingDay": {
@@ -87,6 +110,7 @@
         "workload.$": "$$.Map.Item.Value",
         "execution_id.$": "$$.Execution.Id",
         "pipeline_role.$": "$.collection",
+        "code_sha.$": "$.code.code_sha",
         "force_on_demand": false,
         "attempts": 0
       },
@@ -105,6 +129,7 @@
                 "workload.$": "$.workload",
                 "execution_id.$": "$.execution_id",
                 "pipeline_role.$": "$.pipeline_role",
+                "code_sha.$": "$.code_sha",
                 "force_on_demand.$": "$.force_on_demand"
               }
             },
@@ -230,6 +255,7 @@
               "workload.$": "$.workload",
               "execution_id.$": "$.execution_id",
               "pipeline_role.$": "$.pipeline_role",
+              "code_sha.$": "$.code_sha",
               "force_on_demand": true,
               "attempts.$": "States.MathAdd($.attempts, 1)"
             },
