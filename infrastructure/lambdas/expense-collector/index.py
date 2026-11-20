@@ -104,7 +104,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, cast
+from typing import Any, TypedDict, cast
 
 import boto3
 
@@ -176,6 +176,19 @@ SNAPSHOT_PREFIX = "expenses/snapshots/"
 COST_RAW_PREFIX = "decision_artifacts/_cost_raw/"
 ALERT_STATE_PREFIX = "expenses/alert_state/"
 RECONCILIATION_PREFIX = "expenses/reconciliation/"
+DEGRADED_COST_SOURCES = frozenset({"unpriced", "usage_unreported"})
+
+
+class CostSourceDegradation(TypedDict):
+    date: str
+    callsite_id: str
+    cost_source: str
+    count: int
+
+
+class CostSourceScan(TypedDict, total=False):
+    counts: list[CostSourceDegradation]
+    error: str
 
 # AWS spend source: the CUR 2.0 billing export, NEVER Cost Explorer
 # (alpha-engine-config-I12168, Brian 2026-10-08: "shut Cost Explorer down
@@ -207,7 +220,6 @@ CUR_MAX_AGE_HOURS = float(os.environ.get("EXPENSE_CUR_MAX_AGE_HOURS", "36"))
 CUR_FINALISED_BY_DAY = 5
 # Covered usage and its negation cancel; the recurring fee is the commitment.
 _CUR_NETTING_LINE_TYPES = {"SavingsPlanCoveredUsage", "SavingsPlanNegation"}
-DEGRADED_COST_SOURCES = {"unpriced", "usage_unreported"}
 
 # Export product code -> the SERVICE name Cost Explorer emitted, which
 # EXPENSE_BUDGETS.yaml keys every AWS line on. Kept in step with
@@ -593,58 +605,78 @@ def run_over_budget_alerts(s3: Any, period: str, rows: list[dict]) -> dict:  # p
         return {"alerted": [], "error": str(exc)[:300]}
 
 
-def scan_cost_source_degradations(s3: Any, now: datetime) -> list[dict[str, Any]]:  # pyright: ignore[reportExplicitAny]  # untyped SDK object and JSON records
-    """Count soft cost-record degradations in the trailing seven UTC days.
+def scan_cost_source_degradations(
+        s3: Any, now: datetime) -> CostSourceScan:  # pyright: ignore[reportExplicitAny]  # untyped SDK object
+    """Count soft cost-record degradations in the last seven UTC partitions.
 
-    An unreadable object or record aborts the scan: callers must surface that
-    as unknown rather than publishing a misleading zero.
+    Listing and reading are deliberately one fenced operation: an incomplete
+    S3 scan is unknown, never a truthful zero. The caller records ``error`` in
+    the rollup warnings while allowing expense collection to continue.
     """
     counts: dict[tuple[str, str, str], int] = {}
-    paginator = s3.get_paginator("list_objects_v2")
-    today = now.astimezone(timezone.utc).date()
-    for offset in range(7):
-        day = (today - timedelta(days=offset)).isoformat()
-        prefix = f"{COST_RAW_PREFIX}{day}/"
-        for page in paginator.paginate(Bucket=BUCKET, Prefix=prefix):
-            for obj in page.get("Contents", []):
-                body = s3.get_object(Bucket=BUCKET, Key=obj["Key"])["Body"].read()
-                for line in body.splitlines():
-                    if not line.strip():
+    try:
+        paginator = s3.get_paginator("list_objects_v2")
+        for days_ago in range(7):
+            day = (now.date() - timedelta(days=days_ago)).isoformat()
+            prefix = f"{COST_RAW_PREFIX}{day}/"
+            for page in paginator.paginate(Bucket=BUCKET, Prefix=prefix):
+                for obj in page.get("Contents", []):
+                    key = obj["Key"]
+                    if not key.endswith(".jsonl"):
                         continue
-                    record = json.loads(line)
-                    source = record.get("cost_source")
-                    if source not in DEGRADED_COST_SOURCES:
-                        continue
-                    callsite = str(record.get("callsite_id") or "(unknown)")
-                    key = (day, callsite, source)
-                    counts[key] = counts.get(key, 0) + 1
-    return [
-        {"date": day, "callsite_id": callsite, "cost_source": source, "count": count}
-        for (day, callsite, source), count in sorted(counts.items())
-    ]
+                    body = s3.get_object(Bucket=BUCKET, Key=key)["Body"].read()
+                    for line in body.splitlines():
+                        if not line.strip():
+                            continue
+                        record = json.loads(line)
+                        source = record.get("cost_source")
+                        if source not in DEGRADED_COST_SOURCES:
+                            continue
+                        assert isinstance(source, str)
+                        callsite = str(record.get("callsite_id") or "(unknown)")
+                        group = (day, callsite, source)
+                        counts[group] = counts.get(group, 0) + 1
+    except Exception as exc:  # noqa: BLE001 — soft signal must not fail rollup
+        error = f"cost-source degradation scan failed: {type(exc).__name__}: {exc}"[:500]
+        logger.warning(error)
+        return {"counts": [], "error": error}
+    return {
+        "counts": [
+            {"date": day, "callsite_id": callsite, "cost_source": source,
+             "count": count}
+            for (day, callsite, source), count in sorted(counts.items())
+        ]
+    }
 
 
-def alert_cost_source_degradations(degradations: list[dict[str, Any]]) -> bool:  # pyright: ignore[reportExplicitAny]  # free-form alert context
-    """Send one non-fatal Telegram digest for degraded cost records."""
-    if not degradations:
-        return False
+def alert_cost_source_degradations(scan: CostSourceScan) -> dict[str, object]:
+    """Send one non-fatal Telegram digest for non-zero degraded-cost groups."""
+    counts = scan.get("counts", [])
+    if not counts or scan.get("error"):
+        return {"alerted": False}
     lines = [
         f"{item['date']} | {item['callsite_id']} | {item['cost_source']} | {item['count']}"
-        for item in degradations
+        for item in counts
     ]
-    text = ("\u26a0\ufe0f *Cost records need pricing/usage attention*\n"
-            "Date | callsite | source | count\n" + "\n".join(lines))
+    text = (
+        "\u26a0\ufe0f *Cost records need pricing/usage attention*\n"
+        "date | callsite | cost_source | count\n" + "\n".join(lines)
+    )
     try:
-        return notify_via_flow_doctor(
+        sent = notify_via_flow_doctor(
             text, silent=False, severity="warning",
-            dedup_key=f"{_FLOW_NAME}:cost-source-degradation:{degradations}",
+            dedup_key=f"{_FLOW_NAME}:cost-source-degradation:{_now_utc().date().isoformat()}",
             flow_name=_FLOW_NAME, topics=_ALERT_TOPICS, db_basename=_DB_BASENAME,
-            context={"degradations": degradations},
+            context={"degraded_cost_records": counts},
             source="flow-doctor:expense-collector",
         )
-    except Exception as exc:  # noqa: BLE001 — notification must not fail rollup
-        logger.warning("cost-source degradation Telegram send failed (non-fatal): %s", exc)
-        return False
+        if not sent:
+            logger.warning("cost-source degradation alert was not delivered (non-fatal)")
+            return {"alerted": False, "error": "notification was not delivered"}
+        return {"alerted": bool(sent), "groups": len(counts)}
+    except Exception as exc:  # noqa: BLE001 — notification-only; rollup already landed
+        logger.warning("cost-source degradation alert failed (non-fatal): %s", exc)
+        return {"alerted": False, "error": str(exc)[:300]}
 
 
 def _alert_balance_depletion(row: dict, period: str) -> bool:
@@ -2285,13 +2317,10 @@ def _collect(event: dict, context: Any) -> dict:  # noqa: ARG001 — Lambda cont
 
     rows.extend(fixed_rows(budgets, {r["key"] for r in rows}))
 
-    try:
-        cost_source_degradations = scan_cost_source_degradations(s3, now)
-    except Exception as exc:  # noqa: BLE001 — soft signal, never blocks rollup
-        cost_source_degradations = None
-        warning = f"cost-source degradation scan failed: {type(exc).__name__}: {exc}"
-        warnings.append(warning)
-        logger.warning(warning, exc_info=True)
+    cost_source_scan = scan_cost_source_degradations(s3, now)
+    scan_error = cost_source_scan.get("error")
+    if scan_error:
+        warnings.append(scan_error)
 
     ok_rows = [r for r in rows if r["status"] in {"ok", "fixed"}]
     err_rows = [r for r in rows if r["status"] == "error"]
@@ -2313,7 +2342,6 @@ def _collect(event: dict, context: Any) -> dict:  # noqa: ARG001 — Lambda cont
         "providers": rows,
         "totals": totals,
         "warnings": warnings,
-        "cost_source_degradations": cost_source_degradations,
     }
     _put_json(s3, f"{MONTHLY_PREFIX}{mw['period']}.json", doc)
     _put_json(s3, LATEST_KEY, doc)
@@ -2327,7 +2355,7 @@ def _collect(event: dict, context: Any) -> dict:  # noqa: ARG001 — Lambda cont
     # budget and out of money are different questions, and the fleet was taken
     # down by the second one while the first was green.
     balance_alert_result = run_balance_depletion_alerts(s3, mw["period"], rows)
-    cost_source_alerted = alert_cost_source_degradations(cost_source_degradations or [])
+    cost_source_alert_result = alert_cost_source_degradations(cost_source_scan)
 
     if err_rows and not ok_rows:
         # Every live adapter failed — systemic (network/creds/deploy) breakage,
@@ -2338,9 +2366,10 @@ def _collect(event: dict, context: Any) -> dict:  # noqa: ARG001 — Lambda cont
     # GitHub outage can never cost the rollup or the over-budget page.
     spend_monitor_dispatch = _dispatch_spend_monitor()
 
-    return {"period": mw["period"], "providers": len(rows),  # pyright: ignore[reportUnknownVariableType]  # legacy free-form Lambda response
+    return {"period": mw["period"], "providers": len(rows),  # pyright: ignore[reportUnknownVariableType]  # existing handler response contains legacy untyped adapter rows
             "errors": [(r["key"], r["error"]) for r in err_rows],
             "totals": totals, "alerts": alert_result,
             "balance_alerts": balance_alert_result,
-            "cost_source_alerted": cost_source_alerted,
+            "cost_source_degradations": cost_source_scan,
+            "cost_source_alert": cost_source_alert_result,
             "spend_monitor_dispatch": spend_monitor_dispatch}
