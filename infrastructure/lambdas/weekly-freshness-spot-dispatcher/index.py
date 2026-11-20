@@ -441,8 +441,10 @@ deactivate
 #
 # (measured 2026-08-15, execution watch-rerun-2026-08-15-2).
 #
-# Keep a separate data venv: the dashboard and data checkouts each own their
-# dependency closure, and the weekly stages invoke both interpreters.
+# The two dependency sets stay in separate venvs: the dashboard venv serves
+# the launcher commands, while alpha-engine-data declares the complete closure
+# needed by its own health checks. Installing data's requirements into the
+# dashboard venv would make those independently owned closures drift together.
 echo "[weekly-freshness-spot-bootstrap] building alpha-engine-data venv..."
 cd /home/ec2-user/alpha-engine-data
 # python3.12 literally, for the same reason as the dashboard venv above: an

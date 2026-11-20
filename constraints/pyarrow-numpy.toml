@@ -145,7 +145,7 @@ kind = "bootstrap"
 
 # ---------------------------------------------------------------------------
 [venvs.dashboard]
-about = "The v1 crucible-dashboard (alpha-engine-dashboard) venv on the weekly-freshness and backtest spot boxes. Its dependency set allows NumPy 2 and pyarrow 26 or newer."
+about = "The v1 crucible-dashboard (alpha-engine-dashboard) venv on the weekly-freshness and backtest spot boxes. Its dependencies allow NumPy 2 and pyarrow 26 or newer; it retires with the v1 weekly SF."
 pyarrow = ">=26.0.1"
 numpy_below_2 = false
 
