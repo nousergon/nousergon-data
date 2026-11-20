@@ -9,6 +9,9 @@ for itself, and that it can never fail the run.
 """
 from __future__ import annotations
 
+# Existing modules predate the repository-wide ANN gate.
+# ruff: noqa: ANN001, ANN003, ANN201, ANN202, ANN204, ANN205
+
 import json
 import pathlib
 
@@ -44,34 +47,6 @@ def test_it_receives_the_context_values_it_cannot_derive_for_itself(states):
     assert payload["execution_input.$"] == "$$.Execution.Input"
 
 
-def test_execution_local_scope_controls_the_terminal_through_degraded_route(states):
-    choice = states["CheckExecutionScope"]
-    routes = {
-        next(part["StringEquals"] for part in rule["And"] if "StringEquals" in part):
-        rule["Next"]
-        for rule in choice["Choices"]
-    }
-    assert routes == {
-        "PARTIAL": "MarkExecutionScopeIncomplete",
-        "UNAVAILABLE": "MarkExecutionScopeIncomplete",
-    }
-    assert choice["Default"] == "CheckSkipReportCard"
-    assert states["MarkExecutionScopeIncomplete"]["Next"] == "CheckSkipReportCard"
-    assert states["MarkExecutionScopeIncomplete"]["Parameters"]["degraded"] is True
-
-
-def test_completion_markers_retain_the_execution_scope_verdict(states):
-    for name in (
-        "WriteCompletionMarker",
-        "WriteCompletionMarkerCalendar",
-        "WriteCompletionMarkerDegraded",
-        "WriteCompletionMarkerDegradedCalendar",
-    ):
-        body = states[name]["Parameters"]["Body.$"]
-        assert "$.run_scope_result.Payload.execution_scope" in body
-        assert "skipped_producers" in body
-
-
 def test_it_honours_the_shell_run_dry_contract(states):
     """`research_dry` is this pipeline's canonical dry signal.
 
@@ -89,7 +64,7 @@ def test_it_runs_after_every_work_stage_and_before_the_report_card(states):
     fail-opened its substrate health check would produce a card with no scope
     beside it.
     """
-    assert states["RunScope"]["Next"] == "CheckExecutionScope"
+    assert states["RunScope"]["Next"] == "CheckSkipReportCard"
     predecessors = {
         name for name, body in states.items()
         if name != "RunScope" and '"RunScope"' in json.dumps(
@@ -121,7 +96,7 @@ def test_nothing_else_still_routes_straight_to_the_report_card_gate(states):
             {k: v for k, v in body.items() if k != "Comment"}
         )
     }
-    assert stragglers == {"CheckExecutionScope", "MarkExecutionScopeIncomplete"}
+    assert stragglers == set()
 
 
 def test_it_can_never_fail_the_run(states):
@@ -130,7 +105,7 @@ def test_it_can_never_fail_the_run(states):
     failure handler."""
     catches = states["RunScope"]["Catch"]
     assert [c["ErrorEquals"] for c in catches] == [["States.ALL"]]
-    assert all(c["Next"] == "CheckExecutionScope" for c in catches)
+    assert all(c["Next"] == "CheckSkipReportCard" for c in catches)
     assert all(c["ResultPath"] == "$.run_scope_error" for c in catches)
 
 
@@ -149,6 +124,32 @@ def test_the_state_timeout_binds_before_the_lambda_timeout(states):
     tests/test_sf_lambda_timeout_ordering.py.
     """
     assert states["RunScope"]["TimeoutSeconds"] == 45
+
+
+def test_terminal_scope_is_derived_from_this_execution(states):
+    terminal = states["ClassifyExecutionScope"]
+    payload = terminal["Parameters"]["Payload"]
+    assert states["WeeklyCoverageSweep"]["Next"] == "ClassifyExecutionScope"
+    assert payload["execution_arn.$"] == "$$.Execution.Id"
+    assert payload["execution_input.$"] == "$$.Execution.Input"
+    assert payload["terminal_scope"] is True
+    assert terminal["ResultPath"] == "$.execution_scope_result"
+
+
+def test_only_complete_terminal_scope_can_continue_toward_success(states):
+    choice = states["CheckExecutionScope"]
+    routes = {rule["And"][1]["StringEquals"]: rule["Next"] for rule in choice["Choices"]}
+    assert routes == {
+        "VACUOUS": "CheckRunSlotHeldBeforeVacuousRun",
+        "PARTIAL": "PartialScopeRun",
+        "UNAVAILABLE": "ExecutionScopeUnavailable",
+    }
+    assert choice["Default"] == "CheckExecutionDidWork"
+    assert states["PartialScopeRun"]["Type"] == "Fail"
+    assert states["PartialScopeRun"]["Error"] == "PartialScopeRun"
+    assert "skipped_producers" in states["PartialScopeRun"]["CausePath"] or (
+        "execution_scope" in states["PartialScopeRun"]["CausePath"]
+    )
 
 
 # ---------------------------------------------------------------------------

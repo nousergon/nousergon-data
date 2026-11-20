@@ -106,6 +106,9 @@ Read-only by default; nothing is mutated without ``--start``.
 
 from __future__ import annotations
 
+# Existing modules predate the repository-wide ANN gate.
+# ruff: noqa: ANN001, ANN003, ANN201, ANN202, ANN204, ANN205
+
 import argparse
 import json
 import re
@@ -113,7 +116,6 @@ import sys
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import cast
 
 # sys.path insertion (not a package import) so this resolves identically
 # whether run directly (`python scripts/weekly_sf_rerun.py`) or loaded by
@@ -1127,7 +1129,7 @@ class CadenceSkipsUnreadable(RuntimeError):
     """
 
 
-def cadence_declared_skips(path: Path = None) -> dict:
+def cadence_declared_skips(path: Path | None = None) -> dict[str, bool]:
     """The ``skip_*`` flags the SCHEDULED weekly run declares for itself.
 
     Parsed out of ``SaturdayTrigger.Targets[saturday-pipeline].Input`` in
@@ -1178,7 +1180,7 @@ class RerunPlan:
     completed: list = field(default_factory=list)   # stage names
     degraded: list = field(default_factory=list)    # stage names (re-run!)
     failed: list = field(default_factory=list)      # stage names
-    skip_flags: dict = field(default_factory=dict)  # flag -> True
+    skip_flags: dict[str, bool] = field(default_factory=dict)  # flag -> True
     warnings: list = field(default_factory=list)
     notes: list = field(default_factory=list)
 
@@ -1203,7 +1205,6 @@ class RerunPlan:
     # describe-execution answers "who decided this empty run was right, and
     # why" without anyone having to find the terminal that launched it.
     accept_vacuous_reason: str = ""
-    skipped_producer_reasons: dict[str, str] = field(default_factory=dict)
 
     # alpha-engine-config-I12228: the cycle's collection-readiness anchor (an
     # RFC3339 instant), emitted as ``collection_not_before``. See
@@ -1211,7 +1212,7 @@ class RerunPlan:
     # out and the SF's InitializeInput floor (the rerun's own start) applies.
     collection_not_before: str = ""
 
-    def rerun_input(self) -> dict[str, object]:
+    def rerun_input(self) -> dict:
         """The emitted StartExecution input.
 
         Non-``skip_*`` keys pass through from the source execution
@@ -1255,7 +1256,7 @@ class RerunPlan:
         exactly as I7259 requires. An unreadable declaration RAISES — see
         ``CadenceSkipsUnreadable``.
         """
-        out: dict[str, object] = {
+        out = {
             k: v for k, v in self.original_input.items()
             if not k.startswith("skip_")
         }
@@ -1271,12 +1272,25 @@ class RerunPlan:
         if self.calendar_date:
             out["calendar_date"] = self.calendar_date
         out["pipeline_role"] = EMITTED_ROLE
-        out.update(cast(dict[str, object], declared))
-        out.update(cast(dict[str, object], self.skip_flags))
+        out.update(declared)
+        out.update(self.skip_flags)
+        # alpha-engine-config-I13864: every producer deliberately omitted from
+        # a recovery carries its own durable explanation. This is generated
+        # from the emitted set (not inherited input), so the record cannot name
+        # a skip the recovery did not request or omit one it did.
+        emitted_skip_flags = sorted(
+            {str(flag) for flag in declared} | {str(flag) for flag in self.skip_flags}
+        )
+        out["skipped_producer_reasons"] = {
+            flag: (
+                f"{flag} is declared by the weekly cadence"
+                if flag in declared else
+                f"{flag} was derived from producer completion in the recovery chain"
+            )
+            for flag in emitted_skip_flags
+        }
         if self.accept_vacuous_reason:
             out["vacuous_rerun_accepted_reason"] = self.accept_vacuous_reason
-        if self.skipped_producer_reasons:
-            out["skipped_producer_reasons"] = dict(self.skipped_producer_reasons)
         if self.collection_not_before:
             out["collection_not_before"] = self.collection_not_before
         return out
@@ -2001,33 +2015,6 @@ class VacuousRerunError(Exception):
     """
 
 
-class PartialRerunError(Exception):
-    """A recovery skips some, but not all, declared producer stages."""
-
-
-def require_partial_rerun_reason(
-    sm_def: dict[str, object],
-    sm_arn: str,
-    rerun_input: dict[str, object],
-    reason: str | None,
-) -> dict[str, str]:
-    """Require and retain a reason for every producer a recovery skips."""
-    spine = _landed_spine(sm_arn, sm_def)
-    enterable = cast(
-        tuple[str, ...], enabled_spine_stages(sm_def, rerun_input, spine)
-    )
-    skipped = tuple(stage for stage in spine if stage not in enterable)
-    if not skipped or not enterable:
-        return {}
-    clean_reason = (reason or "").strip()
-    if not clean_reason:
-        raise PartialRerunError(
-            "partial recovery skips declared producers "
-            f"{', '.join(skipped)}; --partial-rerun-reason must explain why"
-        )
-    return {stage: clean_reason for stage in skipped}
-
-
 def refuse_vacuous_rerun(
     sm_def: dict, sm_arn: str, rerun_input: dict, accept_reason: str | None
 ) -> tuple:
@@ -2324,13 +2311,6 @@ def main(argv: list | None = None) -> int:
         ),
     )
     ap.add_argument(
-        "--partial-rerun-reason", metavar="REASON", default="",
-        help=(
-            "required to --start a recovery that skips some declared producer "
-            "stages; retained in the execution input for every skipped producer"
-        ),
-    )
-    ap.add_argument(
         "--rerun-stage",
         action="append",
         default=[],
@@ -2466,25 +2446,11 @@ def main(argv: list | None = None) -> int:
             "declare it before re-running this pipeline through this script "
             "(alpha-engine-config-I11075)."
         )
-    enterable = cast(
-        tuple[str, ...], enabled_spine_stages(sm_def, plan.rerun_input(), spine)
-    )
+    enterable = enabled_spine_stages(sm_def, plan.rerun_input(), spine)
     if enterable:
         plan.notes.append(
             "spine stages this input can still enter: " + ", ".join(enterable)
         )
-        if len(enterable) < len(spine):
-            try:
-                plan.skipped_producer_reasons = require_partial_rerun_reason(
-                    sm_def,
-                    args.state_machine_arn,
-                    plan.rerun_input(),
-                    args.partial_rerun_reason,
-                )
-            except PartialRerunError as exc:
-                if args.start:
-                    raise SystemExit(f"FATAL: {exc}") from exc
-                cast(list[str], plan.warnings).append(str(exc))
     else:
         plan.accept_vacuous_reason = args.accept_vacuous_rerun
         plan.warnings.append(

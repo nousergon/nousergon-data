@@ -7905,7 +7905,7 @@
         "Bucket": "alpha-engine-research",
         "Key.$": "States.Format('{}_sf_completion/ne-weekly-freshness-pipeline/{}.json', $.rehearsal_marker.ns_prefix, $.run_date)",
         "ContentType": "application/json",
-        "Body.$": "States.Format('\\{\"sf\":\"ne-weekly-freshness-pipeline\",\"execution_arn\":\"{}\",\"status\":\"SUCCEEDED\",\"claim\":\"sf_execution_terminal\",\"cycle_verdict\":\"unknown\",\"started_at\":\"{}\",\"completed_at\":\"{}\",\"cycle_key\":\"{}\",\"substrate_relaunches\":{},\"model_zoo_unservable\":{},\"director_retro_refused\":{},\"cost_coverage_gap\":{},\"weekly_preflight_blind_spot\":{},\"execution_scope\":{},\"skipped_producers\":{}\\}', $$.Execution.Id, $$.Execution.StartTime, $$.State.EnteredTime, $.run_date, $.substrate_relaunch_attempts, States.JsonToString($.model_zoo_unservable), States.JsonToString($.director_retro_refused), States.JsonToString($.cost_coverage_gap), States.JsonToString($.weekly_preflight_blind_spot), States.JsonToString($.run_scope_result.Payload.execution_scope), States.JsonToString($.run_scope_result.Payload.execution_scope.skipped_producers))"
+        "Body.$": "States.Format('\\{\"sf\":\"ne-weekly-freshness-pipeline\",\"execution_arn\":\"{}\",\"status\":\"SUCCEEDED\",\"claim\":\"sf_execution_terminal\",\"cycle_verdict\":\"unknown\",\"started_at\":\"{}\",\"completed_at\":\"{}\",\"cycle_key\":\"{}\",\"substrate_relaunches\":{},\"model_zoo_unservable\":{},\"director_retro_refused\":{},\"cost_coverage_gap\":{},\"weekly_preflight_blind_spot\":{}\\}', $$.Execution.Id, $$.Execution.StartTime, $$.State.EnteredTime, $.run_date, $.substrate_relaunch_attempts, States.JsonToString($.model_zoo_unservable), States.JsonToString($.director_retro_refused), States.JsonToString($.cost_coverage_gap), States.JsonToString($.weekly_preflight_blind_spot))"
       },
       "TimeoutSeconds": 60,
       "Retry": [
@@ -9960,7 +9960,7 @@
         "payload.$": "$.Payload"
       },
       "ResultPath": "$.coverage_sweep",
-      "Next": "CheckExecutionDidWork"
+      "Next": "ClassifyExecutionScope"
     },
     "CheckExecutionDidWork": {
       "Comment": "alpha-engine-config-I9693 - THE VACUOUS-RUN TERMINAL. An execution that entered NONE of the pipeline's declared spine stages must not reach a Succeed terminal. MEASURED, five consecutive Saturdays: every scheduled weekly run 2026-08-15 through 2026-09-12 FAILED (five DIFFERENT causes - PredictorBacktest rc=1, a Director APITimeoutError, weekly_aggregate_costs_fail_open twice, and an SNS AuthorizationError in HandleFailure), and every one was 'recovered' by an operator rerun with every producer skipped, which reported SUCCEEDED. watch-rerun-2026-09-11-1 set 26 skip_* flags, entered ZERO of the 16 declared spine stages, ran 2m03s, and is indistinguishable from a four-hour full run in list-executions. A green recovery path is worse than a red run because it stops anyone looking (engagement-protocol-policy 5: detection blindness outranks the defects it hides). sf-pipeline-policy.md 2.3: a run that reaches its terminal having skipped its work must not terminate as a clean success - the same Option-A ruling (2026-07-28, alpha-engine-config#2699) that gave this definition its DegradedRun terminal, applied one level up, to a run that was not degraded because it never started. | WHY HERE AND NOT EARLIER: the completion marker and the coverage sweep both still run on a vacuous execution, and must - alpha-engine-config-I8186 explicitly forbids fixing this by making WriteCompletionMarker unreachable from recovery reruns, because a genuine recovery that DOES complete the spine has to keep writing it. The discriminator is the work verdict, never the execution's role or its name. This Choice is therefore the LAST thing the run does, after the marker is written and after the sweep has augmented it with the cycle's real shape. | WHY IT IS NOT A WIDENED SUCCESS CONDITION IN REVERSE: it fires ONLY on an explicit boolean false. Absent, null, or any non-boolean value takes the Default and the run terminates exactly as it did before - a sweep that could not read the cycle reports outcome=unavailable and pages through WeeklyCoverageSweepUnavailable, which is the surface for an unmeasured run. An unknown is never rendered green AND never manufactured into a red. | NOT REACHABLE FROM THE THU/FRI GATE-OUT (WeeklyRunDaySkip terminates upstream of every stage) NOR FROM THE FRIDAY-PM SHELL RUN (its only terminals are ShellRunComplete and DegradedRun; it never enters WriteCompletionMarker or this tail), so neither designed no-op can be turned red by this.",
@@ -10184,7 +10184,7 @@
         "Bucket": "alpha-engine-research",
         "Key.$": "States.Format('{}_sf_completion/ne-weekly-freshness-pipeline/{}.json', $.rehearsal_marker.ns_prefix, $.run_date)",
         "ContentType": "application/json",
-        "Body.$": "States.Format('\\{\"sf\":\"ne-weekly-freshness-pipeline\",\"execution_arn\":\"{}\",\"status\":\"DEGRADED\",\"claim\":\"sf_execution_terminal\",\"cycle_verdict\":\"unknown\",\"started_at\":\"{}\",\"completed_at\":\"{}\",\"cycle_key\":\"{}\",\"degraded_summary\":{},\"model_zoo_unservable\":{},\"director_retro_refused\":{},\"cost_coverage_gap\":{},\"weekly_preflight_blind_spot\":{},\"execution_scope\":{},\"skipped_producers\":{}\\}', $$.Execution.Id, $$.Execution.StartTime, $$.State.EnteredTime, $.run_date, States.JsonToString($.degraded_summary), States.JsonToString($.model_zoo_unservable), States.JsonToString($.director_retro_refused), States.JsonToString($.cost_coverage_gap), States.JsonToString($.weekly_preflight_blind_spot), States.JsonToString($.run_scope_result.Payload.execution_scope), States.JsonToString($.run_scope_result.Payload.execution_scope.skipped_producers))"
+        "Body.$": "States.Format('\\{\"sf\":\"ne-weekly-freshness-pipeline\",\"execution_arn\":\"{}\",\"status\":\"DEGRADED\",\"claim\":\"sf_execution_terminal\",\"cycle_verdict\":\"unknown\",\"started_at\":\"{}\",\"completed_at\":\"{}\",\"cycle_key\":\"{}\",\"degraded_summary\":{},\"model_zoo_unservable\":{},\"director_retro_refused\":{},\"cost_coverage_gap\":{},\"weekly_preflight_blind_spot\":{}\\}', $$.Execution.Id, $$.Execution.StartTime, $$.State.EnteredTime, $.run_date, States.JsonToString($.degraded_summary), States.JsonToString($.model_zoo_unservable), States.JsonToString($.director_retro_refused), States.JsonToString($.cost_coverage_gap), States.JsonToString($.weekly_preflight_blind_spot))"
       },
       "ResultPath": "$.degraded_marker_result",
       "TimeoutSeconds": 60,
@@ -10578,12 +10578,12 @@
             "States.ALL"
           ],
           "Comment": "Advisory \u2014 a missing scope artifact must not fail the run. The consumer treats an ABSENT run_scope.json as 'scope unknown, grade nothing', never as 'everything ran'.",
-          "Next": "CheckExecutionScope",
+          "Next": "CheckSkipReportCard",
           "ResultPath": "$.run_scope_error"
         }
       ],
       "ResultPath": "$.run_scope_result",
-      "Next": "CheckExecutionScope"
+      "Next": "CheckSkipReportCard"
     },
     "PitParityCompareResourceKill": {
       "Type": "Pass",
@@ -10669,7 +10669,7 @@
         "Bucket": "alpha-engine-research",
         "Key.$": "States.Format('{}_sf_completion/ne-weekly-freshness-pipeline/{}.json', $.rehearsal_marker.ns_prefix, $.calendar_date)",
         "ContentType": "application/json",
-        "Body.$": "States.Format('\\{\"sf\":\"ne-weekly-freshness-pipeline\",\"execution_arn\":\"{}\",\"status\":\"SUCCEEDED\",\"claim\":\"sf_execution_terminal\",\"cycle_verdict\":\"unknown\",\"started_at\":\"{}\",\"completed_at\":\"{}\",\"cycle_key\":\"{}\",\"substrate_relaunches\":{},\"model_zoo_unservable\":{},\"director_retro_refused\":{},\"cost_coverage_gap\":{},\"weekly_preflight_blind_spot\":{},\"execution_scope\":{},\"skipped_producers\":{}\\}', $$.Execution.Id, $$.Execution.StartTime, $$.State.EnteredTime, $.run_date, $.substrate_relaunch_attempts, States.JsonToString($.model_zoo_unservable), States.JsonToString($.director_retro_refused), States.JsonToString($.cost_coverage_gap), States.JsonToString($.weekly_preflight_blind_spot), States.JsonToString($.run_scope_result.Payload.execution_scope), States.JsonToString($.run_scope_result.Payload.execution_scope.skipped_producers))"
+        "Body.$": "States.Format('\\{\"sf\":\"ne-weekly-freshness-pipeline\",\"execution_arn\":\"{}\",\"status\":\"SUCCEEDED\",\"claim\":\"sf_execution_terminal\",\"cycle_verdict\":\"unknown\",\"started_at\":\"{}\",\"completed_at\":\"{}\",\"cycle_key\":\"{}\",\"substrate_relaunches\":{},\"model_zoo_unservable\":{},\"director_retro_refused\":{},\"cost_coverage_gap\":{},\"weekly_preflight_blind_spot\":{}\\}', $$.Execution.Id, $$.Execution.StartTime, $$.State.EnteredTime, $.run_date, $.substrate_relaunch_attempts, States.JsonToString($.model_zoo_unservable), States.JsonToString($.director_retro_refused), States.JsonToString($.cost_coverage_gap), States.JsonToString($.weekly_preflight_blind_spot))"
       },
       "TimeoutSeconds": 60,
       "Retry": [
@@ -10746,7 +10746,7 @@
         "Bucket": "alpha-engine-research",
         "Key.$": "States.Format('{}_sf_completion/ne-weekly-freshness-pipeline/{}.json', $.rehearsal_marker.ns_prefix, $.calendar_date)",
         "ContentType": "application/json",
-        "Body.$": "States.Format('\\{\"sf\":\"ne-weekly-freshness-pipeline\",\"execution_arn\":\"{}\",\"status\":\"DEGRADED\",\"claim\":\"sf_execution_terminal\",\"cycle_verdict\":\"unknown\",\"started_at\":\"{}\",\"completed_at\":\"{}\",\"cycle_key\":\"{}\",\"degraded_summary\":{},\"model_zoo_unservable\":{},\"director_retro_refused\":{},\"cost_coverage_gap\":{},\"weekly_preflight_blind_spot\":{},\"execution_scope\":{},\"skipped_producers\":{}\\}', $$.Execution.Id, $$.Execution.StartTime, $$.State.EnteredTime, $.run_date, States.JsonToString($.degraded_summary), States.JsonToString($.model_zoo_unservable), States.JsonToString($.director_retro_refused), States.JsonToString($.cost_coverage_gap), States.JsonToString($.weekly_preflight_blind_spot), States.JsonToString($.run_scope_result.Payload.execution_scope), States.JsonToString($.run_scope_result.Payload.execution_scope.skipped_producers))"
+        "Body.$": "States.Format('\\{\"sf\":\"ne-weekly-freshness-pipeline\",\"execution_arn\":\"{}\",\"status\":\"DEGRADED\",\"claim\":\"sf_execution_terminal\",\"cycle_verdict\":\"unknown\",\"started_at\":\"{}\",\"completed_at\":\"{}\",\"cycle_key\":\"{}\",\"degraded_summary\":{},\"model_zoo_unservable\":{},\"director_retro_refused\":{},\"cost_coverage_gap\":{},\"weekly_preflight_blind_spot\":{}\\}', $$.Execution.Id, $$.Execution.StartTime, $$.State.EnteredTime, $.run_date, States.JsonToString($.degraded_summary), States.JsonToString($.model_zoo_unservable), States.JsonToString($.director_retro_refused), States.JsonToString($.cost_coverage_gap), States.JsonToString($.weekly_preflight_blind_spot))"
       },
       "ResultPath": "$.completion_marker_calendar_result",
       "TimeoutSeconds": 60,
@@ -11429,51 +11429,101 @@
       "Type": "Succeed",
       "Comment": "alpha-engine-config-I12351 (B): the clean end of a rehearsal stopped by its deadline. Succeed, not Fail: stopping on schedule is the designed outcome, and a Fail would page through the weekly pipeline's failure alarms for a rehearsal that did what it should."
     },
-    "CheckExecutionScope": {
-      "Comment": "alpha-engine-config-I13864: classify THIS execution from RunScope history before a merged cycle scope can conceal skipped producers. Partial or unavailable producer scope is recorded as degradation; acknowledgment fields are deliberately not consulted. Vacuous scope continues to the existing VacuousRun discriminator.",
-      "Type": "Choice",
-      "Choices": [
+    "ClassifyExecutionScope": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I13864: derive the terminal scope of THIS execution after every producer gate has had an opportunity to run. This deliberately does not use the cycle-level merged run_scope artifact: an earlier execution must not conceal producers skipped by this recovery.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-weekly-run-scope",
+        "Payload": {
+          "run_date.$": "$.run_date",
+          "dry_run": false,
+          "execution_arn.$": "$$.Execution.Id",
+          "state_machine_arn.$": "$$.StateMachine.Id",
+          "execution_input.$": "$$.Execution.Input",
+          "terminal_scope": true
+        }
+      },
+      "TimeoutSeconds": 45,
+      "Retry": [
         {
-          "And": [
-            {
-              "Variable": "$.run_scope_result.Payload.execution_scope.verdict",
-              "IsPresent": true
-            },
-            {
-              "Variable": "$.run_scope_result.Payload.execution_scope.verdict",
-              "StringEquals": "PARTIAL"
-            }
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.TooManyRequestsException",
+            "Lambda.SdkClientException"
           ],
-          "Next": "MarkExecutionScopeIncomplete"
-        },
-        {
-          "And": [
-            {
-              "Variable": "$.run_scope_result.Payload.execution_scope.verdict",
-              "IsPresent": true
-            },
-            {
-              "Variable": "$.run_scope_result.Payload.execution_scope.verdict",
-              "StringEquals": "UNAVAILABLE"
-            }
-          ],
-          "Next": "MarkExecutionScopeIncomplete"
+          "MaxAttempts": 2,
+          "IntervalSeconds": 5,
+          "BackoffRate": 2.0
         }
       ],
-      "Default": "CheckSkipReportCard"
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.execution_scope_error",
+          "Next": "ExecutionScopeUnavailable"
+        }
+      ],
+      "ResultPath": "$.execution_scope_result",
+      "Next": "CheckExecutionScope"
     },
-    "MarkExecutionScopeIncomplete": {
-      "Type": "Pass",
-      "Comment": "alpha-engine-config-I13864: retains the execution-local scope verdict through the established degraded completion-marker, cleanup, sweep and DegradedRun route.",
-      "Parameters": {
-        "degraded": true,
-        "reason.$": "$.run_scope_result.Payload.execution_scope.reason",
-        "run_date.$": "$.run_date",
-        "reasons.$": "$.degraded_summary.reasons",
-        "execution_scope.$": "$.run_scope_result.Payload.execution_scope"
-      },
-      "ResultPath": "$.degraded_summary",
-      "Next": "CheckSkipReportCard"
+    "CheckExecutionScope": {
+      "Type": "Choice",
+      "Comment": "alpha-engine-config-I13864: only COMPLETE terminal scope remains eligible for SUCCEEDED. PARTIAL and VACUOUS are explicit execution failures; UNAVAILABLE is never guessed green.",
+      "Choices": [
+        {
+          "Next": "CheckRunSlotHeldBeforeVacuousRun",
+          "And": [
+            {
+              "Variable": "$.execution_scope_result.Payload.execution_scope.verdict",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.execution_scope_result.Payload.execution_scope.verdict",
+              "StringEquals": "VACUOUS"
+            }
+          ]
+        },
+        {
+          "Next": "PartialScopeRun",
+          "And": [
+            {
+              "Variable": "$.execution_scope_result.Payload.execution_scope.verdict",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.execution_scope_result.Payload.execution_scope.verdict",
+              "StringEquals": "PARTIAL"
+            }
+          ]
+        },
+        {
+          "Next": "ExecutionScopeUnavailable",
+          "And": [
+            {
+              "Variable": "$.execution_scope_result.Payload.execution_scope.verdict",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.execution_scope_result.Payload.execution_scope.verdict",
+              "StringEquals": "UNAVAILABLE"
+            }
+          ]
+        }
+      ],
+      "Default": "CheckExecutionDidWork"
+    },
+    "PartialScopeRun": {
+      "Type": "Fail",
+      "Error": "PartialScopeRun",
+      "CausePath": "States.Format('Weekly execution completed with PARTIAL producer scope and must not report SUCCEEDED (alpha-engine-config-I13864). Run date: {}. Scope: {}', $.run_date, States.JsonToString($.execution_scope_result.Payload.execution_scope))"
+    },
+    "ExecutionScopeUnavailable": {
+      "Type": "Fail",
+      "Error": "ExecutionScopeUnavailable",
+      "CausePath": "States.Format('Weekly execution scope was unavailable and must not report SUCCEEDED (alpha-engine-config-I13864). Run date: {}.', $.run_date)"
     }
   }
 }

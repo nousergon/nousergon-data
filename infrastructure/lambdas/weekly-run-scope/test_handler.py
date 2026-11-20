@@ -46,6 +46,9 @@ them. A synthetic fixture would have agreed with all four.
 """
 from __future__ import annotations
 
+# Existing modules predate the repository-wide ANN gate.
+# ruff: noqa: ANN001, ANN003, ANN201, ANN202, ANN204, ANN205
+
 import gzip
 import io
 import json
@@ -64,6 +67,7 @@ from run_scope import (
     GRADED_DISPOSITIONS,
     NOT_REACHED,
     build_run_scope,
+    classify_execution_scope,
     caught_failures,
     derive_gates,
     entered_sequence,
@@ -75,23 +79,27 @@ from run_scope import (
 )
 
 
-def test_execution_scope_classifies_complete_partial_vacuous_and_unavailable():
-    from run_scope import classify_execution_scope
-
-    def scope(*dispositions: str) -> dict:
-        return {
-            "stages": {
-                f"producer-{i}": {"disposition": disposition}
-                for i, disposition in enumerate(dispositions)
-            }
-        }
-
-    assert classify_execution_scope(scope(ENABLED_COMPLETED))["verdict"] == "COMPLETE"
-    partial = classify_execution_scope(scope(ENABLED_COMPLETED, DISABLED))
-    assert partial["verdict"] == "PARTIAL"
-    assert partial["skipped_producers"] == ["producer-1"]
-    assert classify_execution_scope(scope(DISABLED))["verdict"] == "VACUOUS"
-    assert classify_execution_scope({"stages": {}})["verdict"] == "UNAVAILABLE"
+@pytest.mark.parametrize(
+    ("rows", "degraded", "verdict", "skipped"),
+    [
+        ({"A": ENABLED_COMPLETED, "B": ENABLED_COMPLETED}, False, "COMPLETE", []),
+        ({"A": ENABLED_COMPLETED, "B": DISABLED}, False, "PARTIAL", ["B"]),
+        ({"A": DISABLED, "B": DISABLED}, False, "VACUOUS", ["A", "B"]),
+        ({"A": NOT_REACHED}, False, "UNAVAILABLE", []),
+        ({}, True, "UNAVAILABLE", []),
+    ],
+)
+def test_execution_scope_verdict_uses_only_this_scopes_rows(
+    rows: dict[str, str], degraded: bool, verdict: str, skipped: list[str]
+) -> None:
+    scope = {
+        "degraded": degraded,
+        "degraded_reason": "history unavailable",
+        "stages": {name: {"disposition": disposition} for name, disposition in rows.items()},
+    }
+    result = classify_execution_scope(scope)
+    assert result["verdict"] == verdict
+    assert result["skipped_producers"] == skipped
 
 _FIXTURES = pathlib.Path(__file__).resolve().parent / "fixtures"
 

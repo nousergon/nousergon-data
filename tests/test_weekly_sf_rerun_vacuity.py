@@ -25,6 +25,9 @@ public, and the topic plays no part in the analysis.)
 
 from __future__ import annotations
 
+# Existing modules predate the repository-wide ANN gate.
+# ruff: noqa: ANN001, ANN003, ANN201, ANN202, ANN204, ANN205
+
 import importlib.util
 import json
 import sys
@@ -124,26 +127,6 @@ def test_the_escape_hatch_needs_a_reason_and_then_allows_the_dispatch(mod, sf_de
     ) == ()
 
 
-def test_partial_recovery_requires_and_retains_a_reason_per_skipped_producer(
-    mod, sf_def, spine
-):
-    payload = {"skip_scanner": True}
-    with pytest.raises(mod.PartialRerunError):
-        mod.require_partial_rerun_reason(sf_def, WEEKLY_ARN, payload, "")
-    reasons = mod.require_partial_rerun_reason(
-        sf_def, WEEKLY_ARN, payload, "scanner already completed in execution -1"
-    )
-    assert reasons == {"Scanner": "scanner already completed in execution -1"}
-
-    plan = mod.RerunPlan(
-        run_date="2026-09-18",
-        run_date_provenance="test",
-        original_input={},
-        skipped_producer_reasons=reasons,
-    )
-    assert plan.rerun_input()["skipped_producer_reasons"] == reasons
-
-
 def test_the_accepted_reason_rides_into_the_execution_input(mod):
     """`describe-execution` must answer 'why was this empty run dispatched'."""
     plan = mod.RerunPlan(
@@ -157,6 +140,20 @@ def test_the_accepted_reason_rides_into_the_execution_input(mod):
     assert emitted["vacuous_rerun_accepted_reason"] == (
         "completion marker re-stamp, nothing else to run"
     )
+
+
+def test_every_emitted_recovery_skip_retains_a_nonempty_reason(mod):
+    plan = mod.RerunPlan(
+        run_date="2026-09-18",
+        run_date_provenance="test",
+        original_input={},
+        skip_flags={"skip_scanner": True, "skip_report_card": True},
+    )
+    emitted = plan.rerun_input()
+    skipped = {key for key, value in emitted.items() if key.startswith("skip_") and value is True}
+    reasons = emitted["skipped_producer_reasons"]
+    assert set(reasons) == skipped
+    assert all(flag in reason for flag, reason in reasons.items())
 
 
 # ---------------------------------------------------------------------------
