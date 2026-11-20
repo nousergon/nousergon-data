@@ -25,7 +25,9 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -84,7 +86,7 @@ def _split_states_array(expr: str) -> list[str]:
     return re.findall(r"'((?:[^'\\]|\\.)*)'", expr)
 
 
-def _iter_command_blocks(node):
+def _iter_command_blocks(node: Any) -> Iterator[list[str]]:
     """Yield every SSM command block in a SF definition, as a list of strings.
 
     Covers BOTH shapes: a plain ``"commands"`` list, and the JSONPath
@@ -136,7 +138,7 @@ def _extract_env_source_body(text: str) -> str | None:
 
 
 @pytest.mark.parametrize("script", _SCRIPTS, ids=lambda p: p.name)
-def test_env_source_exports_region(script: Path):
+def test_env_source_exports_region(script: Path) -> None:
     text = script.read_text()
     env_source = _extract_env_source_body(text)
     assert env_source is not None, (
@@ -155,8 +157,18 @@ def test_env_source_exports_region(script: Path):
     )
 
 
+@pytest.mark.parametrize("script", _SCRIPTS, ids=lambda p: p.name)
+def test_env_source_enables_strict_flow_doctor(script: Path) -> None:
+    """The deployed RAG spot must fail loudly if flow-doctor setup fails."""
+    text = script.read_text()
+    env_source = _extract_env_source_body(text)
+    assert env_source is not None, f"{script.name}: no ENV_SOURCE assignment found"
+    assert "export FLOW_DOCTOR_ENABLED=1" in env_source
+    assert "export ALPHA_ENGINE_DEPLOYED=1" in env_source
+
+
 @pytest.mark.parametrize("sf", _STEP_FUNCTIONS, ids=lambda p: p.name)
-def test_step_function_does_not_source_dotenv(sf: Path):
+def test_step_function_does_not_source_dotenv(sf: Path) -> None:
     """#890: no SSM command block may source the deprecated .env file."""
     definition = json.loads(sf.read_text())
     offenders = [
@@ -173,7 +185,7 @@ def test_step_function_does_not_source_dotenv(sf: Path):
 
 
 @pytest.mark.parametrize("sf", _STEP_FUNCTIONS, ids=lambda p: p.name)
-def test_step_function_blocks_export_region(sf: Path):
+def test_step_function_blocks_export_region(sf: Path) -> None:
     """#890: every SSM command block that runs the python pipeline must export
     AWS_REGION and AWS_DEFAULT_REGION itself, since the .env that used to
     provide them was removed. Guards the same 2026-05-16 DataPhase1 preflight
