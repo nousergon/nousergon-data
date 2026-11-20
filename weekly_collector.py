@@ -3246,7 +3246,10 @@ def _self_heal_chronic_polygon_gaps(
       1. Read ArcticDB universe ``last_date``.
       2. If ``last_date >= target_date``, skip (already fresh — common case
          after the first heal lands).
-      3. Else yfinance-fetch ``[last_date+1, target_date]`` OHLCV.
+      3. Else yfinance-fetch an overlapping window through ``target_date``.
+         If an overlapping close changed (for example, because a dividend
+         changed yfinance's adjustment factor), re-fetch the full cached
+         history so old and new rows stay on one adjusted basis.
       4. Append the new rows to ``predictor/price_cache/{ticker}.parquet``
          (dedupe by date keep="last" so repeated heals are idempotent). Wave 3
          PR1 mirrors the put to ``reference/price_cache/{ticker}.parquet`` via
@@ -3322,7 +3325,7 @@ def _self_heal_chronic_polygon_gaps(
                 continue
 
             start_ts = (
-                (existing_last + _pd.Timedelta(days=1))
+                (existing_last - _pd.Timedelta(days=7))
                 if existing_last is not None
                 else (target_ts - _pd.Timedelta(days=30))
             )
@@ -3373,6 +3376,42 @@ def _self_heal_chronic_polygon_gaps(
                     break
                 except s3.exceptions.NoSuchKey:
                     continue
+
+            overlap: _pd.Index = existing_pcache.index.intersection(new_rows.index)  # pyright: ignore[reportUnknownVariableType,reportUnknownMemberType,reportAttributeAccessIssue]
+            if "Close" in existing_pcache and "Close" in new_rows and len(overlap):  # pyright: ignore[reportUnknownArgumentType]
+                old_close: _pd.Series = existing_pcache.loc[overlap, "Close"].astype(float)  # pyright: ignore[reportUnknownVariableType,reportUnknownMemberType]
+                fresh_close: _pd.Series = new_rows.loc[overlap, "Close"].astype(float)  # pyright: ignore[reportUnknownVariableType,reportUnknownMemberType,reportAttributeAccessIssue]
+                close_scale: _pd.Series = old_close.abs().clip(lower=1.0)  # pyright: ignore[reportUnknownVariableType,reportUnknownMemberType]
+                adjustment_changed: bool = bool((  # pyright: ignore[reportUnknownArgumentType,reportUnknownMemberType]
+                    (old_close - fresh_close).abs() > close_scale * 1e-6  # pyright: ignore[reportUnknownMemberType]
+                ).any())
+                if adjustment_changed:
+                    full_start = _pd.Timestamp(  # pyright: ignore[reportUnknownVariableType,reportUnknownMemberType]
+                        str(existing_pcache.index.min())  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType]
+                    ).normalize()  # pyright: ignore[reportAttributeAccessIssue]
+                    with quiet_yfinance():
+                        yf_df = _yf.download(  # pyright: ignore[reportUnknownMemberType]
+                            ticker,
+                            start=full_start.strftime("%Y-%m-%d"),  # pyright: ignore[reportUnknownMemberType]
+                            end=end_excl.strftime("%Y-%m-%d"),
+                            progress=False,
+                            auto_adjust=True,
+                            timeout=30,
+                        )
+                    if not isinstance(yf_df, _pd.DataFrame):
+                        raise TypeError("yfinance returned a non-DataFrame result")
+                    if isinstance(yf_df.columns, _pd.MultiIndex):
+                        yf_df.columns = yf_df.columns.get_level_values(0)  # pyright: ignore[reportUnknownMemberType]
+                    yf_df = yf_df[  # pyright: ignore[reportUnknownVariableType]
+                        (yf_df.index >= full_start) & (yf_df.index <= target_ts)
+                    ]
+                    if yf_df.empty:  # pyright: ignore[reportUnknownMemberType]
+                        raise ValueError(
+                            "yfinance returned no rows for full-history adjustment refresh"
+                        )
+                    new_rows = yf_df[  # pyright: ignore[reportUnknownVariableType,reportUnknownMemberType]
+                        [c for c in ohlcv_cols if c in yf_df.columns]  # pyright: ignore[reportUnknownMemberType]
+                    ].copy()
 
             combined_pcache = _pd.concat([existing_pcache, new_rows])
             combined_pcache = combined_pcache[

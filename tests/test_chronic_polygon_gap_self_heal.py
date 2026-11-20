@@ -221,6 +221,45 @@ def test_self_heal_backfills_pstg_via_yfinance_and_invokes_per_ticker_backfill()
     )
 
 
+def test_self_heal_refetches_full_history_when_dividend_adjustment_changes():
+    """An ex-dividend adjustment visible in the overlap must replace history."""
+    from weekly_collector import _self_heal_chronic_polygon_gaps
+
+    universe_lib = _stub_universe_lib({"PSTG": "2026-05-06"})
+    existing_pcache = _yf_df("2026-04-20", n_business_days=13)
+    s3 = _stub_s3_with_pcache({"PSTG": existing_pcache})
+
+    overlap_and_append = _yf_df("2026-04-29", n_business_days=8)
+    overlap_and_append.loc[overlap_and_append.index <= "2026-05-06", [
+        "Open", "High", "Low", "Close",
+    ]] *= 0.995
+    refreshed_history = _yf_df("2026-04-20", n_business_days=15)
+    refreshed_history.loc[refreshed_history.index <= "2026-05-06", [
+        "Open", "High", "Low", "Close",
+    ]] *= 0.995
+
+    with patch("weekly_collector.boto3.client", return_value=s3), \
+         patch("store.arctic_store.get_universe_lib", return_value=universe_lib), \
+         patch(
+             "yfinance.download",
+             side_effect=[overlap_and_append, refreshed_history],
+         ) as yf_download, \
+         patch("builders.backfill.backfill"):
+        result = _self_heal_chronic_polygon_gaps(
+            bucket="test-bucket",
+            target_date="2026-05-08",
+            chronic_tickers=["PSTG"],
+        )
+
+    assert result["errors"] == []
+    assert yf_download.call_count == 2
+    assert yf_download.call_args_list[1].kwargs["start"] == "2026-04-20"
+    written_df = pd.read_parquet(
+        io.BytesIO(s3.written["reference/price_cache/PSTG.parquet"])
+    )
+    assert written_df.loc["2026-04-20", "Close"] == pytest.approx(99.5)
+
+
 def test_self_heal_dry_run_skips_writes_and_backfill_invocation():
     """``dry_run=True`` exercises the read paths + computes the healed
     summary, but writes nothing to S3 and invokes no per-ticker backfill."""
