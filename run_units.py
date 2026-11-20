@@ -45,6 +45,11 @@ from typing import Any, cast
 from nousergon_lib import run_manifest
 from nousergon_lib.run_manifest import DEFAULT_MANIFEST_PREFIX, S3ManifestSink
 
+# Rehearsals are a distinct manifest provenance, not a scheduled fire.  Keep
+# the shared writer's validation aligned with the launcher value until this
+# repository's declared nousergon-lib floor includes the new trigger itself.
+run_manifest.TRIGGERS = run_manifest.TRIGGERS | {"rehearsal"}
+
 __all__ = [
     "LOG_LOCATION_ENV",
     "RUN_LOG_S3_ENV",

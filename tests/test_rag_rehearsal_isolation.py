@@ -21,6 +21,8 @@ text says:
   * the shell's prefix is ``emailer.REHEARSAL_PREFIX``.
 """
 
+# ruff: noqa: ANN001, ANN002, ANN003, ANN201, ANN202, ANN204, ANN205, ANN206 -- legacy fixtures predate annotation linting.
+
 from __future__ import annotations
 
 import os
@@ -36,6 +38,9 @@ from rag.pipelines import emit_progress as ep
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "rag" / "pipelines" / "run_weekly_ingestion.sh"
+SPOT_COMMON = ROOT / "infrastructure" / "_spot_common.sh"
+WEEKLY_LAUNCHER = ROOT / "infrastructure" / "spot_data_weekly.sh"
+RAG_LAUNCHER = ROOT / "infrastructure" / "spot_rag_ingestion.sh"
 
 INGEST_MODULES = (
     "rag.pipelines.ingest_sec_filings",
@@ -97,6 +102,17 @@ def _aws_calls(calls: list[list[str]]) -> list[list[str]]:
 
 
 REHEARSAL = "rehearsal-2026-10-16-2"
+
+
+def test_spot_launchers_export_rehearsal_trigger_to_generated_workers():
+    common = SPOT_COMMON.read_text()
+    weekly = WEEKLY_LAUNCHER.read_text()
+    rag = RAG_LAUNCHER.read_text()
+
+    assert '_RUN_TOKEN_EXPORT+="export NE_DATA_TRIGGER=rehearsal"' in common
+    assert "${_RUN_TOKEN_EXPORT}" in rag
+    assert "ENV_SOURCE+=$'\\nexport NE_DATA_TRIGGER=rehearsal'" in weekly
+    assert weekly.count("${ENV_SOURCE}") >= 6, "all weekly worker modes share ENV_SOURCE"
 
 
 @pytest.fixture()
