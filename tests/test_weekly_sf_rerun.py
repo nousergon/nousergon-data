@@ -789,6 +789,11 @@ class TestStageTableLockstep:
                 f"infrastructure/step_function.json — update STAGES"
             )
 
+    def test_director_named_alert_is_a_degraded_witness(self, mod, all_states):
+        director = next(s for s in mod.STAGES if s.name == "director")
+        assert "PublishDirectorSubStatusDegraded" in director.degraded_witness
+        assert "PublishDirectorSubStatusDegraded" in all_states
+
 
 # ---------------------------------------------------------------------------
 # config#3134 — mode=backtest-eval preset routes past all four lane-A gates

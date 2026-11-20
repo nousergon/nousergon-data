@@ -159,26 +159,36 @@ def test_the_degraded_path_converges_on_director_complete(states):
     """Both routes descend from Director's ONE success edge, which is the
     property the rerun deriver's witness asserts. A Director that degraded
     still wrote its plan and must not be re-run."""
-    assert states["Set" + _SETTER + "Summary"]["Next"] == "PublishDirectorSubStatusDegraded"
+    assert states["Set" + _SETTER + "Summary"]["Next"] == (
+        "PublishDirectorSubStatusDegraded"
+    )
     assert states[_CHOICE]["Default"] == "DirectorComplete"
     assert states["DirectorComplete"]["Next"] == "CheckSkipScannerLeaderboard"
 
 
-def test_the_named_alert_is_hardcoded_and_best_effort(states):
+def test_named_sns_alert_is_hardcoded_and_best_effort(states):
     publish = states["PublishDirectorSubStatusDegraded"]
     assert publish["Type"] == "Task"
     assert publish["Resource"] == "arn:aws:states:::sns:publish"
     assert publish["Parameters"]["TopicArn.$"] == "$.sns_topic_arn"
     assert publish["ResultPath"] == "$.director_degraded_notify"
-    assert "Subject" in publish["Parameters"]
-    assert "Subject.$" not in publish["Parameters"]
-    assert "Director" in publish["Parameters"]["Subject"]
-    assert "Message" in publish["Parameters"]
-    assert "Message.$" not in publish["Parameters"]
-    assert "$.director_result.Payload.degraded_sub_results" in publish["Parameters"]["Message"]
+
+    subject = publish["Parameters"]["Subject"]
+    message = publish["Parameters"]["Message"]
+    assert "Director" in subject
+    assert "$.director_result.Payload.degraded_sub_results" in message
+    assert "States.Format" not in subject
+    assert "States.Format" not in message
+
     assert publish["Next"] == "DirectorComplete"
-    assert publish["Catch"][0]["ErrorEquals"] == ["States.ALL"]
-    assert publish["Catch"][0]["Next"] == "DirectorComplete"
+    assert publish["Catch"] == [
+        {
+            "ErrorEquals": ["States.ALL"],
+            "Comment": publish["Catch"][0]["Comment"],
+            "ResultPath": "$.director_degraded_notify_error",
+            "Next": "DirectorComplete",
+        }
+    ]
 
 
 # ---------------------------------------------------------------------------
