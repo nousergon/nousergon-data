@@ -9493,7 +9493,7 @@
     },
     "SetDirectorSubStatusDegradedSummary": {
       "Type": "Pass",
-      "Comment": "alpha-engine-config-I11299: mirrors SetAggregateCostsDegradedSummary. $.degraded_summary is what CheckDegradedOutcome reads to route to WriteCompletionMarkerDegraded \u2014 the single chokepoint that state's own Comment names, which a fail-open route added later inherits by writing this path and touching nothing there. So a weekly cycle that published no RetroGrade now terminates DegradedRun (Option-A, alpha-engine-config#2699 ported by I6891) instead of ExecutionSucceeded with degraded false. Deliberately carries NO stage_error: the sibling convention is uniform and this setter is reached from a CHOICE, which writes no $.<stage>_error, so an unguarded stage_error.$ would throw States.Runtime here \u2014 the exact failure tests/test_degraded_terminal_derives_its_cause.py exists to prevent. Continuation is the best-effort PublishDirectorSubStatusDegraded alert and then DirectorComplete, the same edge the clean path takes, so this changes what the run SAYS, never where it goes. | alpha-engine-config-I8809: PARTITION FAMILY = trading_day (pass-through). This state does not KEY on the date; it carries $.run_date into a summary payload. | alpha-engine-config-I10540: reasons.$ ACCUMULATES a family-keyed entry via States.JsonMerge instead of last-write-wins whole-object replacement; $.degraded_summary.reasons is floored to {} in InitializeInput so the first setter on any execution never merges onto a missing path.",
+      "Comment": "alpha-engine-config-I11299: mirrors SetAggregateCostsDegradedSummary. $.degraded_summary is what CheckDegradedOutcome reads to route to WriteCompletionMarkerDegraded \u2014 the single chokepoint that state's own Comment names, which a fail-open route added later inherits by writing this path and touching nothing there. So a weekly cycle that published no RetroGrade now terminates DegradedRun (Option-A, alpha-engine-config#2699 ported by I6891) instead of ExecutionSucceeded with degraded false. Deliberately carries NO stage_error: the sibling convention is uniform and this setter is reached from a CHOICE, which writes no $.<stage>_error, so an unguarded stage_error.$ would throw States.Runtime here \u2014 the exact failure tests/test_degraded_terminal_derives_its_cause.py exists to prevent. Continuation is DirectorComplete, the same edge the clean path takes, so this changes what the run SAYS, never where it goes. | alpha-engine-config-I8809: PARTITION FAMILY = trading_day (pass-through). This state does not KEY on the date; it carries $.run_date into a summary payload. | alpha-engine-config-I10540: reasons.$ ACCUMULATES a family-keyed entry via States.JsonMerge instead of last-write-wins whole-object replacement; $.degraded_summary.reasons is floored to {} in InitializeInput so the first setter on any execution never merges onto a missing path.",
       "Parameters": {
         "degraded": true,
         "reason": "weekly_director_substatus_degraded",
@@ -9505,12 +9505,12 @@
     },
     "PublishDirectorSubStatusDegraded": {
       "Type": "Task",
-      "Comment": "alpha-engine-config-I11322: named alert for any degraded or unclassified Director leg, mirroring PublishAggregateCostsDegraded. The Subject and Message are constants by config#1819: the Director's model-authored retro_error must never reach an SNS body. The Message deliberately names no cause because this path can represent retro, director_loop, director_issues or deploy_success and this state cannot distinguish them.",
+      "Comment": "alpha-engine-config-I11322: named alert for any Director named-leg degradation. Mirrors PublishAggregateCostsDegraded: hardcoded Subject/Message constants (never interpolate model-authored Director fields), and best-effort delivery so an SNS failure cannot block the degraded path. The message deliberately names no cause because this state cannot distinguish which Director leg degraded.",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
-        "Subject": "Alpha Engine Weekly Pipeline — Director WARNING (one or more Director legs degraded)",
-        "Message": "Director completed with one or more degraded or unclassified legs. See $.director_result.Payload.degraded_sub_results on the execution record for the named leg results. This alert does not assert a cause because the notification state cannot distinguish which leg degraded. The run therefore terminates DEGRADED. View pipeline status: https://dashboard.nousergon.ai/pipeline-status",
+        "Subject": "Alpha Engine Weekly Pipeline — Director DEGRADED",
+        "Message": "Director completed with one or more degraded named sub-results. See $.director_result.Payload.degraded_sub_results on the execution record for detail. This alert does not identify a cause because the state cannot distinguish which Director leg degraded. The run continues and terminates DEGRADED. View pipeline status: https://dashboard.nousergon.ai/pipeline-status",
         "MessageAttributes": {}
       },
       "ResultPath": "$.director_degraded_notify",
@@ -9519,7 +9519,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "Best-effort alert — a publish failure must not block the non-fatal path this alert decorates. $.degraded_summary and $.director_degraded are already set, so the run still terminates DEGRADED.",
+          "Comment": "Best-effort alert — a publish failure must not block the degraded path. $.degraded_summary and $.director_degraded are already set, so the run still terminates DEGRADED.",
           "ResultPath": "$.director_degraded_notify_error",
           "Next": "DirectorComplete"
         }

@@ -1,4 +1,4 @@
-# ruff: noqa: ANN001, ANN003, ANN201, ANN202, ANN204, ANN205  # Legacy test module; fixtures are intentionally untyped.
+# ruff: noqa: ANN001, ANN201, ANN202
 """alpha-engine-config#6684 — structural contract over every
 ``infrastructure/step_function*.json`` orchestration definition.
 

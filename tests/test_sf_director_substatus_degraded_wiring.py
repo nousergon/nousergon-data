@@ -1,4 +1,4 @@
-# ruff: noqa: ANN001, ANN003, ANN201, ANN202, ANN204, ANN205  # Legacy test module; fixtures are intentionally untyped.
+# ruff: noqa: ANN001, ANN201, ANN202
 """alpha-engine-config-I11299 — a Director that reports `degraded` must not
 terminate the weekly SF at plain ``NotifyComplete``.
 
@@ -31,9 +31,8 @@ being able to see it.
 1. ``Director``'s success edge routes to ``CheckDirectorSubResults``, a Choice
    that fires on exactly one string.
 2. That Choice sets ``$.director_degraded`` via ``DirectorSubStatusDegraded``,
-   then the sibling summary Pass writes ``$.degraded_summary`` and a named,
-   best-effort SNS alert leads to ``DirectorComplete`` — the same edge the
-   clean path takes.
+   then the sibling summary Pass writes ``$.degraded_summary``, then
+   ``DirectorComplete`` — the same edge the clean path takes.
 3. ``$.director_degraded`` threads into ``CheckGateDegradedNotify`` as the
    seventh family, registered LAST, so a run whose ONLY degradation is the
    Director cannot reach ``NotifyComplete``'s "All steps completed
@@ -162,25 +161,24 @@ def test_the_degraded_path_converges_on_director_complete(states):
     property the rerun deriver's witness asserts. A Director that degraded
     still wrote its plan and must not be re-run."""
     assert states["Set" + _SETTER + "Summary"]["Next"] == "PublishDirectorSubStatusDegraded"
-    publish = states["PublishDirectorSubStatusDegraded"]
-    assert publish["Next"] == "DirectorComplete"
-    assert publish["Catch"][0]["Next"] == "DirectorComplete"
     assert states[_CHOICE]["Default"] == "DirectorComplete"
     assert states["DirectorComplete"]["Next"] == "CheckSkipScannerLeaderboard"
 
 
-def test_named_sns_alert_is_constant_and_best_effort(states):
-    publish = states["PublishDirectorSubStatusDegraded"]
-    assert publish["Type"] == "Task"
-    assert publish["Resource"] == "arn:aws:states:::sns:publish"
-    assert publish["Parameters"]["TopicArn.$"] == "$.sns_topic_arn"
-    assert publish["ResultPath"] == "$.director_degraded_notify"
-    assert "Director" in publish["Parameters"]["Subject"]
-    assert "$.director_result.Payload.degraded_sub_results" in publish["Parameters"]["Message"]
-    assert not any(key.endswith(".$") for key in publish["Parameters"] if key != "TopicArn.$")
-    assert publish["Catch"] == [{
+def test_the_named_alert_is_hardcoded_and_best_effort(states):
+    alert = states["PublishDirectorSubStatusDegraded"]
+    assert alert["Type"] == "Task"
+    assert alert["Resource"] == "arn:aws:states:::sns:publish"
+    assert alert["Parameters"]["TopicArn.$"] == "$.sns_topic_arn"
+    assert "Director" in alert["Parameters"]["Subject"]
+    assert "$.director_result.Payload.degraded_sub_results" in alert["Parameters"]["Message"]
+    assert "Subject.$" not in alert["Parameters"]
+    assert "Message.$" not in alert["Parameters"]
+    assert alert["ResultPath"] == "$.director_degraded_notify"
+    assert alert["Next"] == "DirectorComplete"
+    assert alert["Catch"] == [{
         "ErrorEquals": ["States.ALL"],
-        "Comment": publish["Catch"][0]["Comment"],
+        "Comment": alert["Catch"][0]["Comment"],
         "ResultPath": "$.director_degraded_notify_error",
         "Next": "DirectorComplete",
     }]

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# ruff: noqa: ANN001, ANN003, ANN201, ANN202, ANN204, ANN205  # Legacy module; CI requires ANN lint when this file changes.
+# ruff: noqa: ANN001, ANN201, ANN202
 """Mechanical weekly-SF recovery helper (config#2277).
 
 Derives, from a FAILED ``ne-weekly-freshness-pipeline`` execution, the exact
