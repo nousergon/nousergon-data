@@ -1,3 +1,4 @@
+# pyright: reportExplicitAny=false
 """alpha-engine-ci-watch-dispatcher — launch the Fleet CI Watch diagnose+fix
 agent on a dedicated EC2 spot box, once per real CI failure event.
 
@@ -86,6 +87,8 @@ import json
 import logging
 import os
 import re
+import shlex
+from typing import Any
 import uuid
 from datetime import datetime, timezone
 
@@ -423,7 +426,8 @@ def _resolve_event_fields(event: dict) -> tuple[str, str, str, str, str, str, st
 
 def _bootstrap_command(repo: str, sha: str, run_id: str, run_url: str,
                        workflow: str, branch: str, run_token: str,
-                       is_drill: str = "false", model: str = "") -> str:
+                       is_drill: str = "false", model: str = "",
+                       dispatch_run_id: str = "") -> str:
     """The async SSM RunShellScript body: fetch PAT, clone config, exec the
     unified overseer_spot_bootstrap.sh entrypoint in alpha-engine-config with
     ``--playbook ci-watch``. Any prelude failure shuts the box down so a
@@ -472,6 +476,7 @@ export CI_RUN_URL="{run_url}"
 export CI_WORKFLOW="{workflow}"
 export CI_BRANCH="{branch}"
 export CI_IS_DRILL="{is_drill}"
+export OVERSEER_DISPATCH_RUN_ID={shlex.quote(dispatch_run_id)}
 exec bash infrastructure/overseer_spot_bootstrap.sh --playbook ci-watch
 """
 
@@ -512,12 +517,14 @@ def _wait_ssm_online(instance_id: str) -> None:
 
 def _send_bootstrap(instance_id: str, repo: str, sha: str, run_id: str, run_url: str,
                     workflow: str, branch: str, run_token: str,
-                    is_drill: str = "false", model: str = "") -> str:
+                    is_drill: str = "false", model: str = "",
+                    dispatch_run_id: str = "") -> str:
     """Fire the async, detached SSM command that runs CI-watch + self-terminates."""
     return spot_dispatch.send_async_command(
         instance_id,
         _bootstrap_command(repo, sha, run_id, run_url, workflow, branch, run_token,
-                           is_drill=is_drill, model=model),
+                           is_drill=is_drill, model=model,
+                           dispatch_run_id=dispatch_run_id),
         comment=f"ci-watch ({repo}@{sha[:12]}, run {run_id}, token {run_token[:12]})",
         region=REGION,
         cw_log_group=CW_LOG_GROUP,
@@ -551,7 +558,8 @@ def _terminate_instance(instance_id: str) -> None:
 
 def _launch_ci_watch_spot(repo: str, sha: str, run_id: str, run_url: str,
                           workflow: str, branch: str,
-                          is_drill: str = "false", model: str = "") -> dict:
+                          is_drill: str = "false", model: str = "",
+                          dispatch_run_id: str = "") -> dict[str, Any]:
     """Launch + bootstrap the CI-watch box. SYNCHRONOUS contract: every
     anticipated failure mode returns a clean, well-formed launched:false
     rather than raising — see module docstring."""
@@ -633,7 +641,7 @@ def _launch_ci_watch_spot(repo: str, sha: str, run_id: str, run_url: str,
         _wait_ssm_online(instance_id)
         command_id = _send_bootstrap(instance_id, repo, sha, run_id, run_url,
                                      workflow, branch, run_token, is_drill=is_drill,
-                                     model=model)
+                                     model=model, dispatch_run_id=dispatch_run_id)
     except Exception as exc:  # noqa: BLE001 — converted to a clean launched:false
         _terminate_instance(instance_id)
         logger.error("ci-watch post-launch step failed for %s: %s: %s",
@@ -665,7 +673,7 @@ def _launch_ci_watch_spot(repo: str, sha: str, run_id: str, run_url: str,
     return verdict
 
 
-def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
+def handler(event: dict[str, Any], context: object) -> dict[str, Any]:  # noqa: ARG001 — Lambda contract
     """Synchronous handler invoked once per real CI failure event. `event`
     carries {"repo", "sha", "run_id", "run_url", "workflow", "branch"} from
     the GHA job's `lambda invoke` payload (RequestResponse).
@@ -692,9 +700,12 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         logger.error("invalid ci-watch event: %s", exc)
         return {"launched": False, "reason": "invalid_event", "error": str(exc)}
 
+    dispatch_run_id = str(event.get("dispatch_run_id") or "")
+
     logger.info(
         "ci-watch trigger: repo=%s sha=%s run_id=%s workflow=%s branch=%s is_drill=%s",
         repo, sha, run_id, workflow, branch, is_drill,
     )
     return _launch_ci_watch_spot(repo, sha, run_id, run_url, workflow, branch,
-                                 is_drill=is_drill, model=model)
+                                 is_drill=is_drill, model=model,
+                                 dispatch_run_id=dispatch_run_id)

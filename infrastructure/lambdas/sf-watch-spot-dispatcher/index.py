@@ -1,3 +1,4 @@
+# pyright: reportExplicitAny=false
 """alpha-engine-sf-watch-spot-dispatcher — launch the Fleet-SF Watch
 diagnose+fix+rerun agent on a dedicated EC2 spot box, once per real
 saturday-sf-failure event.
@@ -80,6 +81,8 @@ import json
 import logging
 import os
 import re
+import shlex
+from typing import Any
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Protocol
@@ -287,7 +290,7 @@ def _optional(event: dict, key: str, pattern: "re.Pattern[str]", default: str = 
     return val
 
 
-def _resolve_event_fields(event: dict) -> dict:
+def _resolve_event_fields(event: dict[str, Any]) -> dict[str, Any]:
     """Validate the GHA payload's SF fields; raises _InvalidEvent on any
     missing/malformed field (caught once, at the handler, and converted to a
     clean launched:false — see module docstring's synchronous contract)."""
@@ -366,10 +369,11 @@ def _resolve_event_fields(event: dict) -> dict:
         "cause": cause,
         "sf_execution_id": sf_execution_id,
         "dispatch_id": dispatch_id,
+        "dispatch_run_id": str(event.get("dispatch_run_id") or ""),
     }
 
 
-def _bootstrap_command(fields: dict, run_token: str) -> str:
+def _bootstrap_command(fields: dict[str, Any], run_token: str) -> str:
     """The async SSM RunShellScript body: fetch PAT, clone config, exec the
     unified overseer_spot_bootstrap.sh entrypoint in alpha-engine-config with
     ``--playbook sf-watch``. Any prelude failure shuts the box down so a
@@ -433,6 +437,7 @@ export SF_WATCH_LOG_KEY="{fields['watch_log_key']}"
 export SF_IS_PREFLIGHT="{fields['is_preflight']}"
 export SF_IS_DRILL="{fields['is_drill']}"
 export SF_WATCH_MODEL="{fields.get('model', '')}"
+export OVERSEER_DISPATCH_RUN_ID={shlex.quote(str(fields.get('dispatch_run_id') or ''))}
 exec bash infrastructure/overseer_spot_bootstrap.sh --playbook sf-watch
 """
 
@@ -490,7 +495,7 @@ def _wait_ssm_online(instance_id: str) -> None:
     )
 
 
-def _send_bootstrap(fields: dict, instance_id: str, run_token: str) -> str:
+def _send_bootstrap(fields: dict[str, Any], instance_id: str, run_token: str) -> str:
     """Fire the async, detached SSM command that runs SF-watch + self-terminates."""
     return spot_dispatch.send_async_command(
         instance_id,
@@ -851,7 +856,7 @@ def _reevaluate_after_defer(fields: dict) -> dict | None:
     return None
 
 
-def _launch_sf_watch_spot(fields: dict, context: object | None = None, defer_generation: int = 0) -> dict:
+def _launch_sf_watch_spot(fields: dict[str, Any], context: object | None = None, defer_generation: int = 0) -> dict[str, Any]:
     """Launch + bootstrap the SF-watch box. SYNCHRONOUS contract: every
     anticipated failure mode returns a clean, well-formed launched:false
     rather than raising — see module docstring."""
@@ -966,7 +971,7 @@ def _launch_sf_watch_spot(fields: dict, context: object | None = None, defer_gen
     return verdict
 
 
-def handler(event: dict, context: object) -> dict:
+def handler(event: dict[str, Any], context: object) -> dict[str, Any]:
     """Synchronous handler invoked once per real saturday-sf-failure event —
     NOT on a cron schedule. `event` carries {"pipeline_name", "cadence_slug",
     "state_machine_arn", "execution_arn", "run_date", "failed_state", "cause",

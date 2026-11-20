@@ -1,3 +1,4 @@
+# pyright: reportExplicitAny=false
 """alpha-engine-alert-drain-dispatcher — launch the Overseer alert-drain agent
 on a dedicated EC2-spot box, twice daily (alpha-engine-config-I2824, epic
 I2821 phase 3).
@@ -41,6 +42,8 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shlex
+from typing import Any
 from datetime import datetime, timezone
 
 from nousergon_lib import spot_dispatch
@@ -157,7 +160,8 @@ def _resolve_event_fields(event: dict) -> tuple[str, str, str, str, str]:
     return run_id, is_drill, trigger, model, lineage_id or run_id
 
 
-def _bootstrap_command(run_id: str, is_drill: str, model: str = "") -> str:
+def _bootstrap_command(run_id: str, is_drill: str, model: str = "",
+                       dispatch_run_id: str = "") -> str:
     """The async SSM RunShellScript body: fetch PAT, clone config, exec the
     UNIFIED overseer_spot_bootstrap.sh with ``--playbook alert-drain``.
     Prelude failure shuts the box down (mirrors the sibling dispatchers'
@@ -206,6 +210,7 @@ git clone --depth 1 --branch {DRAIN_CONFIG_BRANCH} \
 cd /home/ec2-user/alpha-engine-config
 export DRAIN_RUN_ID="{run_id}"
 export DRAIN_IS_DRILL="{is_drill}"
+export OVERSEER_DISPATCH_RUN_ID={shlex.quote(dispatch_run_id)}
 exec bash infrastructure/overseer_spot_bootstrap.sh --playbook alert-drain
 """
 
@@ -244,10 +249,10 @@ def _wait_ssm_online(instance_id: str) -> None:
 
 
 def _send_bootstrap(instance_id: str, run_id: str, is_drill: str,
-                    model: str = "") -> str:
+                    model: str = "", dispatch_run_id: str = "") -> str:
     return spot_dispatch.send_async_command(
         instance_id,
-        _bootstrap_command(run_id, is_drill, model),
+        _bootstrap_command(run_id, is_drill, model, dispatch_run_id),
         comment=f"alert-drain ({run_id})",
         region=REGION,
         cw_log_group=CW_LOG_GROUP,
@@ -261,7 +266,7 @@ def _terminate_instance(instance_id: str) -> None:
     spot_dispatch.terminate_on_failure(instance_id, region=REGION, label="alert-drain")
 
 
-def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
+def handler(event: dict[str, Any], context: object) -> dict[str, Any]:  # noqa: ARG001 — Lambda contract
     """Synchronous handler invoked by the overseer-dispatcher router (playbook
     ``alert-drain``) when the twice-daily Scheduler fires — or with
     ``{"is_drill": "true"}`` on a canary drill. Clean-JSON contract identical
@@ -273,6 +278,8 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     except _InvalidEvent as exc:
         logger.error("invalid alert-drain event: %s", exc)
         return {"launched": False, "reason": "invalid_event", "error": str(exc)}
+
+    dispatch_run_id = str(event.get("dispatch_run_id") or "")
 
     if not DISPATCH_ENABLED:
         logger.warning("ALERT_DRAIN_DISPATCH_ENABLED=false — drain NOT launched")
@@ -315,7 +322,8 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
 
     try:
         _wait_ssm_online(instance_id)
-        command_id = _send_bootstrap(instance_id, run_id, is_drill, model)
+        command_id = _send_bootstrap(instance_id, run_id, is_drill, model,
+                                     dispatch_run_id)
     except Exception as exc:  # noqa: BLE001 — converted to a clean launched:false (router escalates)
         _terminate_instance(instance_id)
         logger.error("alert-drain post-launch step failed for %s: %s: %s",
