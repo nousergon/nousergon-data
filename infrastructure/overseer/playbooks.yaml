@@ -795,6 +795,7 @@ alert_classes:
     severities: [dynamic]
     intake: bus
     response: drain-queue
+    migration_issue: alpha-engine-config-I8996
     # derived: severities [dynamic] — resolved per emission
     tier: dynamic
     chat: critical-only
@@ -974,6 +975,7 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    migration_issue: alpha-engine-config-I8996
     # DECLARED: stance drift is named in I6751's NOTIFY-SILENT row (suboptimal,
     # not broken).
     tier: tracked-only
@@ -983,6 +985,7 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    migration_issue: alpha-engine-config-I8996
     # derived: error-capable, automated response declared
     tier: tracked-only
     chat: none
@@ -992,6 +995,7 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    migration_issue: alpha-engine-config-I8996
     # derived: error-capable, automated response declared
     tier: tracked-only
     chat: none
@@ -1021,6 +1025,7 @@ alert_classes:
     severities: [critical]
     intake: bus
     response: drain-queue
+    migration_issue: alpha-engine-config-I8996
     # derived: critical/alarm-capable
     tier: tracked-only
     chat: none
@@ -1194,6 +1199,7 @@ alert_classes:
     severities: [info, warning, critical]
     intake: bus
     response: drain-queue
+    migration_issue: alpha-engine-config-I8996
     # derived: critical/alarm-capable
     tier: tracked-only
     chat: none
@@ -1202,6 +1208,7 @@ alert_classes:
     severities: [warning, critical]
     intake: bus
     response: drain-queue
+    migration_issue: alpha-engine-config-I8996
     # derived: critical/alarm-capable
     tier: tracked-only
     chat: none
@@ -1250,6 +1257,7 @@ alert_classes:
     severities: [dynamic]
     intake: bus
     response: drain-queue
+    migration_issue: alpha-engine-config-I8996
     # derived: severities [dynamic] — resolved per emission
     tier: tracked-only
     chat: none
@@ -1260,6 +1268,7 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    migration_issue: alpha-engine-config-I8996
     # derived: error-capable, automated response declared
     tier: tracked-only
     chat: none
@@ -1278,6 +1287,7 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    migration_issue: alpha-engine-config-I8996
     # derived: error-capable, automated response declared
     tier: tracked-only
     chat: none
@@ -1294,6 +1304,7 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    migration_issue: alpha-engine-config-I8996
     # derived: error-capable, automated response declared
     tier: tracked-only
     chat: none
@@ -1302,6 +1313,7 @@ alert_classes:
     severities: [critical]
     intake: bus
     response: drain-queue
+    migration_issue: alpha-engine-config-I8996
     # derived: critical/alarm-capable
     tier: tracked-only
     chat: none
@@ -1370,6 +1382,7 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    migration_issue: alpha-engine-config-I8996
     # derived: error-capable, automated response declared
     tier: tracked-only
     chat: none
@@ -1427,6 +1440,7 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    migration_issue: alpha-engine-config-I8996
     # derived: error-capable, automated response declared
     tier: tracked-only
     chat: none
@@ -1496,6 +1510,7 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    migration_issue: alpha-engine-config-I8996
     # derived: error-capable, automated response declared
     tier: tracked-only
     chat: none
@@ -1535,6 +1550,7 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    migration_issue: alpha-engine-config-I8996
     # derived: error-capable, automated response declared
     tier: tracked-only
     chat: none
@@ -1812,6 +1828,7 @@ alert_classes:
     severities: [dynamic]
     intake: bus
     response: drain-queue
+    migration_issue: alpha-engine-config-I8996
     # DECLARED dynamic: non-severe constituents drift is TRACKED-ONLY per the
     # matrix; a severe (critical) drift is a data-integrity break and pages.
     tier: tracked-only
@@ -1825,6 +1842,7 @@ alert_classes:
     severities: [dynamic]
     intake: bus
     response: drain-queue
+    migration_issue: alpha-engine-config-I8996
     # DECLARED dynamic: the per-run verdict is `error` when the run has defects
     # and `warn` otherwise, and a DEGRADED run that still produced its artifact
     # is tracked-only work (tonight's data-collector 'Collection finished
@@ -1836,6 +1854,7 @@ alert_classes:
     severities: [dynamic]
     intake: bus
     response: drain-queue
+    migration_issue: alpha-engine-config-I8996
     # derived: severities [dynamic] — resolved per emission
     tier: tracked-only
     chat: none
@@ -1878,6 +1897,7 @@ alert_classes:
     severities: [critical]
     intake: bus
     response: drain-queue
+    migration_issue: alpha-engine-config-I8996
     # derived: critical/alarm-capable
     tier: tracked-only
     chat: none
@@ -1886,6 +1906,7 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    migration_issue: alpha-engine-config-I8996
     # derived: error-capable, automated response declared
     tier: tracked-only
     chat: none
@@ -1894,6 +1915,7 @@ alert_classes:
     severities: [critical]
     intake: bus
     response: drain-queue
+    migration_issue: alpha-engine-config-I8996
     # derived: critical/alarm-capable
     tier: page
     chat: critical
@@ -1913,6 +1935,7 @@ alert_classes:
     severities: [dynamic]
     intake: bus
     response: drain-queue
+    migration_issue: alpha-engine-config-I8996
     # DECLARED: SF-definition drift is conformance, named in I6751's
     # TRACKED-ONLY row.
     tier: tracked-only
@@ -1924,6 +1947,7 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    migration_issue: alpha-engine-config-I8996
     # derived: error-capable, automated response declared
     tier: tracked-only
     chat: none
@@ -1934,6 +1958,7 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    migration_issue: alpha-engine-config-I8996
     # derived: error-capable, automated response declared
     tier: tracked-only
     chat: none
@@ -1949,6 +1974,7 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    migration_issue: alpha-engine-config-I8996
     # DECLARED: conformance drift — backlog work, nothing broken. I6751 matrix
     # names systemd-unit-drift in the TRACKED-ONLY row.
     tier: tracked-only
@@ -1966,6 +1992,7 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    migration_issue: alpha-engine-config-I8996
     # derived: error-capable, automated response declared
     tier: tracked-only
     chat: none
@@ -1979,6 +2006,7 @@ alert_classes:
     severities: [dynamic]
     intake: bus
     response: drain-queue
+    migration_issue: alpha-engine-config-I8996
     # derived: severities [dynamic] — resolved per emission
     tier: tracked-only
     chat: none
@@ -1990,6 +2018,7 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    migration_issue: alpha-engine-config-I8996
     # derived: error-capable, automated response declared
     tier: tracked-only
     chat: none
@@ -2032,6 +2061,7 @@ alert_classes:
     severities: [error, warning]
     intake: bus
     response: drain-queue
+    migration_issue: alpha-engine-config-I8996
     # DECLARED: groom lifecycle, named in I6751's NOTIFY-SILENT row.
     tier: tracked-only
     chat: none
@@ -2103,6 +2133,7 @@ alert_classes:
     severities: [warning, critical]
     intake: bus
     response: drain-queue
+    migration_issue: alpha-engine-config-I8996
     # DECLARED dynamic + `page_after_consecutive` below: a single failed run of
     # an HOURLY timer that its own next run repairs is not actionable-now.
     # Measured 2026-09-09: metron-deploy-drift failed once at 18:07 (git
@@ -2165,6 +2196,7 @@ alert_classes:
     severities: [critical]
     intake: bus
     response: drain-queue
+    migration_issue: alpha-engine-config-I8996
     # derived: critical/alarm-capable
     tier: tracked-only
     chat: none
@@ -2215,6 +2247,7 @@ alert_classes:
     severities: [dynamic]
     intake: bus
     response: drain-queue
+    migration_issue: alpha-engine-config-I8996
     # DECLARED: a pending-reboot notice is scheduled maintenance, not a break.
     tier: tracked-only
     chat: none
@@ -2223,6 +2256,7 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    migration_issue: alpha-engine-config-I8996
     # derived: error-capable, automated response declared
     tier: tracked-only
     chat: none
@@ -2231,6 +2265,7 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    migration_issue: alpha-engine-config-I8996
     # derived: error-capable, automated response declared
     tier: tracked-only
     chat: none
@@ -2239,6 +2274,7 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    migration_issue: alpha-engine-config-I8996
     # derived: error-capable, automated response declared
     tier: tracked-only
     chat: none
@@ -2247,6 +2283,7 @@ alert_classes:
     severities: [critical]
     intake: bus
     response: drain-queue
+    migration_issue: alpha-engine-config-I8996
     # derived: critical/alarm-capable
     tier: page
     chat: critical
@@ -2255,6 +2292,7 @@ alert_classes:
     severities: [critical]
     intake: bus
     response: drain-queue
+    migration_issue: alpha-engine-config-I8996
     # derived: critical/alarm-capable
     tier: page
     chat: critical
@@ -2263,6 +2301,7 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    migration_issue: alpha-engine-config-I8996
     # derived: error-capable, automated response declared
     tier: tracked-only
     chat: none
@@ -2274,6 +2313,7 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    migration_issue: alpha-engine-config-I8996
     # derived: error-capable, automated response declared
     tier: tracked-only
     chat: none
@@ -2287,6 +2327,7 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    migration_issue: alpha-engine-config-I8996
     # DECLARED: the canary's own defects (alpha-engine-config-I9314 / I9486) are
     # the dominant firing condition and are already tracked; one of tonight's
     # two pages self-labelled 'CANARY DEFECT (not a router fault)'. A router
@@ -2308,6 +2349,7 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    migration_issue: alpha-engine-config-I8996
     # DECLARED: an SLI breach is degraded-not-broken; the proxy fails CLOSED, so
     # a real outage surfaces as the consumer's own error, which pages on its own
     # class.
@@ -2318,6 +2360,7 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    migration_issue: alpha-engine-config-I8996
     # derived: error-capable, automated response declared
     tier: tracked-only
     chat: none
