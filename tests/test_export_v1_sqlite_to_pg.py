@@ -5,119 +5,135 @@ import sqlite3
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
-from types import ModuleType
-from typing import Never, cast
+from types import SimpleNamespace
 
 import pytest
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "export_v1_sqlite_to_pg.py"
-SPEC = importlib.util.spec_from_file_location("export_v1", SCRIPT)
-assert SPEC and SPEC.loader
-export = importlib.util.module_from_spec(SPEC)
-sys.modules[SPEC.name] = export
-SPEC.loader.exec_module(export)
-export = cast(ModuleType, export)
+spec = importlib.util.spec_from_file_location("export_v1_sqlite_to_pg", SCRIPT)
+assert spec and spec.loader
+export = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = export
+spec.loader.exec_module(export)
 
 
-def make_database(path: Path) -> None:
+def _sqlite(path: Path) -> None:
     with sqlite3.connect(path) as connection:
-        connection.execute("CREATE TABLE fills (id INTEGER PRIMARY KEY, price REAL, note TEXT, raw BLOB, amount NUMERIC)")
-        connection.execute("INSERT INTO fills VALUES (?, ?, ?, ?, ?)", (1, 12.5, "ok", b"\x00\xff", 7))
-
-
-class Paginator:
-    def __init__(self, contents: list[dict[str, object]]) -> None:
-        self.contents = contents
-
-    def paginate(self, **_kwargs: object) -> list[dict[str, object]]:
-        return [{"Contents": self.contents}]
+        connection.execute(
+            "CREATE TABLE fills (account TEXT, id INTEGER, price REAL, payload BLOB, amount NUMERIC, "
+            "PRIMARY KEY (account, id))"
+        )
+        connection.execute("INSERT INTO fills VALUES (?, ?, ?, ?, ?)", ("A", 7, 1.25, b"x\x00", "2.5"))
 
 
 class FakeS3:
-    def __init__(self, trades: Path, research: Path) -> None:
-        self.files = {"trades/final/trades.db": trades, "backups/final/research.db": research}
-        now = datetime(2026, 11, 1, tzinfo=UTC)
-        self.contents = [{"Key": key, "LastModified": now} for key in self.files]
-        self.puts: list[dict[str, object]] = []
+    def __init__(self, source: Path) -> None:
+        self.source = source
 
-    def get_paginator(self, _name: str) -> Paginator:
-        return Paginator(self.contents)
-
-    def download_file(self, _bucket: str, key: str, filename: str) -> None:
-        Path(filename).write_bytes(self.files[key].read_bytes())
-
-    def head_object(self, **_kwargs: object) -> dict[str, object]:
-        return {"ETag": '"abc"'}
-
-    def put_object(self, **kwargs: object) -> None:
-        self.puts.append(kwargs)
+    def download_file(self, bucket: str, key: str, filename: str) -> None:
+        del bucket, key
+        Path(filename).write_bytes(self.source.read_bytes())
 
 
-def test_dry_run_is_default_and_does_not_connect_or_upload(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    trades = tmp_path / "trades.db"
-    research = tmp_path / "research.db"
-    make_database(trades)
-    make_database(research)
-    s3 = FakeS3(trades, research)
+def test_download_uses_online_backup_and_inspection_maps_schema(tmp_path: Path) -> None:
+    original = tmp_path / "original.db"
+    _sqlite(original)
+    backup, digest = export.download_backup(FakeS3(original), "trades", "trades/final.db", tmp_path)
+    tables = export.inspect_tables("trades", backup)
 
-    def unexpected_connect(_dsn: str) -> Never:
-        raise AssertionError("dry-run connected to Postgres")
-
-    assert export.run(["--read-role", "archive_reader"], s3=s3, connect=unexpected_connect) == 0
-    output = capsys.readouterr().out
-    assert "s3://alpha-engine-research/trades/final/trades.db" in output
-    assert '"price" double precision' in output
-    assert "rows=1" in output
-    assert "dry-run: no Postgres writes and no manifest upload" in output
-    assert s3.puts == []
+    assert ".backup(destination)" in SCRIPT.read_text()
+    assert len(digest) == 64
+    assert len(tables) == 1
+    assert [column.pg_type for column in tables[0].columns] == [
+        "text", "bigint", "double precision", "bytea", "numeric",
+    ]
+    assert 'PRIMARY KEY ("account", "id")' in export.create_sql(tables[0])
+    assert tables[0].rows == (("A", 7, 1.25, b"x\x00", 2.5),)
 
 
-def test_inspection_maps_types_and_preserves_composite_primary_key(tmp_path: Path) -> None:
-    database = tmp_path / "source.db"
-    with sqlite3.connect(database) as connection:
-        connection.execute("CREATE TABLE sample (a TEXT, b INTEGER, value BLOB, PRIMARY KEY (b, a))")
-    table = export.inspect_tables(database, "trades")[0]
-    assert table.target_table == "v1_trades_sample"
-    assert export.create_sql(table) == (
-        'CREATE TABLE "v1_archive"."v1_trades_sample" '
-        '("a" text, "b" bigint, "value" bytea, PRIMARY KEY ("b", "a"))'
-    )
+def test_latest_source_obeys_cutoff_and_db_suffix() -> None:
+    class Paginator:
+        def paginate(self, **kwargs: object) -> list[dict[str, object]]:
+            assert kwargs == {"Bucket": export.BUCKET, "Prefix": "trades/"}
+            return [{"Contents": [
+                {"Key": "trades/old.db", "LastModified": datetime(2026, 10, 29, tzinfo=UTC), "ETag": '"old"'},
+                {"Key": "trades/new.txt", "LastModified": datetime(2026, 11, 2, tzinfo=UTC), "ETag": '"txt"'},
+                {"Key": "trades/final.db", "LastModified": datetime(2026, 11, 1, tzinfo=UTC), "ETag": '"etag"'},
+            ]}]
+
+    client = SimpleNamespace(get_paginator=lambda operation: Paginator())
+    assert export.find_latest_source(client, "trades/") == ("trades/final.db", "etag")
 
 
-def test_refuses_existing_target_with_different_count() -> None:
-    table = export.Table("trades", "fills", "v1_trades_fills", (), 2)
+class Cursor:
+    def __init__(self, answers: list[tuple[object, ...] | None]) -> None:
+        self.answers = answers
+        self.sql: list[str] = []
+        self.inserted: list[tuple[object, ...]] = []
 
-    class Cursor:
-        def __init__(self) -> None:
-            self.results = iter([("v1_archive.v1_trades_fills",), (1,)])
-        def __enter__(self) -> Cursor:
-            return self
-        def __exit__(self, *_args: object) -> None:
-            return None
-        def execute(self, _query: str, _params: object = ()) -> Cursor:
-            return self
-        def fetchone(self) -> tuple[object, ...]:
-            return next(self.results)
+    def execute(self, query: str, params: object = None) -> None:
+        del params
+        self.sql.append(query)
 
-    class Connection:
-        def __init__(self) -> None:
-            self.rolled_back = False
-        def cursor(self) -> Cursor:
-            return Cursor()
-        def commit(self) -> None:
-            raise AssertionError("committed mismatched table")
-        def rollback(self) -> None:
-            self.rolled_back = True
+    def executemany(self, query: str, params: object) -> None:
+        self.sql.append(query)
+        self.inserted = list(params)
 
-    connection = Connection()
-    with pytest.raises(RuntimeError, match="target has 1 rows, source has 2"):
-        export.apply_table(connection, Path("unused"), table, "reader")
-    assert connection.rolled_back
+    def fetchone(self) -> tuple[object, ...] | None:
+        return self.answers.pop(0)
+
+    def close(self) -> None:
+        pass
 
 
-def test_unsupported_declared_type_is_refused(tmp_path: Path) -> None:
-    database = tmp_path / "source.db"
-    with sqlite3.connect(database) as connection:
-        connection.execute("CREATE TABLE bad (created DATETIME)")
-    with pytest.raises(ValueError, match="unsupported SQLite type"):
-        export.inspect_tables(database, "research")
+class Connection:
+    def __init__(self, cursor: Cursor) -> None:
+        self._cursor = cursor
+        self.commits = 0
+        self.rollbacks = 0
+
+    def cursor(self) -> Cursor:
+        return self._cursor
+
+    def commit(self) -> None:
+        self.commits += 1
+
+    def rollback(self) -> None:
+        self.rollbacks += 1
+
+
+def _table() -> object:
+    return export.Table("trades", "fills", "v1_trades_fills", (export.Column("id", "bigint", 1),), ((1,),))
+
+
+def test_apply_loads_new_table_and_sets_select_only() -> None:
+    cursor = Cursor([(None,)])
+    connection = Connection(cursor)
+    assert export.apply_table(connection, _table(), "archive_reader") == 1
+    assert connection.commits == 1
+    assert cursor.inserted == [(1,)]
+    assert any("REVOKE ALL PRIVILEGES" in sql for sql in cursor.sql)
+    assert any("GRANT SELECT" in sql for sql in cursor.sql)
+
+
+def test_matching_table_is_noop_but_privileges_are_reasserted() -> None:
+    cursor = Cursor([("v1_archive.v1_trades_fills",), (1,)])
+    connection = Connection(cursor)
+    export.apply_table(connection, _table(), "archive_reader")
+    assert not cursor.inserted
+    assert not any(sql.startswith("CREATE TABLE") for sql in cursor.sql)
+    assert any("GRANT SELECT" in sql for sql in cursor.sql)
+
+
+def test_different_existing_count_is_refused_and_rolled_back() -> None:
+    cursor = Cursor([("v1_archive.v1_trades_fills",), (2,)])
+    connection = Connection(cursor)
+    with pytest.raises(RuntimeError, match="refusing"):
+        export.apply_table(connection, _table(), "archive_reader")
+    assert connection.rollbacks == 1
+    assert connection.commits == 0
+
+
+def test_cli_defaults_to_dry_run() -> None:
+    args = export.parse_args(["--dsn", "postgres://example", "--read-role", "reader"])
+    assert args.apply is False
