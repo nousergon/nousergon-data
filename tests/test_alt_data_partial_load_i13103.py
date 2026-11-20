@@ -17,13 +17,14 @@ from __future__ import annotations
 
 import io
 import math
+from typing import Any
 
 import numpy as np
 import pandas as pd
 import pytest
 
 from features import compute
-from features.writer import snapshot_group_frames
+from features.writer import write_feature_snapshot
 from tests.test_alt_data_read_coverage import FakeS3, _universe as _alt_universe
 
 _END = pd.Timestamp("2026-09-24")
@@ -53,11 +54,7 @@ def _entry(i: int) -> dict:
     }
 
 
-def _patch(
-    monkeypatch: pytest.MonkeyPatch,
-    tickers: list[str],
-    alt: compute.AlternativeLoad,
-) -> None:
+def _patch(monkeypatch: pytest.MonkeyPatch, tickers: list[str], alt: Any) -> None:
     spy = _stock(300, seed=999)
     price_data = {t: _stock(300, seed=i) for i, t in enumerate(tickers)}
     price_data["SPY"] = spy
@@ -156,24 +153,47 @@ def test_a_full_load_marks_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
     assert build.features_df[list(compute.ALTERNATIVE_FEATURES)].notna().all().all()
 
 
-def test_present_payload_preserves_missing_alternative_values_and_real_zero(
+def test_written_alternative_snapshot_distinguishes_missing_from_zero(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    alt = _alt_load(TICKERS, short=False)
-    alt["AAA"]["earnings"] = {"surprise_pct": 0.0}
-    alt["AAA"]["revisions"] = {"eps_revision_4w": None, "revision_streak": 0}
-    alt["AAA"]["options"] = {"put_call_ratio": 0.0}
-    _patch(monkeypatch, TICKERS, alt)
-
+    """Missing fields inside a loaded payload stay null through Parquet."""
+    zero = compute._alt_entry_from_payload({
+        "eps_revision": {
+            "surprise_pct": 0.0,
+            "days_since_earnings": 0.0,
+            "revision_4w": 0.0,
+            "streak": 0.0,
+        },
+        "options_flow": {"put_call_ratio": 0.0, "iv_rank": 0.0, "expected_move_pct": 0.0},
+    })
+    missing = compute._alt_entry_from_payload({})
+    alt = compute.AlternativeLoad({"AAA": missing, "BBB": zero})
+    _patch(monkeypatch, ["AAA", "BBB"], alt)
     build = compute.build_feature_frame(_END.date().isoformat(), "test-bucket", s3=None)
-    frames = snapshot_group_frames(_END.date().isoformat(), build.features_df)
-    written = pd.read_parquet(io.BytesIO(frames["alternative"][1])).set_index("ticker")
 
-    assert written.loc["AAA", "earnings_surprise_pct"] == 0.0
-    assert written.loc["AAA", "revision_streak"] == 0.0
-    assert written.loc["AAA", "put_call_ratio"] == 0.0
-    for feature in ("days_since_earnings", "eps_revision_4w", "iv_rank", "iv_vs_rv"):
-        assert math.isnan(written.loc["AAA", feature]), feature
+    class _CaptureS3:
+        objects: dict[str, bytes] = {}
+
+        def put_object(self, *, Bucket: str, Key: str, Body: bytes) -> None:
+            self.objects[Key] = Body
+
+    s3 = _CaptureS3()
+    write_feature_snapshot(
+        _END.date().isoformat(), build.features_df, "test-bucket", s3_client=s3,
+    )
+    key = f"features/{_END.date().isoformat()}/alternative.parquet"
+    written = pd.read_parquet(io.BytesIO(s3.objects[key])).set_index("ticker")
+
+    assert list(written.columns[1:]) == list(compute.ALTERNATIVE_FEATURES)
+    assert written.loc["AAA", list(compute.ALTERNATIVE_FEATURES)].isna().all()
+    assert written.loc["BBB", "earnings_surprise_pct"] == 0.0
+    assert written.loc["BBB", "days_since_earnings"] == 0.0
+    assert written.loc["BBB", "eps_revision_4w"] == 0.0
+    assert written.loc["BBB", "revision_streak"] == 0.0
+    assert written.loc["BBB", "put_call_ratio"] == 0.0
+    assert written.loc["BBB", "iv_rank"] == 0.0
+    # atm_iv=0 means this derived ratio is unavailable, not a genuine zero.
+    assert math.isnan(written.loc["BBB", "iv_vs_rv"])
 
 
 @pytest.mark.parametrize(
@@ -185,9 +205,7 @@ def test_present_payload_preserves_missing_alternative_values_and_real_zero(
     ],
 )
 def test_the_loader_reports_a_short_load(
-    unreadable: int,
-    manifest_short: bool,
-    short: bool,
+    unreadable: int, manifest_short: bool, short: bool,
 ) -> None:
     tickers = _alt_universe(20)
     s3 = FakeS3(

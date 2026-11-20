@@ -1113,36 +1113,38 @@ def compute_features(
 
     # ── v2.0 features — alternative data signals (O10-O12) ────────────────────
 
-    def _safe_float(
-        val: Any,  # pyright: ignore[reportExplicitAny] -- JSON scalar at runtime
-        default: float = 0.0,
-    ) -> float:
+    def _safe_float(val: Any, default: float = 0.0) -> float:
         """Coerce to float, treating None as the default."""
         return float(val) if val is not None else default
 
     # O10: PEAD
     if earnings_data:
-        df["earnings_surprise_pct"] = _safe_float(earnings_data.get("surprise_pct"), np.nan)
-        days_since = _safe_float(earnings_data.get("days_since_earnings"), np.nan)
+        surprise = (
+            float("nan")
+            if earnings_data.get("_surprise_missing")
+            else _safe_float(earnings_data.get("surprise_pct"), float("nan"))
+        )
+        df["earnings_surprise_pct"] = surprise
+        days_since = _safe_float(earnings_data.get("days_since_earnings"), float("nan"))
         # Capped at 90 days, as registry.py declares (I13143).
         df["days_since_earnings"] = min(max(days_since, 0.0), 90.0) / 90.0
     else:
-        df["earnings_surprise_pct"] = np.nan
-        df["days_since_earnings"] = np.nan
+        df["earnings_surprise_pct"] = float("nan")
+        df["days_since_earnings"] = float("nan")
 
     # O11: EPS revision momentum
     if revision_data:
-        df["eps_revision_4w"] = _safe_float(revision_data.get("eps_revision_4w"), np.nan)
-        df["revision_streak"] = _safe_float(revision_data.get("revision_streak"), np.nan)
+        df["eps_revision_4w"] = _safe_float(revision_data.get("eps_revision_4w"), float("nan"))
+        df["revision_streak"] = _safe_float(revision_data.get("revision_streak"), float("nan"))
     else:
-        df["eps_revision_4w"] = np.nan
-        df["revision_streak"] = np.nan
+        df["eps_revision_4w"] = float("nan")
+        df["revision_streak"] = float("nan")
 
     # O12: Options-derived signals
     if options_data:
-        df["put_call_ratio"] = _safe_float(options_data.get("put_call_ratio"), np.nan)
-        df["iv_rank"] = _safe_float(options_data.get("iv_rank"), np.nan)
-        atm_iv = _safe_float(options_data.get("atm_iv"), np.nan)
+        df["put_call_ratio"] = _safe_float(options_data.get("put_call_ratio"), float("nan"))
+        df["iv_rank"] = _safe_float(options_data.get("iv_rank"), float("nan"))
+        atm_iv = _safe_float(options_data.get("atm_iv"), float("nan"))
         # NOT a look-ahead: this whole O12 options block is an as-of-SNAPSHOT
         # broadcast — `options_data` (atm_iv etc.) is the current, time-axis-less
         # options state, written as one scalar to every row. Pairing the scalar
@@ -1154,11 +1156,11 @@ def compute_features(
         if realized_vol > 0 and atm_iv > 0:
             df["iv_vs_rv"] = atm_iv / realized_vol
         else:
-            df["iv_vs_rv"] = np.nan
+            df["iv_vs_rv"] = float("nan")
     else:
-        df["put_call_ratio"] = np.nan
-        df["iv_rank"] = np.nan
-        df["iv_vs_rv"] = np.nan
+        df["put_call_ratio"] = float("nan")
+        df["iv_rank"] = float("nan")
+        df["iv_vs_rv"] = float("nan")
 
     # ── v3.0 features — fundamental ratios (quarterly, from FMP) ─────────────
     if fundamental_data:
