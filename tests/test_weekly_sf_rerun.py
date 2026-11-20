@@ -1,3 +1,4 @@
+# ruff: noqa: ANN001, ANN003, ANN201, ANN202, ANN204, ANN205  # Legacy test module; fixtures are intentionally untyped.
 """Unit tests for scripts/weekly_sf_rerun.py (config#2277) + lockstep guards
 pinning its declarative stage table against infrastructure/step_function.json.
 
@@ -789,7 +790,7 @@ class TestStageTableLockstep:
                 f"infrastructure/step_function.json — update STAGES"
             )
 
-    def test_director_named_alert_is_a_degraded_witness(self, mod, all_states):
+    def test_director_named_alert_is_mapped_in_stages(self, mod, all_states):
         director = next(s for s in mod.STAGES if s.name == "director")
         assert "PublishDirectorSubStatusDegraded" in director.degraded_witness
         assert "PublishDirectorSubStatusDegraded" in all_states

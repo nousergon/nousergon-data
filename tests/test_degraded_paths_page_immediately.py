@@ -1,3 +1,4 @@
+# ruff: noqa: ANN001, ANN003, ANN201, ANN202, ANN204, ANN205  # Legacy test module; fixtures are intentionally untyped.
 """A fail-open that pages only at the terminal is silent when it matters.
 
 `sf-pipeline-policy.md` §5 permits the weekday fail-opens on exactly one
