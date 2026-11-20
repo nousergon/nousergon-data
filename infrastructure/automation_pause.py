@@ -55,7 +55,9 @@ scheduled work, so it is safe for ``enforce()`` to do unattended.
 ``paused_alarms`` is graded for CORRECTNESS by the above: every entry in it must
 still be justified and must match live state. It is graded for COMPLETENESS by
 ``armed_alarms`` (alpha-engine-config-I7023). Every live alarm with
-``TreatMissingData=breaching`` can latch ALARM from silence alone, so each one
+``TreatMissingData=breaching`` can latch ALARM from silence alone, and every
+alarm routing AlarmActions or OKActions to ``alpha-engine-alarm-backstop`` can
+page on a transition, so each one
 must be classified into exactly one of the two blocks — silenced because a
 trigger is paused, or armed because it watches something genuinely running. An
 alarm in NEITHER block is an ``alarm-undeclared`` finding, so a new one cannot be
@@ -159,6 +161,7 @@ import subprocess
 import sys
 from datetime import UTC, date, datetime
 from pathlib import Path
+from typing import cast
 
 MANIFEST = Path(__file__).parent.resolve() / "automation_pause.json"
 
@@ -618,7 +621,7 @@ def _alarm_actions_enabled(name: str) -> bool | None:
 
 
 def _live_alarm_actions() -> dict[str, dict[str, bool]]:
-    """``{alarm name: {"enabled": ActionsEnabled, "breaching": bool}}`` for EVERY live alarm.
+    """Live action state and completeness attributes for every CloudWatch alarm.
 
     One enumeration, two populations, because the manifest is graded against
     both and two independent scans of the same account can disagree with each
@@ -644,7 +647,7 @@ def _live_alarm_actions() -> dict[str, dict[str, bool]]:
             "cloudwatch", "describe-alarms", "--max-items", "100",
             "--query",
             "{a: MetricAlarms[].{n: AlarmName, e: ActionsEnabled, "
-            "b: TreatMissingData}, t: NextToken}",
+            "b: TreatMissingData, aa: AlarmActions, oa: OKActions}, t: NextToken}",
             "--output", "json",
         ]
         if token:
@@ -652,20 +655,32 @@ def _live_alarm_actions() -> dict[str, dict[str, bool]]:
         rc, out, err = _aws(args)
         if rc != 0:
             raise RuntimeError(f"aws cloudwatch describe-alarms: {err}")
-        page = json.loads(out or "{}")
-        for row in page.get("a") or []:
-            alarms[row["n"]] = {
+        page = cast(dict[str, object], json.loads(out or "{}"))
+        for row in cast(list[dict[str, object]], page.get("a") or []):
+            actions = cast(list[str], row.get("aa") or []) + cast(
+                list[str], row.get("oa") or []
+            )
+            name = cast(str, row["n"])
+            alarms[name] = {
                 "enabled": bool(row["e"]),
                 "breaching": row.get("b") == "breaching",
+                "paging": any(
+                    action.endswith(":alpha-engine-alarm-backstop")
+                    for action in actions
+                ),
             }
-        token = page.get("t")
+        token = cast(str | None, page.get("t"))
         if not token:
             return alarms
 
 
-def _live_breaching_alarms() -> dict[str, bool]:
-    """``{alarm name: ActionsEnabled}`` for every live alarm that latches on silence."""
-    return {n: v["enabled"] for n, v in _live_alarm_actions().items() if v["breaching"]}
+def _live_graded_alarms() -> dict[str, bool]:
+    """Alarms that can page through silence or the fleet backstop topic."""
+    return {
+        name: state["enabled"]
+        for name, state in _live_alarm_actions().items()
+        if state["breaching"] or state["paging"]
+    }
 
 
 def _live_silenced_alarms() -> set[str]:
@@ -1006,10 +1021,11 @@ def release_findings(manifest: dict | None = None,
 
 
 def alarm_coverage_findings() -> list[dict]:
-    """Is every silence-latching alarm CLASSIFIED — not merely every listed one?
+    """Is every silence-latching or backstop-routing alarm classified?
 
     ``alarm_findings()`` above grades the entries that exist. This grades the
-    ones that do not: any live alarm with ``TreatMissingData=breaching`` in
+    ones that do not: any live alarm with ``TreatMissingData=breaching`` or an
+    AlarmActions/OKActions route to ``alpha-engine-alarm-backstop`` in
     neither ``paused_alarms`` nor ``armed_alarms``, and any ``armed_alarms``
     entry that has been silenced or has vanished. Without this, the manifest can
     only ever be as complete as whatever was firing on the day someone wrote it.
@@ -1021,7 +1037,7 @@ def alarm_coverage_findings() -> list[dict]:
     # operator runs the delete it is still live (and still muted); afterwards
     # it is gone. Both states are the declaration holding, not a finding.
     declared_retired = retired_alarm_names()
-    live = _live_breaching_alarms()
+    live = _live_graded_alarms()
 
     # ── an UNDECLARED mute, of any alarm (alpha-engine-config-I8047) ────────
     #
@@ -1053,8 +1069,9 @@ def alarm_coverage_findings() -> list[dict]:
         out.append({
             "trigger": name, "surface": "cloudwatch", "kind": "alarm-undeclared",
             "detail": (
-                "treat_missing_data=breaching, so it can latch ALARM on silence "
-                "alone, but it appears in neither paused_alarms nor "
+                "the alarm can latch on missing data or routes an ALARM/OK "
+                "transition to alpha-engine-alarm-backstop, but it appears in "
+                "neither paused_alarms nor "
                 "armed_alarms. Classify it: add it to paused_alarms with the "
                 "trigger(s) it watches if it is quiet because they are paused, "
                 "or to armed_alarms with a one-line reason if it watches "
@@ -1068,9 +1085,9 @@ def alarm_coverage_findings() -> list[dict]:
             out.append({
                 "trigger": name, "surface": "cloudwatch", "kind": "armed-missing-in-aws",
                 "detail": (
-                    "declared in armed_alarms but no live alarm of that name has "
-                    "treat_missing_data=breaching — it was deleted, renamed, or its "
-                    "missing-data treatment was changed, and whatever it detected is "
+                    "declared in armed_alarms but no live alarm of that name is "
+                    "breaching or routes to alpha-engine-alarm-backstop — it was "
+                    "deleted, renamed, or its paging configuration changed, and whatever it detected is "
                     "now undetected. Remove or correct the entry."
                 ),
             })
