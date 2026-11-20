@@ -76,7 +76,7 @@ _FAMILY_BY_STATE = {
 
 
 @pytest.fixture(scope="module")
-def states() -> dict:
+def states() -> dict[str, Any]:
     return json.loads(_WEEKLY.read_text(encoding="utf-8"))["States"]
 
 
@@ -88,7 +88,9 @@ def floor(states: dict[str, Any]) -> dict[str, Any]:
     return json.loads(m.group(1))
 
 
-def _degraded_summary_setters(states: dict) -> dict[str, dict]:
+def _degraded_summary_setters(
+    states: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
     return {
         name: body
         for name, body in states.items()
@@ -173,24 +175,22 @@ def test_degraded_summary_is_floored_with_an_empty_reasons_object(
     }
 
 
-def test_clean_degraded_summary_uses_normalized_run_date(
+def test_clean_degraded_summary_receives_normalized_run_date(
     states: dict[str, Any],
 ) -> None:
-    """The clean summary must identify the normalized trading-day cycle.
-
-    ``ApplyNormalizedRunDate`` is downstream of ``NormalizeRunDates`` and is
-    therefore the first initializer that can stamp the resolved cycle date;
-    using the execution-input floor would misidentify explicit reruns.
-    """
+    """The clean route must attribute its honesty object to the normalized
+    trading cycle, not leave the floor's pre-normalization ``null`` in place."""
     merge = states["ApplyNormalizedRunDate"]["Parameters"]["merged.$"]
-    assert '\"degraded_summary\":' in merge
-    assert '\"degraded\":false' in merge
-    assert '\"reasons\":\\{\\}' in merge
-    assert '\"run_date\":\"{}\"' in merge
-    assert merge.endswith(
-        "$.run_dates.run_date, $.run_dates.run_date_family, "
-        "$.run_dates.run_date)), false)"
-    ), "degraded_summary.run_date must come from NormalizeRunDates' result"
+
+    assert "States.JsonMerge($.degraded_summary," in merge
+    assert (
+        "States.Format('\\{\"run_date\":\"{}\"\\}', $.run_dates.run_date)"
+        in merge
+    ), (
+        "ApplyNormalizedRunDate must stamp degraded_summary.run_date from the "
+        "normalizer result; using the earlier $.run_date would misattribute an "
+        "explicit rerun to its execution's calendar day"
+    )
 
 
 def test_check_degraded_outcome_never_routes_a_floored_clean_run_as_degraded(
