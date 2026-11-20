@@ -678,6 +678,29 @@ class TestCodifiedRootDiscovery:
         assert "[clean] ibgateway.service" in cap.out
         assert "uncodified=0" in cap.out
 
+    def test_demo_units_in_nested_systemd_root_are_clean_not_baselined(
+        self, cd, tmp_path, monkeypatch, capsys
+    ):
+        """The metron demo layout is infrastructure/demo/systemd/."""
+        module, _, installed_dir = cd
+        home = tmp_path / "home"
+        nested_root = home / "metron-ops" / "infrastructure" / "demo" / "systemd"
+        nested_root.mkdir(parents=True)
+        for name in ("metron-demo-api.service", "metron-demo-web.service"):
+            (nested_root / name).write_text(f"UNIT {name}\n")
+            (installed_dir / name).write_text(f"UNIT {name}\n")
+
+        monkeypatch.setattr(module, "CODIFIED_SEARCH_BASES", (home,))
+        monkeypatch.setattr(module, "load_baseline", lambda *a, **k: set())
+        monkeypatch.setattr("sys.argv", ["check-systemd-unit-drift.py"])
+        code = module.main()
+        cap = capsys.readouterr()
+
+        assert code == 0
+        assert "[clean] metron-demo-api.service" in cap.out
+        assert "[clean] metron-demo-web.service" in cap.out
+        assert "uncodified=0 uncodified_new=0" in cap.out
+
     def test_prune_keeps_the_walk_off_git_and_venvs(self, cd, tmp_path):
         module, _, _ = cd
         home = tmp_path / "home"

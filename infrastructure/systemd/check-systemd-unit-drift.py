@@ -106,11 +106,12 @@ the roots instead of through the units.
 
 A hardcoded list cannot be right on two boxes at once, and a third box would
 have inherited the same wrong list. Roots are therefore found by walking
-`CODIFIED_SEARCH_BASES` for `<repo>/infrastructure/systemd/` and
-`<repo>/infrastructure/` — the only two shapes any repo in the fleet uses —
-so a checkout that lands on a box is covered the day it lands, with nothing
-to remember to edit. `--codified-root` still works and is ADDITIVE, for a
-tree outside the search bases.
+`CODIFIED_SEARCH_BASES` for `<repo>/infrastructure/` and every `systemd/`
+directory beneath it. This covers both `<repo>/infrastructure/systemd/` and
+nested layouts such as `<repo>/infrastructure/demo/systemd/`, so a checkout
+that lands on a box is covered the day it lands, with nothing to remember to
+edit. `--codified-root` still works and is ADDITIVE, for a tree outside the
+search bases.
 
 **A drift/uncodified finding is annotated with `boot-pull.service` health
 (2026-08-31, alpha-engine-config-I9444).** Measured live on the trading box
@@ -139,6 +140,7 @@ import socket
 import subprocess
 import sys
 from pathlib import Path
+from typing import Callable
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
 REPO_ROOT = SCRIPT_DIR.parent.parent
@@ -220,7 +222,7 @@ def discover_codified_roots(
     bases: tuple[Path, ...] | list[Path] | None = None,
     max_depth: int = CODIFIED_SEARCH_MAX_DEPTH,
 ) -> list[Path]:
-    """Every `infrastructure/` and `infrastructure/systemd/` dir under `bases`.
+    """Every `infrastructure/` and nested `systemd/` dir under `bases`.
 
     The two shapes are the only ones any repo in the fleet uses, so matching on
     the directory NAME rather than on a list of repo names is what makes a new
@@ -260,11 +262,32 @@ def discover_codified_roots(
                     continue
                 if entry.name == "infrastructure":
                     found.append(entry)
-                    systemd_dir = entry / "systemd"
-                    if systemd_dir.is_dir():
-                        found.append(systemd_dir)
-                    # No descent below an `infrastructure/` dir: both shapes are
-                    # already captured, and its subdirs are IaC, not units.
+                    # Once the bounded search finds an infrastructure root,
+                    # inspect it recursively: repos may group units below a
+                    # component directory (for example demo/systemd).
+                    infra_stack = [entry]
+                    while infra_stack:
+                        infra_dir = infra_stack.pop()
+                        try:
+                            infra_entries = [
+                                p for p in infra_dir.iterdir()
+                                if p.is_dir() and not p.is_symlink()
+                            ]
+                        except (PermissionError, OSError):
+                            print(
+                                f"[check-systemd-unit-drift] could not list {infra_dir} while "
+                                f"discovering codified roots — any unit codified only there "
+                                f"will read as uncodified",
+                                file=sys.stderr,
+                            )
+                            continue
+                        for infra_entry in infra_entries:
+                            if infra_entry.name in _SEARCH_PRUNE or infra_entry.name.startswith("."):
+                                continue
+                            if infra_entry.name == "systemd":
+                                found.append(infra_entry)
+                                continue
+                            infra_stack.append(infra_entry)
                     continue
                 stack.append((entry, depth + 1))
     return sorted(set(found))
@@ -378,7 +401,9 @@ def check_unit(
     return "clean", f"{name}: OK"
 
 
-def _boot_pull_diagnosis(run=None) -> str | None:
+def _boot_pull_diagnosis(
+    run: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+) -> str | None:
     """If `boot-pull.service` exists on this box and its last run failed, say so.
 
     Boot-pull is the trading box's ONLY reconciliation path outside a manual
