@@ -215,6 +215,25 @@ def test_fetch_execution_history_paginates_past_the_old_twenty_page_cap():
     assert len(events) == 25 * 3
     assert truncated is False
     assert sf.get_execution_history.call_count == 25
+    assert all(
+        call.kwargs["includeExecutionData"] is False
+        for call in sf.get_execution_history.call_args_list
+    )
+
+
+def test_fetch_execution_history_includes_execution_data_on_every_page_when_requested():
+    sf = _paged_history_client(total_pages=3)
+    events, truncated = fetch_execution_history(
+        sf, "arn:exec", include_execution_data=True
+    )
+
+    assert len(events) == 9
+    assert truncated is False
+    assert [call.kwargs["includeExecutionData"] for call in sf.get_execution_history.call_args_list] == [
+        True,
+        True,
+        True,
+    ]
 
 
 def test_fetch_execution_history_reports_truncation_when_pages_exhausted():
