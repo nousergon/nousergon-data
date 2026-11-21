@@ -1033,6 +1033,20 @@ alert_classes:
     # finding.
     tier: tracked-only
     chat: none
+  - class: backtester_parity_tolerance_band
+    source: "alpha-engine-backtester/parity/tolerance-band"
+    severities: [warning]
+    intake: bus
+    response: drain-queue
+    tier: tracked-only
+    chat: none
+  - class: backtester_parity_step_change
+    source: "alpha-engine-backtester/parity/step-change"
+    severities: [warning, error]
+    intake: bus
+    response: drain-queue
+    tier: tracked-only
+    chat: none
   - class: backtester_input_quality
     source: "alpha-engine-backtester/analysis/input_quality.py"
     severities: [warning]

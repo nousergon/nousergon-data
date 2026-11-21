@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
@@ -54,13 +55,13 @@ GHA_CRON_PLAYBOOKS = sorted(
 )
 
 
-def test_registry_validates_against_schema():
+def test_registry_validates_against_schema() -> None:
     jsonschema = pytest.importorskip("jsonschema")
     jsonschema.validate(REGISTRY, SCHEMA)
 
 
 @pytest.mark.parametrize("name", LAMBDA_BACKED_PLAYBOOKS)
-def test_executor_lambda_dir_exists(name):
+def test_executor_lambda_dir_exists(name: str) -> None:
     spec = REGISTRY["playbooks"][name]
     lambda_dir = LAMBDAS_DIR / spec["executor_lambda_dir"]
     assert (lambda_dir / "index.py").is_file(), (
@@ -70,7 +71,7 @@ def test_executor_lambda_dir_exists(name):
 
 
 @pytest.mark.parametrize("name", LAMBDA_BACKED_PLAYBOOKS)
-def test_executor_function_matches_dir_convention(name):
+def test_executor_function_matches_dir_convention(name: str) -> None:
     spec = REGISTRY["playbooks"][name]
     assert spec["executor_function"] == f"alpha-engine-{spec['executor_lambda_dir']}", (
         f"playbook {name!r}: executor_function {spec['executor_function']!r} does not "
@@ -82,7 +83,7 @@ def test_executor_function_matches_dir_convention(name):
     "name",
     sorted(k for k, v in REGISTRY["playbooks"].items() if v.get("routed")),
 )
-def test_benign_reasons_exist_in_executor_source(name):
+def test_benign_reasons_exist_in_executor_source(name: str) -> None:
     spec = REGISTRY["playbooks"][name]
     src = (LAMBDAS_DIR / spec["executor_lambda_dir"] / "index.py").read_text()
     returnable = set(re.findall(r'"reason":\s*"([a-z_]+)"', src))
@@ -95,7 +96,7 @@ def test_benign_reasons_exist_in_executor_source(name):
 
 
 @pytest.mark.parametrize("name", LAMBDA_BACKED_PLAYBOOKS)
-def test_kill_switch_env_exists_in_executor_source(name):
+def test_kill_switch_env_exists_in_executor_source(name: str) -> None:
     spec = REGISTRY["playbooks"][name]
     src = (LAMBDAS_DIR / spec["executor_lambda_dir"] / "index.py").read_text()
     assert spec["kill_switch_env"] in src, (
@@ -116,7 +117,7 @@ WORKFLOW_FILE_PATTERN = re.compile(r"^\.github/workflows/[a-z0-9_-]+\.ya?ml$")
 
 
 @pytest.mark.parametrize("name", GHA_CRON_PLAYBOOKS)
-def test_gha_cron_entry_has_sane_workflow_file(name):
+def test_gha_cron_entry_has_sane_workflow_file(name: str) -> None:
     spec = REGISTRY["playbooks"][name]
     workflow_file = spec.get("workflow_file")
     assert workflow_file, (
@@ -130,7 +131,7 @@ def test_gha_cron_entry_has_sane_workflow_file(name):
 
 
 @pytest.mark.parametrize("name", GHA_CRON_PLAYBOOKS)
-def test_gha_cron_entry_has_repo(name):
+def test_gha_cron_entry_has_repo(name: str) -> None:
     spec = REGISTRY["playbooks"][name]
     assert spec.get("repo"), (
         f"playbook {name!r}: trigger_type github_actions_cron requires a repo "
@@ -140,7 +141,7 @@ def test_gha_cron_entry_has_repo(name):
 
 
 @pytest.mark.parametrize("name", GHA_CRON_PLAYBOOKS)
-def test_gha_cron_entry_has_no_lambda_fields(name):
+def test_gha_cron_entry_has_no_lambda_fields(name: str) -> None:
     """A github_actions_cron entry has no Lambda — Lambda-specific fields
     should not be present (schema already forbids requiring them, but this
     pins the intent: don't half-fill a Lambda reference for an entry with
@@ -153,7 +154,7 @@ def test_gha_cron_entry_has_no_lambda_fields(name):
         )
 
 
-def test_router_bundles_this_registry():
+def test_router_bundles_this_registry() -> None:
     """The router's deploy.sh must copy THIS registry file into its zip —
     pin the copy line so a rename breaks CI, not the deploy."""
     deploy = (LAMBDAS_DIR / "overseer-dispatcher" / "deploy.sh").read_text()
@@ -165,7 +166,7 @@ def test_router_bundles_this_registry():
 # playbook's optional `liveness.checks` + the top-level `watch_plane_liveness`.
 
 
-def test_liveness_probe_bundles_this_registry():
+def test_liveness_probe_bundles_this_registry() -> None:
     """The overseer-liveness-probe's deploy.sh must copy THIS registry into its
     zip (the probe's check table) — same bundling contract as the router."""
     deploy = (LAMBDAS_DIR / "overseer-liveness-probe" / "deploy.sh").read_text()
@@ -184,7 +185,7 @@ def _sibling_dispatcher_pipeline_names() -> set[str]:
     return set(re.findall(r'^ {4}"([\w.-]+)":\s*\{', block, re.M))
 
 
-def test_sf_watch_liveness_pipelines_lockstep_with_dispatcher():
+def test_sf_watch_liveness_pipelines_lockstep_with_dispatcher() -> None:
     """REGRESSION GUARD (moved from sf-watch-reclaim-sweep-handler's own test): the
     sf-watch playbook's liveness pipeline list (the eventbridge_rule
     ``expect_state_machines`` + ``state_machines_exist`` list — ONE YAML anchor)
@@ -231,7 +232,7 @@ def _sibling_dispatcher_watch_prefixes() -> dict[str, str]:
     return prefixes
 
 
-def test_sf_watch_invocation_success_pipelines_lockstep_with_dispatcher():
+def test_sf_watch_invocation_success_pipelines_lockstep_with_dispatcher() -> None:
     """REGRESSION GUARD (alpha-engine-config-I2901): the sf_watch_invocation_
     success check's per-pipeline ``watch_prefix`` must exactly match
     saturday-sf-watch-dispatcher's PIPELINES mapping — a drifted prefix would
@@ -255,7 +256,7 @@ def test_sf_watch_invocation_success_pipelines_lockstep_with_dispatcher():
 # ── scheduler_schedule_exists coverage (alpha-engine-config-I2906) ───────────
 
 
-def test_watch_plane_covers_all_four_router_scheduler_schedules():
+def test_watch_plane_covers_all_four_router_scheduler_schedules() -> None:
     """REGRESSION GUARD (alpha-engine-config-I2906): the 4 router-targeting
     EventBridge Scheduler schedules (alert-drain x2, weekly canary-drill x2)
     must each have a scheduler_schedule_exists entry under watch_plane_
@@ -289,7 +290,7 @@ def test_watch_plane_covers_all_four_router_scheduler_schedules():
 # ── model/wake/cadence declaration (config-I3293) ────────────────────────────
 
 
-def test_every_routed_playbook_declares_model_wake_cadence():
+def test_every_routed_playbook_declares_model_wake_cadence() -> None:
     """config-I3293: the registry is the ONE place that answers 'what model
     runs this agent, what wakes it, on what cadence'. Every routed playbook
     (its agent is launched THROUGH the router, so the router can inject the
@@ -318,7 +319,7 @@ def test_every_routed_playbook_declares_model_wake_cadence():
         assert spec.get("cadence"), f"routed playbook {name!r} missing cadence declaration"
 
 
-def test_drain_wake_names_all_four_schedules():
+def test_drain_wake_names_all_four_schedules() -> None:
     """The alert-drain wake declaration and the watch_plane_liveness
     scheduler checks must agree on the 4x-daily schedule set — a schedule
     added to one surface but not the other is drift."""
@@ -339,7 +340,7 @@ def test_drain_wake_names_all_four_schedules():
 # ── cadence liveness coverage (config#4474) ───────────────────────────────────
 
 
-def test_every_cadenced_playbook_has_run_window_or_invocation_success():
+def test_every_cadenced_playbook_has_run_window_or_invocation_success() -> None:
     """Every Lambda-backed playbook with a non-event-driven cadence string
     MUST declare either a ``run_window`` or ``sf_watch_invocation_success``
     liveness check — a mature trigger with no covering check is a silent
@@ -371,7 +372,7 @@ def test_every_cadenced_playbook_has_run_window_or_invocation_success():
 # ── alert-class registry (config-I3211) ──────────────────────────────────────
 
 
-def test_alert_classes_present_and_unique():
+def test_alert_classes_present_and_unique() -> None:
     """The alert-class registry exists and class ids are unique — this is
     the fleet's declared answer to 'what notifications exist and what
     responds to each' (Brian directive 2026-07-22)."""
@@ -381,7 +382,7 @@ def test_alert_classes_present_and_unique():
     assert len(ids) == len(set(ids)), "duplicate alert class ids"
 
 
-def test_no_undeclared_drain_blind_class():
+def test_no_undeclared_drain_blind_class() -> None:
     """Every intake:none row must carry a migration_issue (tracked path onto
     the bus) or an operator_reason (explicit page-only declaration). A
     drain-blind class with neither is the exact I3211 defect."""
@@ -393,7 +394,7 @@ def test_no_undeclared_drain_blind_class():
             )
 
 
-def test_alert_class_playbook_refs_exist():
+def test_alert_class_playbook_refs_exist() -> None:
     """A response of playbook:<name> must reference a real, routed playbook."""
     for r in REGISTRY["alert_classes"]:
         resp = r["response"]
@@ -406,7 +407,7 @@ def test_alert_class_playbook_refs_exist():
             )
 
 
-def test_known_bus_sources_have_rows():
+def test_known_bus_sources_have_rows() -> None:
     """Spot-pin the highest-value bus sources from the 2026-07-22 fleet
     inventory — the classes most recently exercised live. (The full
     cross-repo static completeness chokepoint is tracked separately; this
@@ -439,7 +440,7 @@ BACKTESTER_SPOT_EXIT_SOURCES = (
 
 
 @pytest.mark.parametrize("source", BACKTESTER_SPOT_EXIT_SOURCES)
-def test_backtester_spot_exit_sources_are_declared(source):
+def test_backtester_spot_exit_sources_are_declared(source: str) -> None:
     """alpha-engine-config-I12385: a spot reclaim on the portfolio-optimizer
     stage reached intake with no row, and an undeclared source PAGES
     (krepis.alert_tiers.resolve_tier). Each stage's source has its own exact
@@ -454,7 +455,34 @@ def test_backtester_spot_exit_sources_are_declared(source):
     assert row["tier"] == "tracked-only" and row["chat"] == "none"
 
 
-def test_registry_model_passes_its_executor_validator():
+@pytest.mark.parametrize(
+    ("class_id", "source", "severities"),
+    (
+        (
+            "backtester_parity_tolerance_band",
+            "alpha-engine-backtester/parity/tolerance-band",
+            ["warning"],
+        ),
+        (
+            "backtester_parity_step_change",
+            "alpha-engine-backtester/parity/step-change",
+            ["warning", "error"],
+        ),
+    ),
+)
+def test_backtester_parity_alert_classes_are_declared(
+    class_id: str, source: str, severities: list[str]
+) -> None:
+    rows = [r for r in REGISTRY["alert_classes"] if r["class"] == class_id]
+    assert len(rows) == 1, f"{class_id!r}: expected exactly one alert-class row, got {len(rows)}"
+    row = rows[0]
+    assert row["source"] == source
+    assert row["severities"] == severities
+    assert row["intake"] == "bus" and row["response"] == "drain-queue"
+    assert row["tier"] == "tracked-only" and row["chat"] == "none"
+
+
+def test_registry_model_passes_its_executor_validator() -> None:
     """LOCKSTEP: every routed playbook's declared `model` must actually be
     accepted by the executor Lambda that receives it.
 
@@ -494,7 +522,7 @@ _ROUTING_ALIAS_SUFFIXES = ("-max", "-low", "-mid", "-high")
     "name",
     sorted(k for k, v in REGISTRY["playbooks"].items() if v.get("routed") and v.get("model")),
 )
-def test_registry_model_is_a_provider_name_not_a_routing_alias(name):
+def test_registry_model_is_a_provider_name_not_a_routing_alias(name: str) -> None:
     """A routed playbook's `model` is passed STRAIGHT to `claude -p --model` on
     the spot box, which talks directly to the provider through the local egress
     proxy — there is no LiteLLM hop to resolve a fleet routing alias.
@@ -519,7 +547,7 @@ def test_registry_model_is_a_provider_name_not_a_routing_alias(name):
     )
 
 
-def test_every_registry_bundling_lambda_redeploys_on_registry_change():
+def test_every_registry_bundling_lambda_redeploys_on_registry_change() -> None:
     """LOCKSTEP: if a Lambda's deploy.sh BUNDLES playbooks.yaml into its zip,
     that Lambda's deploy workflow must be path-triggered on the registry too.
 
@@ -568,11 +596,11 @@ def test_every_registry_bundling_lambda_redeploys_on_registry_change():
 # ── T1 outcome split + re-authorization (alpha-engine-config-I8686) ──────────
 
 
-def _t1(name):
+def _t1(name: str) -> dict[str, Any]:
     return next(e for e in REGISTRY["t1_automations"] if e["name"] == name)
 
 
-def test_the_auto_verify_entry_distinguishes_declined_from_failed():
+def test_the_auto_verify_entry_distinguishes_declined_from_failed() -> None:
     """Brian ruling 2026-08-26: a correct DECLINE is an outcome, not a
     predicate failure. The steps are the executable spec for a
     non-deterministic runner, so the distinction has to be IN them."""
@@ -582,7 +610,7 @@ def test_the_auto_verify_entry_distinguishes_declined_from_failed():
     assert "could not be EVALUATED" in steps
 
 
-def test_a_decline_declares_the_incident():
+def test_a_decline_declares_the_incident() -> None:
     """The half that turns a decline into work. Without it the T1 lane earns
     its keep only on the resolved path, and the full-agent cost the demotion
     notice names is never removed."""
@@ -593,7 +621,7 @@ def test_a_decline_declares_the_incident():
         assert fact in steps, fact
 
 
-def test_the_auto_verify_entry_is_reauthorized_by_the_ruling_issue():
+def test_the_auto_verify_entry_is_reauthorized_by_the_ruling_issue() -> None:
     """Re-authorization is a merged registry diff, never a hand-edit of the
     carryover ledger in S3 — that is what makes overseer-policy.md §6's
     'a reviewed issue authorizing it' an actual mechanism."""
@@ -606,7 +634,7 @@ def test_the_auto_verify_entry_is_reauthorized_by_the_ruling_issue():
     assert entry["reauthorized_at"] >= "2026-10-18"
 
 
-def test_reauthorized_at_and_reauthorized_by_are_required_together():
+def test_reauthorized_at_and_reauthorized_by_are_required_together() -> None:
     """A date with no authorizing issue would re-arm an automation with no
     record of who decided to."""
     dep = SCHEMA["properties"]["t1_automations"]["items"]["dependentRequired"]
@@ -614,14 +642,14 @@ def test_reauthorized_at_and_reauthorized_by_are_required_together():
     assert dep["reauthorized_by"] == ["reauthorized_at"]
 
 
-def test_max_consecutive_failures_is_documented_as_failed_only():
+def test_max_consecutive_failures_is_documented_as_failed_only() -> None:
     desc = (SCHEMA["properties"]["t1_automations"]["items"]
             ["properties"]["max_consecutive_failures"]["description"])
     assert "ONLY `failed`" in desc
     assert "declined" in desc
 
 
-def test_the_auto_verify_entry_excludes_declared_off_rows():
+def test_the_auto_verify_entry_excludes_declared_off_rows() -> None:
     """The coupling with alpha-engine-config-I8719, stated where the
     population is defined — one contract, enforced at the producer."""
     desc = _t1("freshness-critical-auto-verify")["description"]
@@ -635,7 +663,7 @@ _SWEEP_SRC = (REPO_ROOT / "infrastructure" / "lambdas" / "freshness-monitor"
               / "unregistered_envelopes.py")
 
 
-def _sweep_constant(name):
+def _sweep_constant(name: str) -> Any:
     """Read a constant from the sweep module's SOURCE — importing it would pull
     in nousergon_lib, and the registry tests must not depend on that."""
     m = re.search(rf'^{name}\s*=\s*"([^"]+)"', _SWEEP_SRC.read_text(encoding="utf-8"),
@@ -644,7 +672,7 @@ def _sweep_constant(name):
     return m.group(1)
 
 
-def test_the_auto_verify_entry_resolves_the_synthetic_sweep_row():
+def test_the_auto_verify_entry_resolves_the_synthetic_sweep_row() -> None:
     """Demoted 2026-10-18 on two runs that could not EVALUATE: the synthetic
     `unregistered_envelope_staleness` row has no ARTIFACT_REGISTRY row by
     design, so a step that only reads the registry could never resolve it.
@@ -657,14 +685,14 @@ def test_the_auto_verify_entry_resolves_the_synthetic_sweep_row():
     assert "threshold_minutes" in steps
 
 
-def test_the_sweep_row_is_never_verified_on_its_report_mtime():
+def test_the_sweep_row_is_never_verified_on_its_report_mtime() -> None:
     """The report is rewritten on every sweep, so HEADing it would `verify`
     genuinely stale envelopes. The step has to say so, not just omit it."""
     steps = " ".join(_t1("freshness-critical-auto-verify")["remediation_steps"])
     assert "do NOT HEAD its canonical key" in steps
 
 
-def test_a_missing_registry_row_stays_failed_outside_the_sweep_row():
+def test_a_missing_registry_row_stays_failed_outside_the_sweep_row() -> None:
     """The exception is one named row, not a general licence: any other
     artifact_id with no registry row is a registry gap and stays `failed`."""
     steps = " ".join(_t1("freshness-critical-auto-verify")["remediation_steps"])
