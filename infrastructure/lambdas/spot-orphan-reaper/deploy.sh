@@ -265,6 +265,7 @@ if $SMOKE; then
   cat "${RESP}"
   echo ""
   assert_no_function_error "${INVOKE_STDOUT}" "${RESP}"
+  assert_json_response_field_equals "${RESP}" dry_run true
 
   # Restore production env (DRY_RUN=false)
   aws lambda update-function-configuration \

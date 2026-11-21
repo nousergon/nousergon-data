@@ -1,7 +1,6 @@
 # shellcheck shell=bash
 #
-# smoke.sh — the ONE assertion every deploy.sh's --smoke path calls after
-# invoking its Lambda: did the handler CRASH. Nothing else.
+# smoke.sh — shared assertions for every deploy.sh's --smoke path.
 # (alpha-engine-config-I7535, following the I7379 fix on one script.)
 #
 # WHY. `aws lambda invoke` exits 0 when the handler RAISES — a handler
@@ -96,6 +95,60 @@ if function_error or error_type:
     sys.exit(1)
 
 sys.exit(0)
+PY
+}
+
+# Assert one top-level field in a handler's JSON response.  The expected value
+# is itself JSON, so callers can distinguish booleans/numbers from strings.
+# This deliberately lives beside the universal crash assertion: deploy scripts
+# supply the per-handler contract, while parsing and fail-loud diagnostics stay
+# shared (policy-shared-code).
+assert_json_response_field_equals() {
+  local resp_file="${1:?assert_json_response_field_equals: response file required}"
+  local field="${2:?assert_json_response_field_equals: field required}"
+  local expected_json="${3:?assert_json_response_field_equals: expected JSON required}"
+
+  python3 - "${resp_file}" "${field}" "${expected_json}" <<'PY'
+import json
+import sys
+
+resp_path, field, expected_json = sys.argv[1:]
+try:
+    with open(resp_path, encoding="utf-8") as stream:
+        response = json.load(stream)
+    expected = json.loads(expected_json)
+except (OSError, json.JSONDecodeError) as exc:
+    print(f"SMOKE FAILED: cannot read semantic response contract: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+if not isinstance(response, dict) or response.get(field) != expected:
+    actual = response.get(field) if isinstance(response, dict) else response
+    print(
+        f"SMOKE FAILED: expected response field {field!r} to equal "
+        f"{expected!r}; got {actual!r}.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+PY
+}
+
+assert_json_response_field_present() {
+  local resp_file="${1:?assert_json_response_field_present: response file required}"
+  local field="${2:?assert_json_response_field_present: field required}"
+  python3 - "${resp_file}" "${field}" <<'PY'
+import json
+import sys
+
+resp_path, field = sys.argv[1:]
+try:
+    with open(resp_path, encoding="utf-8") as stream:
+        response = json.load(stream)
+except (OSError, json.JSONDecodeError) as exc:
+    print(f"SMOKE FAILED: cannot read semantic response contract: {exc}", file=sys.stderr)
+    sys.exit(1)
+if not isinstance(response, dict) or field not in response or response[field] in (None, ""):
+    print(f"SMOKE FAILED: response lacks non-empty field {field!r}.", file=sys.stderr)
+    sys.exit(1)
 PY
 }
 

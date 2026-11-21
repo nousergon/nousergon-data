@@ -175,6 +175,7 @@ if $SMOKE; then
     "${RESP}")
   cat "${RESP}"
   echo ""
+  # SMOKE_SEMANTIC_EXEMPTION: the read-only result is necessarily determined by whether today’s live S3 precondition exists.
   assert_no_function_error "${INVOKE_STDOUT}" "${RESP}"
   rm -f "${RESP}"
 fi

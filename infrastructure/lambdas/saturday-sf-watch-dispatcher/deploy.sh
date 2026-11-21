@@ -330,5 +330,6 @@ EOF
   cat "${RESP}"
   echo ""
   assert_no_function_error "${INVOKE_STDOUT}" "${RESP}"
+  assert_json_response_field_present "${RESP}" watch_log_key
   rm -f "${RESP}"
 fi
