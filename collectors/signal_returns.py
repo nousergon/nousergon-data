@@ -28,7 +28,9 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
+from collections.abc import Callable
+from typing import cast
 
 import boto3
 import pandas as pd
@@ -1575,7 +1577,7 @@ def _emit_horizon_grading_lag_metric(db_path: str, forward_days: int) -> dict:
     # between 00:37 and 03:20 UTC, and every run outside that gap read 0.
     today = _market_today()
 
-    summary: dict = {"status": "ok", "forward_days": h}
+    summary: dict[str, object] = {"status": "ok", "forward_days": h}
     try:
         conn = sqlite3.connect(db_path)
         try:
@@ -1612,12 +1614,12 @@ def _emit_horizon_grading_lag_metric(db_path: str, forward_days: int) -> dict:
     # the newest closed date is already graded — count_trading_days is a
     # half-open (start, end] count so it's 0 when start == end and never
     # negative for a healthy monotonic backfill).
-    lag_returns = (
+    lag_returns = cast(int,
         count_trading_days(date.fromisoformat(max_graded_returns), date.fromisoformat(newest_closed_returns))
         if newest_closed_returns and max_graded_returns
         else 0
     )
-    lag_outcomes = (
+    lag_outcomes = cast(int,
         count_trading_days(date.fromisoformat(max_graded_outcome), date.fromisoformat(newest_closed_outcomes))
         if newest_closed_outcomes and max_graded_outcome
         else 0
@@ -1636,6 +1638,50 @@ def _emit_horizon_grading_lag_metric(db_path: str, forward_days: int) -> dict:
 
     try:
         cw = boto3.client("cloudwatch")
+        dimensions = [{"Name": "HorizonDays", "Value": str(h)}]
+
+        def consecutive_weeks(metric_name: str, lag: int) -> int:
+            if lag == 0:
+                return 0
+            try:
+                end = datetime.now(timezone.utc)
+                get_statistics = cast(Callable[..., object], cw.get_metric_statistics)
+                response = get_statistics(
+                    Namespace="AlphaEngine/Data",
+                    MetricName=metric_name,
+                    Dimensions=dimensions,
+                    StartTime=end - timedelta(days=35),
+                    EndTime=end,
+                    Period=86400,
+                    Statistics=["Maximum"],
+                )
+                if not isinstance(response, dict):
+                    return 1
+                typed_response = cast(dict[object, object], response)
+                prior = typed_response.get("Datapoints")
+                if not isinstance(prior, list) or not prior:
+                    return 1
+                points = [
+                    cast(dict[object, object], point)
+                    for point in cast(list[object], prior)
+                    if isinstance(point, dict)
+                ]
+                latest = max(points, key=lambda point: str(point.get("Timestamp")))
+                previous = latest.get("Maximum", 0)
+                return int(previous) + 1 if isinstance(previous, (int, float)) else 1
+            except Exception as exc:
+                logger.warning(
+                    "horizon_grading_lag consecutive metric read failed for %s; "
+                    "starting a new consecutive run. %s", metric_name, exc,
+                )
+                return 1
+
+        consecutive_returns = consecutive_weeks(
+            "universe_returns_horizon_grading_lag_consecutive_weeks", lag_returns,
+        )
+        consecutive_outcomes = consecutive_weeks(
+            "predictor_outcomes_grading_lag_consecutive_weeks", lag_outcomes,
+        )
         cw.put_metric_data(
             Namespace="AlphaEngine/Data",
             MetricData=[
@@ -1643,15 +1689,31 @@ def _emit_horizon_grading_lag_metric(db_path: str, forward_days: int) -> dict:
                     "MetricName": "universe_returns_horizon_grading_lag_trading_days",
                     "Value": float(lag_returns),
                     "Unit": "Count",
-                    "Dimensions": [{"Name": "HorizonDays", "Value": str(h)}],
+                    "Dimensions": dimensions,
                 },
                 {
                     "MetricName": "predictor_outcomes_grading_lag_trading_days",
                     "Value": float(lag_outcomes),
                     "Unit": "Count",
-                    "Dimensions": [{"Name": "HorizonDays", "Value": str(h)}],
+                    "Dimensions": dimensions,
+                },
+                {
+                    "MetricName": "universe_returns_horizon_grading_lag_consecutive_weeks",
+                    "Value": float(consecutive_returns),
+                    "Unit": "Count",
+                    "Dimensions": dimensions,
+                },
+                {
+                    "MetricName": "predictor_outcomes_grading_lag_consecutive_weeks",
+                    "Value": float(consecutive_outcomes),
+                    "Unit": "Count",
+                    "Dimensions": dimensions,
                 },
             ],
+        )
+        summary.update(
+            universe_returns_lag_consecutive_weeks=consecutive_returns,
+            predictor_outcomes_lag_consecutive_weeks=consecutive_outcomes,
         )
     except Exception as exc:
         logger.warning(

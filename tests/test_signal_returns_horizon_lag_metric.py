@@ -10,7 +10,6 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 from datetime import date, datetime, timezone
-from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -54,15 +53,15 @@ def _seed_predictor_outcomes(db: str, prediction_date: str, horizon_days: int | 
 
 
 class TestNewestWindowClosed:
-    def test_none_when_table_empty(self):
+    def test_none_when_table_empty(self) -> None:
         assert _newest_window_closed(None, date(2026, 7, 19), 21) is None
 
-    def test_newest_row_already_closed(self):
+    def test_newest_row_already_closed(self) -> None:
         # 2026-06-16 + 21 trading days = 2026-07-17, which is < 2026-07-19.
         out = _newest_window_closed("2026-06-16", date(2026, 7, 19), 21)
         assert out == "2026-06-16"
 
-    def test_walks_back_when_newest_row_still_open(self):
+    def test_walks_back_when_newest_row_still_open(self) -> None:
         # 2026-06-17 + 21 trading days = 2026-07-20, NOT < 2026-07-19 (still
         # open) — must walk back to 2026-06-16, whose window HAS closed.
         out = _newest_window_closed("2026-06-17", date(2026, 7, 19), 21)
@@ -70,7 +69,7 @@ class TestNewestWindowClosed:
 
 
 class TestEmitHorizonGradingLagMetric:
-    def test_healthy_pipeline_emits_zero_lag(self, monkeypatch):
+    def test_healthy_pipeline_emits_zero_lag(self, monkeypatch) -> None:
         """The exact config#2972 scenario: rows exist up through a date whose
         21d window hasn't closed yet, and the graded columns are populated
         for every date whose window HAS closed. Lag must be 0 — this is NOT
@@ -103,11 +102,13 @@ class TestEmitHorizonGradingLagMetric:
         assert names == {
             "universe_returns_horizon_grading_lag_trading_days",
             "predictor_outcomes_grading_lag_trading_days",
+            "universe_returns_horizon_grading_lag_consecutive_weeks",
+            "predictor_outcomes_grading_lag_consecutive_weeks",
         }
         for m in call.kwargs["MetricData"]:
             assert m["Value"] == 0.0
 
-    def test_stalled_pipeline_emits_positive_lag(self, monkeypatch):
+    def test_stalled_pipeline_emits_positive_lag(self, monkeypatch) -> None:
         """A genuinely stalled grading path: several dates' 21d windows have
         closed but the graded columns never got backfilled for them. Lag
         must be > 0 so the alarm can fire on sustained non-zero lag."""
@@ -135,7 +136,70 @@ class TestEmitHorizonGradingLagMetric:
         assert out["universe_returns_lag_trading_days"] > 0
         assert out["predictor_outcomes_lag_trading_days"] > 0
 
-    def test_db_read_failure_is_non_fatal(self, monkeypatch):
+    @pytest.mark.parametrize("previous, expected", [([], 1), ([2], 3)])
+    def test_nonzero_lag_advances_consecutive_gauges(
+        self, monkeypatch, previous, expected,
+    ) -> None:
+        db = _make_db()
+        _seed_universe_returns(db, "2026-05-01", has_21d=True)
+        _seed_universe_returns(db, "2026-05-04", has_21d=False)
+        _seed_predictor_outcomes(db, "2026-05-01", horizon_days=21)
+        _seed_predictor_outcomes(db, "2026-05-04", horizon_days=None)
+        cw = MagicMock()
+        cw.get_metric_statistics.return_value = {
+            "Datapoints": [
+                {"Timestamp": datetime(2026, 7, 12, tzinfo=timezone.utc), "Maximum": value}
+                for value in previous
+            ],
+        }
+        monkeypatch.setattr("collectors.signal_returns.boto3.client", lambda svc: cw)
+        monkeypatch.setattr(
+            "collectors.signal_returns._market_today", lambda: date(2026, 7, 19),
+        )
+
+        out = _emit_horizon_grading_lag_metric(db, forward_days=21)
+        assert out["universe_returns_lag_consecutive_weeks"] == expected
+        assert out["predictor_outcomes_lag_consecutive_weeks"] == expected
+
+    def test_consecutive_gauges_reset_and_are_independent(self, monkeypatch) -> None:
+        db = _make_db()
+        _seed_universe_returns(db, "2026-05-01", has_21d=True)
+        _seed_universe_returns(db, "2026-05-04", has_21d=False)
+        _seed_predictor_outcomes(db, "2026-05-04", horizon_days=21)
+        cw = MagicMock()
+        cw.get_metric_statistics.return_value = {
+            "Datapoints": [{"Timestamp": datetime.now(timezone.utc), "Maximum": 4}],
+        }
+        monkeypatch.setattr("collectors.signal_returns.boto3.client", lambda svc: cw)
+        monkeypatch.setattr(
+            "collectors.signal_returns._market_today", lambda: date(2026, 7, 19),
+        )
+
+        out = _emit_horizon_grading_lag_metric(db, forward_days=21)
+        assert out["universe_returns_lag_consecutive_weeks"] == 5
+        assert out["predictor_outcomes_lag_consecutive_weeks"] == 0
+        assert cw.get_metric_statistics.call_count == 1
+
+    def test_failed_prior_value_read_starts_at_one(self, monkeypatch) -> None:
+        db = _make_db()
+        _seed_universe_returns(db, "2026-05-01", has_21d=True)
+        _seed_universe_returns(db, "2026-05-04", has_21d=False)
+        _seed_predictor_outcomes(db, "2026-05-01", horizon_days=21)
+        _seed_predictor_outcomes(db, "2026-05-04", horizon_days=None)
+        cw = MagicMock()
+        cw.get_metric_statistics.side_effect = RuntimeError("read failed")
+        monkeypatch.setattr("collectors.signal_returns.boto3.client", lambda svc: cw)
+        monkeypatch.setattr(
+            "collectors.signal_returns._market_today", lambda: date(2026, 7, 19),
+        )
+
+        out = _emit_horizon_grading_lag_metric(db, forward_days=21)
+        assert out["status"] == "ok"
+        assert out["universe_returns_lag_consecutive_weeks"] == 1
+        assert out["predictor_outcomes_lag_consecutive_weeks"] == 1
+        cw.put_metric_data.assert_called_once()
+
+    def test_db_read_failure_is_non_fatal(self, monkeypatch) -> None:
         monkeypatch.setattr(
             "collectors.signal_returns.boto3.client",
             lambda svc: MagicMock(),
@@ -144,7 +208,7 @@ class TestEmitHorizonGradingLagMetric:
         assert out["status"] == "skipped"
         assert "error" in out
 
-    def test_empty_tables_emit_zero_not_crash(self, monkeypatch):
+    def test_empty_tables_emit_zero_not_crash(self, monkeypatch) -> None:
         db = _make_db()
         cw = MagicMock()
         monkeypatch.setattr(
@@ -178,7 +242,7 @@ class TestGaugeReadsTheGradersClock:
         _seed_predictor_outcomes(db, "2026-08-24", horizon_days=21)
         _seed_predictor_outcomes(db, "2026-08-25", horizon_days=None)
 
-    def test_utc_evening_run_on_caught_up_pipeline_emits_zero(self, monkeypatch):
+    def test_utc_evening_run_on_caught_up_pipeline_emits_zero(self, monkeypatch) -> None:
         from collectors.universe_returns import _market_today
 
         db = _make_db()
@@ -199,7 +263,7 @@ class TestGaugeReadsTheGradersClock:
         for m in cw.put_metric_data.call_args.kwargs["MetricData"]:
             assert m["Value"] == 0.0
 
-    def test_the_utc_anchor_is_what_produced_the_false_lag(self, monkeypatch):
+    def test_the_utc_anchor_is_what_produced_the_false_lag(self, monkeypatch) -> None:
         # Discriminator: the same DB judged on the box's UTC date reads lag=1.
         # If this ever reads 0, the test above no longer proves anything.
         db = _make_db()
