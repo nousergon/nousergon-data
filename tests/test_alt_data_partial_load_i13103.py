@@ -15,13 +15,16 @@ but does not degrade a full load.
 
 from __future__ import annotations
 
+import io
 import math
+from typing import Any
 
 import numpy as np
 import pandas as pd
 import pytest
 
 from features import compute
+from features.writer import write_feature_snapshot
 from tests.test_alt_data_read_coverage import FakeS3, _universe as _alt_universe
 
 _END = pd.Timestamp("2026-09-24")
@@ -51,7 +54,7 @@ def _entry(i: int) -> dict:
     }
 
 
-def _patch(monkeypatch, tickers: list[str], alt):
+def _patch(monkeypatch: pytest.MonkeyPatch, tickers: list[str], alt: Any) -> None:
     spy = _stock(300, seed=999)
     price_data = {t: _stock(300, seed=i) for i, t in enumerate(tickers)}
     price_data["SPY"] = spy
@@ -77,14 +80,16 @@ def _alt_load(tickers: list[str], *, short: bool) -> compute.AlternativeLoad:
 TICKERS = ["AAA", "BBB", "CCC", "DDD"]
 
 
-def test_alternative_features_are_the_registered_group():
+def test_alternative_features_are_the_registered_group() -> None:
     assert compute.ALTERNATIVE_FEATURES == (
         "earnings_surprise_pct", "days_since_earnings", "eps_revision_4w",
         "revision_streak", "put_call_ratio", "iv_rank", "iv_vs_rv",
     )
 
 
-def test_a_ticker_missing_from_a_partial_load_is_nan_not_defaults(monkeypatch):
+def test_a_ticker_missing_from_a_partial_load_is_nan_not_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """RED before the fix: DDD carried 0.0 / 1.0 / 0.5 / 1.0, indistinguishable
     from a ticker whose alternative data really reads that way."""
     _patch(monkeypatch, TICKERS, _alt_load(TICKERS[:3], short=True))
@@ -102,7 +107,9 @@ def test_a_ticker_missing_from_a_partial_load_is_nan_not_defaults(monkeypatch):
     assert df.loc["DDD", other].notna().sum() > 0
 
 
-def test_a_short_load_degrades_the_run_and_names_the_tickers(monkeypatch):
+def test_a_short_load_degrades_the_run_and_names_the_tickers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from weekly_collector import _DegradedRun
 
     _patch(monkeypatch, TICKERS, _alt_load(TICKERS[:2], short=True))
@@ -120,7 +127,9 @@ def test_a_short_load_degrades_the_run_and_names_the_tickers(monkeypatch):
     assert "carry no signal" not in result["reason"]
 
 
-def test_an_uncovered_ticker_on_a_full_load_is_marked_but_not_degraded(monkeypatch):
+def test_an_uncovered_ticker_on_a_full_load_is_marked_but_not_degraded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A ticker the producer never requests (XLRE today) is NaN on every run;
     that alone must not turn every snapshot DEGRADED."""
     _patch(monkeypatch, TICKERS, _alt_load(TICKERS[:3], short=False))
@@ -135,13 +144,56 @@ def test_an_uncovered_ticker_on_a_full_load_is_marked_but_not_degraded(monkeypat
     assert "reason" not in result
 
 
-def test_a_full_load_marks_nothing(monkeypatch):
+def test_a_full_load_marks_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch(monkeypatch, TICKERS, _alt_load(TICKERS, short=False))
 
     build = compute.build_feature_frame(_END.date().isoformat(), "test-bucket", s3=None)
 
     assert build.alt_data_missing == ()
     assert build.features_df[list(compute.ALTERNATIVE_FEATURES)].notna().all().all()
+
+
+def test_written_alternative_snapshot_distinguishes_missing_from_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Missing fields inside a loaded payload stay null through Parquet."""
+    zero = compute._alt_entry_from_payload({
+        "eps_revision": {
+            "surprise_pct": 0.0,
+            "days_since_earnings": 0.0,
+            "revision_4w": 0.0,
+            "streak": 0.0,
+        },
+        "options_flow": {"put_call_ratio": 0.0, "iv_rank": 0.0, "expected_move_pct": 0.0},
+    })
+    missing = compute._alt_entry_from_payload({})
+    alt = compute.AlternativeLoad({"AAA": missing, "BBB": zero})
+    _patch(monkeypatch, ["AAA", "BBB"], alt)
+    build = compute.build_feature_frame(_END.date().isoformat(), "test-bucket", s3=None)
+
+    class _CaptureS3:
+        objects: dict[str, bytes] = {}
+
+        def put_object(self, *, Bucket: str, Key: str, Body: bytes) -> None:
+            self.objects[Key] = Body
+
+    s3 = _CaptureS3()
+    write_feature_snapshot(
+        _END.date().isoformat(), build.features_df, "test-bucket", s3_client=s3,
+    )
+    key = f"features/{_END.date().isoformat()}/alternative.parquet"
+    written = pd.read_parquet(io.BytesIO(s3.objects[key])).set_index("ticker")
+
+    assert list(written.columns[1:]) == list(compute.ALTERNATIVE_FEATURES)
+    assert written.loc["AAA", list(compute.ALTERNATIVE_FEATURES)].isna().all()
+    assert written.loc["BBB", "earnings_surprise_pct"] == 0.0
+    assert written.loc["BBB", "days_since_earnings"] == 0.0
+    assert written.loc["BBB", "eps_revision_4w"] == 0.0
+    assert written.loc["BBB", "revision_streak"] == 0.0
+    assert written.loc["BBB", "put_call_ratio"] == 0.0
+    assert written.loc["BBB", "iv_rank"] == 0.0
+    # atm_iv=0 means this derived ratio is unavailable, not a genuine zero.
+    assert math.isnan(written.loc["BBB", "iv_vs_rv"])
 
 
 @pytest.mark.parametrize(
@@ -152,7 +204,9 @@ def test_a_full_load_marks_nothing(monkeypatch):
         (0, False, False),  # full coverage
     ],
 )
-def test_the_loader_reports_a_short_load(unreadable, manifest_short, short):
+def test_the_loader_reports_a_short_load(
+    unreadable: int, manifest_short: bool, short: bool,
+) -> None:
     tickers = _alt_universe(20)
     s3 = FakeS3(
         tickers,

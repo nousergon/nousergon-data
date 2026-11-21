@@ -1458,10 +1458,10 @@ class AlternativeCoverageError(RuntimeError):
     Raised only for the unambiguous cases: the manifest states N>0 tickers were
     written and we loaded ZERO, or nothing could be loaded at all (the
     ``latest_weekly.json`` pointer unreadable, dateless, or the listing failed;
-    alpha-engine-config-I12879). Every alternative feature would silently become
-    0.0 for the whole universe, which is indistinguishable from a genuine zero
-    (see ``compute_and_write``'s ``val ... else 0.0``) — a red run is the honest
-    outcome. A PARTIAL shortfall is logged at ERROR rather than raised, so the
+    alpha-engine-config-I12879). Every alternative feature would be missing for
+    the whole universe, so publishing a snapshot would conceal a failed input
+    load — a red run is the honest outcome. A PARTIAL shortfall is logged at
+    ERROR rather than raised, so the
     daily append still lands on a provider hiccup — and in the snapshot each
     missing ticker's alternative features are NaN, never the 0.0 defaults
     (:func:`_mark_alternative_missing`, alpha-engine-config-I13103).
@@ -1541,9 +1541,11 @@ def _alt_entry_from_payload(ticker_data: dict) -> dict:
     # The two direct-key lookups above always missed, so ``surprise`` was
     # always None and every ticker silently fell to the literal 0.0 default.
     surprise = eps.get("surprise_pct")
+    surprise_missing = surprise is None
     if surprise is None:
         surprises = consensus.get("earnings_surprises") or []
         surprise = surprises[0].get("surprise_pct") if surprises else 0.0
+        surprise_missing = not surprises or surprise is None
     # registry.py documents earnings_surprise_pct as "decimal pct (_pct
     # suffix)" (e.g. 0.01 for 1%), but the producer's surprise_pct is a
     # percent-point number (AAPL 2026-06-30: actual=1.91 vs
@@ -1554,6 +1556,9 @@ def _alt_entry_from_payload(ticker_data: dict) -> dict:
     return {
         "earnings": {
             "surprise_pct": surprise,
+            # Preserve the reader's long-standing scalar shape while retaining
+            # whether its compatibility 0.0 is absent rather than genuine.
+            "_surprise_missing": surprise_missing,
             # None, never 0.0, when absent: 0.0 reads as "reported today" and
             # was every ticker's value until the producer wrote the field
             # (alpha-engine-config-I13143). feature_engineer defaults None
@@ -1561,8 +1566,8 @@ def _alt_entry_from_payload(ticker_data: dict) -> dict:
             "days_since_earnings": eps.get("days_since_earnings"),
         },
         "revisions": {
-            "eps_revision_4w": eps.get("revision_4w", 0.0),
-            "revision_streak": eps.get("streak", 0),
+            "eps_revision_4w": eps.get("revision_4w"),
+            "revision_streak": eps.get("streak"),
         },
         "options": {
             "put_call_ratio": options.get("put_call_ratio"),
@@ -1603,7 +1608,7 @@ def _load_cached_alternative(
             # prefix, which holds nothing: the same whole-universe zero.
             raise AlternativeCoverageError(
                 "Alternative data: market_data/latest_weekly.json has no 'date'; "
-                "every alternative feature would be 0.0 for the whole universe."
+                "every alternative feature would be missing for the whole universe."
             )
         prefix = f"market_data/weekly/{latest_date}/alternative/"
 
@@ -1659,7 +1664,7 @@ def _load_cached_alternative(
                 raise AlternativeCoverageError(
                     f"Alternative data: manifest at {prefix}manifest.json reports "
                     f"{expected} tickers written for {latest_date}, loaded ZERO. "
-                    "Every alternative feature would be 0.0 for the whole universe "
+                    "Every alternative feature would be missing for the whole universe "
                     "and indistinguishable from a genuine zero."
                 )
             log.error(
@@ -1716,22 +1721,24 @@ def _expected_alternative_count(
 #: The registered ``alternative``-family columns (``features/registry.py``):
 #: every one is derived ONLY from the per-ticker DataPhase2 payload, so a ticker
 #: with no payload has no basis for any of them.
+#: I5818 audit: the other groups keep their existing policy. Technical and macro
+#: inputs come from price series (or the ticker is skipped), while fundamental
+#: collector defaults are deliberate and separate. The backtester and evaluator
+#: use pandas/LightGBM missing-value paths; ``apply_factor_zscores`` only reads
+#: ``FACTOR_LOADING_SOURCES``, which contains none of these columns.
 ALTERNATIVE_FEATURES: tuple[str, ...] = tuple(GROUPS.get("alternative", ()))
 
 
 def _mark_alternative_missing(row: dict) -> None:
     """Set every alternative feature in ``row`` to NaN: this ticker had no payload.
 
-    alpha-engine-config-I13103. ``compute_features`` fills a ticker with no
-    alternative payload with plausible constants (0.0, ``days_since_earnings``
-    1.0, ``iv_rank`` 0.5, ``iv_vs_rv`` 1.0) — the same values a genuinely quiet
-    ticker carries, so a partial DataPhase2 load (unreadable objects, or fewer
-    than the manifest's ``tickers_succeeded``) was invisible row by row. NaN is
+    alpha-engine-config-I13103. This explicit marker records a partial DataPhase2
+    load (unreadable objects, or fewer than the manifest's
+    ``tickers_succeeded``) row by row. NaN is
     the snapshot's declared "absent" state (``contracts/features_parquet.schema.json``
     types every feature ``[number, null]``; the ``vwap_divergence_pct`` and
-    ``factor_momentum_ratio`` precedents, I7572/I7539), and a loaded ticker can
-    never be NaN in all seven — ``compute_features`` defaults every ``None`` — so
-    an all-NaN alternative block IS the row-level marker in the published file.
+    ``factor_momentum_ratio`` precedents, I7572/I7539). A loaded ticker may also
+    have unavailable individual inputs; those fields now remain NaN (I5818).
     The tickers are also listed by name in the run result (``alt_data_missing``).
     """
     for f in ALTERNATIVE_FEATURES:
@@ -1923,10 +1930,10 @@ def build_feature_frame(
             latest = featured_df.iloc[-1]
             row = {"ticker": ticker}
             for f in FEATURES:
-                val = latest[f] if f in latest.index else 0.0
+                val = latest[f] if f in latest.index else float("nan")
                 if pd.notna(val):
                     row[f] = float(val)
-                elif f in ALL_NULL_EXPECTED:
+                elif f in ALTERNATIVE_FEATURES or f in ALL_NULL_EXPECTED:
                     # alpha-engine-config-I7572: a generic "not yet known" ->
                     # 0.0 fallback silently laundered vwap_divergence_pct's
                     # legitimate NaN (today's VWAP isn't known until the
@@ -1956,8 +1963,8 @@ def build_feature_frame(
         log.log(
             logging.ERROR if getattr(alt_data, "short", False) else logging.INFO,
             "Alternative data MISSING for %d of %d computed tickers: their %d "
-            "alternative features are NaN in this snapshot, not the 0.0/0.5/1.0 "
-            "defaults (alpha-engine-config-I13103). First 20: %s",
+            "alternative features are NaN in this snapshot "
+            "(alpha-engine-config-I13103). First 20: %s",
             len(alt_missing), n_ok, len(ALTERNATIVE_FEATURES), sorted(alt_missing)[:20],
         )
     log.info(
