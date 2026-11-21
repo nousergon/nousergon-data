@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
 import pytest
+from pytest import MonkeyPatch
 
 from execution_digest import (
     STATE_DURATION_FLOORS_SEC,
@@ -24,7 +26,7 @@ def _ts(base: datetime, offset_sec: int) -> datetime:
     return base.replace(tzinfo=timezone.utc) + __import__("datetime").timedelta(seconds=offset_sec)
 
 
-def test_parse_task_state_durations_computes_wall_clock():
+def test_parse_task_state_durations_computes_wall_clock() -> None:
     base = datetime(2026, 7, 5, 12, 0, 0, tzinfo=timezone.utc)
     events = [
         {
@@ -41,7 +43,7 @@ def test_parse_task_state_durations_computes_wall_clock():
     assert parse_task_state_durations(events)["PredictorTraining"] == 120
 
 
-def test_floor_breach_detected_when_under_minimum():
+def test_floor_breach_detected_when_under_minimum() -> None:
     # alpha-engine-config-I10574: "PredictorTraining" is the dispatch state
     # (never floored — see STATE_DURATION_FLOORS_SEC); the floor sits on its
     # companion poll state, "WaitForPredictorTraining".
@@ -58,7 +60,7 @@ def test_floor_breach_detected_when_under_minimum():
     assert rows[0].anomaly is True
 
 
-def test_preflight_suppresses_floor_breach():
+def test_preflight_suppresses_floor_breach() -> None:
     start = datetime(2026, 7, 5, 12, 0, 0, tzinfo=timezone.utc)
     rows = build_state_durations(
         {"WaitForPredictorTraining": 30},
@@ -70,7 +72,7 @@ def test_preflight_suppresses_floor_breach():
     assert rows[0].floor_breach is False
 
 
-def test_retired_data_stage_floors_left_with_their_states():
+def test_retired_data_stage_floors_left_with_their_states() -> None:
     # alpha-engine-config-I11269: the data cutover removed the weekly
     # WaitForMorningEnrich / WaitForDataPhase1 and preopen
     # PollMorningEnrichSpot / PollMorningArcticAppendSpot states, so their
@@ -87,7 +89,7 @@ def test_retired_data_stage_floors_left_with_their_states():
     assert ed.DIGEST_STATE_ORDER[0] == "WaitForCollectionManifests"
 
 
-def test_dispatch_state_duration_still_renders_with_no_floor():
+def test_dispatch_state_duration_still_renders_with_no_floor() -> None:
     # The dispatch states are dropped from STATE_DURATION_FLOORS_SEC, not
     # from the digest entirely — no whitelist filter (alpha-engine-config-
     # I6857): a state absent from the floor mapping renders with no floor,
@@ -104,7 +106,7 @@ def test_dispatch_state_duration_still_renders_with_no_floor():
     assert rows[0].floor_breach is False
 
 
-def test_format_digest_sorts_anomalies_visually():
+def test_format_digest_sorts_anomalies_visually() -> None:
     rows = [
         StateDuration("Backtester", 600, 600, False, False),
         StateDuration("PredictorTraining", 120, 1200, True, False),
@@ -114,7 +116,7 @@ def test_format_digest_sorts_anomalies_visually():
     assert any("Backtester" in line and "✓" in line for line in lines)
 
 
-def test_build_execution_digest_hollow_on_fast_predictor():
+def test_build_execution_digest_hollow_on_fast_predictor() -> None:
     # alpha-engine-config-I10574: floored/attested on "WaitForPredictorTraining"
     # (the poll state), not "PredictorTraining" (the dispatch state).
     start_ms = 1_700_000_000_000
@@ -148,12 +150,103 @@ def test_build_execution_digest_hollow_on_fast_predictor():
     assert STATE_DURATION_FLOORS_SEC["WaitForPredictorTraining"] == 20 * 60
 
 
-def test_parse_run_date_from_execution_name_extracts_iso_date():
+def _ssm_poll_events(
+    state_name: str, poll_key: str, poll_result: object, duration_sec: int = 1800
+) -> list[dict]:
+    base = datetime(2026, 9, 8, tzinfo=timezone.utc)
+    return [
+        {
+            "type": "TaskStateEntered",
+            "timestamp": base,
+            "stateEnteredEventDetails": {"name": state_name},
+        },
+        {
+            "type": "TaskStateExited",
+            "timestamp": _ts(base, duration_sec),
+            "stateExitedEventDetails": {
+                "name": state_name,
+                "output": json.dumps({poll_key: poll_result}),
+            },
+        },
+    ]
+
+
+@pytest.mark.parametrize(
+    ("state_name", "poll_key"),
+    [
+        ("PollMorningArcticAppendSpot", "arctic_append_poll"),
+        ("PollMorningEnrichSpot", "morning_enrich_poll"),
+    ],
+)
+def test_digest_flags_tracked_failed_ssm_status(state_name: str, poll_key: str) -> None:
+    sf = MagicMock()
+    sf.get_execution_history.return_value = {
+        "events": _ssm_poll_events(state_name, poll_key, {"Status": "Failed"}, 3806)
+    }
+    lines, hollow, _cause = build_execution_digest(
+        execution_arn="arn:exec:fb449297",
+        is_preflight=False,
+        execution_start_ms=1_700_000_000_000,
+        run_date="2026-09-08",
+        sf_client=sf,
+        s3_client=None,
+    )
+    assert hollow is True
+    assert any(state_name in line and "SSM command failed" in line for line in lines)
+
+
+def test_digest_flags_nonzero_ssm_response_code() -> None:
+    sf = MagicMock()
+    sf.get_execution_history.return_value = {
+        "events": _ssm_poll_events(
+            "PollMorningEnrichSpot", "morning_enrich_poll", {"ResponseCode": 1}
+        )
+    }
+    _lines, hollow, _cause = build_execution_digest(
+        execution_arn="arn:exec",
+        is_preflight=False,
+        execution_start_ms=1_700_000_000_000,
+        run_date=None,
+        sf_client=sf,
+        s3_client=None,
+    )
+    assert hollow is True
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        {"Status": "Success", "ResponseCode": 0},
+        None,
+        "malformed",
+    ],
+)
+def test_digest_does_not_flag_successful_missing_or_malformed_ssm_result(output: object) -> None:
+    events = _ssm_poll_events(
+        "PollMorningArcticAppendSpot", "arctic_append_poll", output
+    )
+    if output == "malformed":
+        events[1]["stateExitedEventDetails"]["output"] = "{not-json"
+    sf = MagicMock()
+    sf.get_execution_history.return_value = {"events": events}
+    lines, hollow, _cause = build_execution_digest(
+        execution_arn="arn:exec",
+        is_preflight=False,
+        execution_start_ms=1_700_000_000_000,
+        run_date=None,
+        sf_client=sf,
+        s3_client=None,
+    )
+    assert hollow is False
+    assert all("SSM command failed" not in line for line in lines)
+
+
+def test_parse_run_date_from_execution_name_extracts_iso_date() -> None:
     # daemon.py's _trigger_eod_pipeline: name=f"eod-{run_date}-{epoch}"
     assert parse_run_date_from_execution_name("eod-2026-08-08-1754678901") == "2026-08-08"
 
 
-def test_parse_run_date_from_execution_name_handles_backstop_prefix():
+def test_parse_run_date_from_execution_name_handles_backstop_prefix() -> None:
     # eod-backstop/index.py: name=f"eod-backstop-{trading_day}-{epoch}"
     assert (
         parse_run_date_from_execution_name("eod-backstop-2026-08-08-1700000000")
@@ -161,11 +254,11 @@ def test_parse_run_date_from_execution_name_handles_backstop_prefix():
     )
 
 
-def test_parse_run_date_from_execution_name_returns_none_without_a_date():
+def test_parse_run_date_from_execution_name_returns_none_without_a_date() -> None:
     assert parse_run_date_from_execution_name("exec-001") is None
 
 
-def test_parse_run_date_from_execution_name_returns_none_for_empty_input():
+def test_parse_run_date_from_execution_name_returns_none_for_empty_input() -> None:
     assert parse_run_date_from_execution_name(None) is None
     assert parse_run_date_from_execution_name("") is None
 
@@ -184,7 +277,7 @@ def test_parse_run_date_from_execution_name_returns_none_for_empty_input():
 # finite) new cap IS exhausted, the digest says so instead of asserting ✓.
 
 
-def _paged_history_client(total_pages: int, events_per_page: int = 3):
+def _paged_history_client(total_pages: int, events_per_page: int = 3) -> MagicMock:
     """A MagicMock sf_client whose get_execution_history hands back
     `total_pages` pages before nextToken goes empty."""
     sf = MagicMock()
@@ -206,7 +299,7 @@ def _paged_history_client(total_pages: int, events_per_page: int = 3):
     return sf
 
 
-def test_fetch_execution_history_paginates_past_the_old_twenty_page_cap():
+def test_fetch_execution_history_paginates_past_the_old_twenty_page_cap() -> None:
     # 25 pages exceeds the OLD max_pages=20 cap but is well inside the new
     # default (_MAX_HISTORY_PAGES=150, headroom over the measured 42-page
     # need). Every event across every page must come back, untruncated.
@@ -215,9 +308,10 @@ def test_fetch_execution_history_paginates_past_the_old_twenty_page_cap():
     assert len(events) == 25 * 3
     assert truncated is False
     assert sf.get_execution_history.call_count == 25
+    assert sf.get_execution_history.call_args_list[0].kwargs["includeExecutionData"] is True
 
 
-def test_fetch_execution_history_reports_truncation_when_pages_exhausted():
+def test_fetch_execution_history_reports_truncation_when_pages_exhausted() -> None:
     # More pages exist (nextToken never runs out) than the caller's max_pages
     # budget — the exact shape of the real 2026-09-12 run under the old cap.
     sf = MagicMock()
@@ -231,7 +325,9 @@ def test_fetch_execution_history_reports_truncation_when_pages_exhausted():
     assert sf.get_execution_history.call_count == 5
 
 
-def test_build_execution_digest_announces_truncation_and_forces_hollow(monkeypatch):
+def test_build_execution_digest_announces_truncation_and_forces_hollow(
+    monkeypatch: MonkeyPatch,
+) -> None:
     import execution_digest as ed
 
     monkeypatch.setattr(ed, "_MAX_HISTORY_PAGES", 2)
@@ -265,7 +361,7 @@ def test_build_execution_digest_announces_truncation_and_forces_hollow(monkeypat
     assert any("truncated" in line for line in lines)
 
 
-def test_history_fetch_failure_surfaces_marker():
+def test_history_fetch_failure_surfaces_marker() -> None:
     sf = MagicMock()
     sf.get_execution_history.side_effect = RuntimeError("throttled")
     lines, hollow, detailed_cause = build_execution_digest(
@@ -291,7 +387,7 @@ def test_history_fetch_failure_surfaces_marker():
 # in the events the whole time, as a TaskStateEntered with no matching exit.
 
 
-def _entered(base, name, offset=0):
+def _entered(base: datetime, name: str, offset: int = 0) -> dict:
     return {
         "type": "TaskStateEntered",
         "timestamp": _ts(base, offset),
@@ -299,7 +395,7 @@ def _entered(base, name, offset=0):
     }
 
 
-def test_last_workload_state_entered_finds_the_unexited_state():
+def test_last_workload_state_entered_finds_the_unexited_state() -> None:
     from execution_digest import last_workload_state_entered
 
     base = datetime(2026, 8, 10, 23, 58, 0, tzinfo=timezone.utc)
@@ -310,7 +406,7 @@ def test_last_workload_state_entered_finds_the_unexited_state():
     assert last_workload_state_entered(events) == "MorningEnrich"
 
 
-def test_last_workload_state_entered_ignores_untracked_states():
+def test_last_workload_state_entered_ignores_untracked_states() -> None:
     """Naming a gate or wait state would be true and useless.
 
     The exclusion is by EVENT TYPE, not by a name whitelist
@@ -342,7 +438,7 @@ def test_last_workload_state_entered_ignores_untracked_states():
     assert last_workload_state_entered(events) is None
 
 
-def test_last_workload_state_entered_names_a_weekday_task_state():
+def test_last_workload_state_entered_names_a_weekday_task_state() -> None:
     """The counterpart: a Task state absent from DIGEST_STATE_ORDER is named.
 
     Under the old whitelist this returned None for every weekday pipeline
@@ -354,13 +450,13 @@ def test_last_workload_state_entered_names_a_weekday_task_state():
     assert last_workload_state_entered([_entered(base, "SomeBrandNewState", 0)]) == "SomeBrandNewState"
 
 
-def test_digest_names_the_entered_state_instead_of_saying_nothing():
+def test_digest_names_the_entered_state_instead_of_saying_nothing() -> None:
     lines = format_digest_lines([], last_entered="MorningEnrich")
     assert lines == ["MorningEnrich — entered, never completed ⚠️"]
     assert "no workload states in history" not in " ".join(lines)
 
 
-def test_digest_keeps_the_empty_message_when_nothing_workload_ran():
+def test_digest_keeps_the_empty_message_when_nothing_workload_ran() -> None:
     """A run that truly reached no workload state — the narrowed
     director-verify shape — still says so."""
     assert format_digest_lines([], last_entered=None) == [
@@ -368,7 +464,7 @@ def test_digest_keeps_the_empty_message_when_nothing_workload_ran():
     ]
 
 
-def test_build_execution_digest_names_the_hung_state_end_to_end():
+def test_build_execution_digest_names_the_hung_state_end_to_end() -> None:
     """The 2026-08-10 shape, through the real entry point."""
     start_ms = 1_786_400_000_000
     base = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc)
@@ -425,7 +521,7 @@ def _preopen_history() -> list[dict]:
     return events
 
 
-def test_the_real_2026_08_11_preopen_history_renders_states():
+def test_the_real_2026_08_11_preopen_history_renders_states() -> None:
     """The regression, against the execution that produced it."""
     events = _preopen_history()
     durations = ed.parse_task_state_durations(events)
@@ -444,7 +540,7 @@ def test_the_real_2026_08_11_preopen_history_renders_states():
     )
 
 
-def test_the_preopen_poll_loop_reports_its_elapsed_not_zero():
+def test_the_preopen_poll_loop_reports_its_elapsed_not_zero() -> None:
     """PollMorningEnrichSpot spans ~15 min across ~60 entry/exit pairs.
 
     Max-per-pair reported 0s, which is worse than omitting it: it asserts the
@@ -455,7 +551,7 @@ def test_the_preopen_poll_loop_reports_its_elapsed_not_zero():
     assert durations["PollMorningArcticAppendSpot"] > 10 * 60
 
 
-def test_a_state_in_neither_collection_still_renders():
+def test_a_state_in_neither_collection_still_renders() -> None:
     """The filter is gone; the collections annotate and order only."""
     from datetime import datetime, timezone
 
@@ -472,7 +568,7 @@ def test_a_state_in_neither_collection_still_renders():
     assert not rows[0].anomaly
 
 
-def test_unknown_states_sort_after_known_ones_longest_first():
+def test_unknown_states_sort_after_known_ones_longest_first() -> None:
     from datetime import datetime, timezone
 
     start = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
@@ -487,7 +583,7 @@ def test_unknown_states_sort_after_known_ones_longest_first():
     assert [r.name for r in rows] == ["Scanner", "AardvarkState", "ZebraState"]
 
 
-def test_anomalous_states_lead_so_truncation_cannot_drop_them():
+def test_anomalous_states_lead_so_truncation_cannot_drop_them() -> None:
     from datetime import datetime, timezone
 
     start = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
@@ -503,7 +599,7 @@ def test_anomalous_states_lead_so_truncation_cannot_drop_them():
     assert rows[0].floor_breach
 
 
-def test_truncation_is_announced_never_silent():
+def test_truncation_is_announced_never_silent() -> None:
     from datetime import datetime, timezone
 
     start = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
@@ -518,7 +614,7 @@ def test_truncation_is_announced_never_silent():
     assert "+3 more states" in lines[-1]
 
 
-def test_no_truncation_line_when_everything_fits():
+def test_no_truncation_line_when_everything_fits() -> None:
     from datetime import datetime, timezone
 
     start = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
@@ -530,7 +626,7 @@ def test_no_truncation_line_when_everything_fits():
     assert "elided" not in lines[0]
 
 
-def test_every_weekday_state_name_in_the_order_list_exists_in_a_definition():
+def test_every_weekday_state_name_in_the_order_list_exists_in_a_definition() -> None:
     """A misspelled state name is a silent no-op — it orders nothing.
 
     The old collections were not wrong about spelling, they were wrong about
@@ -627,7 +723,7 @@ _REAL_HISTORY_EVENT_DETAIL_KEYS: frozenset[str] = frozenset(
 )
 
 
-def test_module_reads_no_event_detail_key_outside_the_real_sf_schema():
+def test_module_reads_no_event_detail_key_outside_the_real_sf_schema() -> None:
     """Deliverable 3: the next invented key is red at merge, not silent.
 
     Scans execution_digest.py's own source for every string literal shaped
@@ -667,7 +763,7 @@ def _load_real_history_fixture() -> list[dict]:
     return events
 
 
-def test_real_preopen_failure_history_names_the_state_that_broke():
+def test_real_preopen_failure_history_names_the_state_that_broke() -> None:
     """Closes-when, part 1: replaying the real history through
     format_digest_lines produces a line naming WaitForCodeFreshness — the
     state whose SSM poll actually failed (the git-push 403), not
@@ -696,7 +792,7 @@ def test_real_preopen_failure_history_names_the_state_that_broke():
     assert any("WaitForCodeFreshness" in line for line in lines)
 
 
-def test_last_workload_state_entered_excludes_handle_failure():
+def test_last_workload_state_entered_excludes_handle_failure() -> None:
     """Deliverable 4: HandleFailure is the state that SENDS the alert, not
     the one that failed. Without the exclusion, the fallback on a run dying
     before its first exit would name the alerter instead of the work."""
@@ -705,7 +801,7 @@ def test_last_workload_state_entered_excludes_handle_failure():
     assert ed.last_workload_state_entered(events) == "WaitForCodeFreshness"
 
 
-def test_terminal_error_handling_states_covers_all_three_definitions():
+def test_terminal_error_handling_states_covers_all_three_definitions() -> None:
     """HandleFailure is the shared Task name immediately preceding the
     terminal Fail state on the weekly, preopen AND postclose definitions —
     verified against the committed definitions, not assumed from one
@@ -718,7 +814,7 @@ def test_terminal_error_handling_states_covers_all_three_definitions():
     assert "HandleFailure" in ed.TERMINAL_ERROR_HANDLING_STATES
 
 
-def test_every_task_preceding_a_fail_state_is_classified():
+def test_every_task_preceding_a_fail_state_is_classified() -> None:
     """Exhaustive, or the next terminal state gets named as the failure.
 
     ``last_workload_state_entered`` returns the LAST Task entered, so any Task
@@ -767,7 +863,7 @@ def test_every_task_preceding_a_fail_state_is_classified():
     )
 
 
-def test_extract_detailed_failure_cause_surfaces_the_real_error():
+def test_extract_detailed_failure_cause_surfaces_the_real_error() -> None:
     """Deliverable 5 / sf-pipeline-policy §2.3 corollary: the terminal
     failure message must carry the actual error. describe_execution's own
     error/cause on this execution is the constant
@@ -783,7 +879,7 @@ def test_extract_detailed_failure_cause_surfaces_the_real_error():
     assert "Write access to repository not granted" in cause
 
 
-def test_extract_detailed_failure_cause_returns_none_without_a_poll_failure():
+def test_extract_detailed_failure_cause_returns_none_without_a_poll_failure() -> None:
     """A failure the ssm-liveness-poller contract does not cover returns
     None rather than a guess — the caller falls back to describe_execution's
     error/cause."""
