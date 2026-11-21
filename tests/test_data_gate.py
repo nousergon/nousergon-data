@@ -1692,15 +1692,14 @@ def test_the_board_document_publishes_one_unit_state_per_observable_unit(units, 
         assert u["as_of"] == "g"
 
 
-def test_an_externally_owned_unit_publishes_no_state_under_its_own_id(units):
-    """D39's row lives in nous-ergon-ops under another id (I10870), so nothing
-    declares `data-collector-d39-inst-ownership`: an observation keyed there
-    renders UNREGISTERED on the console (alpha-engine-config-I12911)."""
+def test_d39_publishes_its_run_record_under_its_declared_component_id(units):
+    """D39's declaration and run-record observation meet on the unit id."""
     by_id = {u.unit_id: u for u in units}
-    assert "D39" in read.EXTERNALLY_OWNED_OBSERVABILITY_ROWS
+    assert "D39" not in read.EXTERNALLY_OWNED_OBSERVABILITY_ROWS
     rows = [_run_record_row("D39", "MET", "HEALTHY"), _run_record_row("D01", "MET", "HEALTHY")]
     out = read._unit_states(rows, [by_id["D39"], by_id["D01"]], "t")
-    assert [u["component_id"] for u in out] == [by_id["D01"].component_id]
+    assert [u["component_id"] for u in out] == [by_id["D01"].component_id, by_id["D39"].component_id]
+    assert out[1]["console_state"] == "HEALTHY"
 
 
 def _cycle_row(clause, state, console_state):
