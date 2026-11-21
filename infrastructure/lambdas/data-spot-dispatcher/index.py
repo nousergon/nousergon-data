@@ -58,8 +58,7 @@ import re
 import shlex
 import urllib.request
 import uuid
-from types import ModuleType
-from typing import Any
+from typing import Any, cast
 
 import boto3
 from krepis import alerts
@@ -69,19 +68,6 @@ from nousergon_lib.ec2_spot import SpotCapacityExhausted, SpotQuotaExceededError
 
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
-
-CODE_SHA_URL = "https://api.github.com/repos/nousergon/nousergon-data/commits/main"
-CODE_SHA_RE = re.compile(r"[0-9a-f]{40}")
-
-
-def _resolve_code_sha() -> dict[str, object]:
-    """Resolve the public repository's branch head to one immutable commit."""
-    with urllib.request.urlopen(CODE_SHA_URL, timeout=10) as response:  # noqa: S310 -- fixed HTTPS URL
-        payload = json.load(response)
-    sha = str(payload.get("sha", ""))
-    if CODE_SHA_RE.fullmatch(sha) is None:
-        raise RuntimeError("GitHub returned no valid nousergon-data commit SHA")
-    return {"code_sha": sha}
 
 REGION = os.environ.get("AWS_REGION", "us-east-1")
 
@@ -256,6 +242,8 @@ COST_TAG_VALUE = "data-collection"
 
 DATA_REPO = os.environ.get("DATA_SPOT_REPO", "nousergon/nousergon-data")
 DATA_BRANCH = os.environ.get("DATA_SPOT_BRANCH", "main")
+GITHUB_API = "https://api.github.com/repos/{repo}/commits/{ref}"
+GITHUB_TIMEOUT_SECONDS = 15
 # Private config package weekly_collector.py resolves via resolve_experiment_config
 # (experiments/reference/data/config.yaml). The spot box mirrors groom-dispatcher:
 # read the fleet PAT from SSM (executor role grants alpha-engine/* GetParameter)
@@ -1146,7 +1134,7 @@ def _resolve_workload(event: dict) -> tuple[str, str]:
 _MARKET_TZ = "America/New_York"
 
 
-def _trading_day_check(now: datetime.datetime | None = None) -> dict[str, object]:
+def _trading_day_check(now: Any = None) -> dict[str, Any]:  # pyright: ignore[reportExplicitAny] — injectable clock and Lambda JSON
     """Answer "is today an NYSE trading day?" for the data-collection SFs.
 
     alpha-engine-config-I10739. A standalone EventBridge Scheduler cron cannot
@@ -1192,7 +1180,7 @@ def _trading_day_check(now: datetime.datetime | None = None) -> dict[str, object
 # measured and found wanting; the collection ASL routes both to a Fail state.
 
 
-def _predicate() -> ModuleType:
+def _predicate() -> Any:  # pyright: ignore[reportExplicitAny] — lazily imported module
     """The shared predicate module, imported lazily.
 
     Lazy so the module-import graph the hermetic test gate derives stays free
@@ -1207,14 +1195,11 @@ def _unit_descriptors() -> dict[str, dict]:
     return _predicate().unit_descriptors()
 
 
-def _parse_ts(value: object, *, where: str) -> Any:  # pyright: ignore[reportExplicitAny]
+def _parse_ts(value: Any, *, where: str) -> Any:  # pyright: ignore[reportExplicitAny] — compatibility wrapper around the shared predicate
     return _predicate().parse_ts(value, where=where)
 
 
-def _completion_check(
-    event: dict[str, object],
-    s3_client: Any = None,  # pyright: ignore[reportExplicitAny]
-) -> dict[str, object]:
+def _completion_check(event: dict[str, Any], s3_client: Any = None) -> dict[str, Any]:  # pyright: ignore[reportExplicitAny] — AWS event/client JSON boundary
     s3 = s3_client if s3_client is not None else boto3.client("s3", region_name=REGION)
     return _predicate().completion_check(event, s3_client=s3)
 
@@ -1524,8 +1509,8 @@ def _bootstrap_command(
     workload: str,
     collector_cmd: str,
     run_token: str,
+    code_sha: str = DATA_BRANCH,
     *,
-    code_sha: str,
     instance_id: str = "unknown-instance",
     trading_day: "str | None" = None,
 ) -> str:
@@ -1581,11 +1566,13 @@ def _bootstrap_command(
             outcome_location=_outcome_uri(workload, resolved_day, instance_id),
         ),
     )
-    if CODE_SHA_RE.fullmatch(code_sha) is None:
-        raise ValueError("code_sha must be a full lowercase Git commit SHA")
     tail = f"""set +e
 set -uo pipefail
 git config --global --add safe.directory '*' || true
+cd /home/ec2-user/alpha-engine-data
+git fetch --depth 1 origin {code_sha} || fail "data commit fetch failed ({code_sha})"
+git checkout --detach {code_sha} || fail "data commit checkout failed ({code_sha})"
+[ "$(git rev-parse HEAD)" = "{code_sha}" ] || fail "data commit checkout did not select {code_sha}"
 # alpha-engine-config is PRIVATE. The PAT is read HERE, on the box, from SSM
 # via the instance profile — never known to this Lambda, never in the SSM
 # document.
@@ -1597,11 +1584,6 @@ git clone --depth 1 --branch {CONFIG_BRANCH} \\
   "https://x-access-token:${{PAT}}@github.com/{CONFIG_REPO}.git" \\
   /home/ec2-user/alpha-engine-config || fail "config clone failed"
 cd /home/ec2-user/alpha-engine-data
-# The renderer clones the configured branch for compatibility with other
-# callers. Fetch and detach at the execution-pinned commit before any install
-# or collector command; a missing commit is a hard failure, never a fallback.
-git fetch --depth 1 origin {code_sha} || fail "pinned code fetch failed"
-git checkout --detach {code_sha} || fail "pinned code checkout failed"
 # python3.12 literally, matching the renderer, which has already installed and
 # ASSERTED it: requirements.txt is resolved against 3.12 and the AMI's python3
 # resolves different wheels.
@@ -1783,7 +1765,7 @@ def _send_bootstrap(
                     workload,
                     collector_cmd,
                     run_token,
-                    code_sha=code_sha,
+                    code_sha,
                     instance_id=instance_id,
                     trading_day=trading_day,
                 )
@@ -1816,9 +1798,23 @@ def _terminate_instance(instance_id: str) -> None:
         )
 
 
-def handler(
-    event: dict[str, object] | None, context: object
-) -> dict[str, object]:  # noqa: ARG001 — Lambda contract
+def _resolve_code_sha(
+    opener: Any = urllib.request.urlopen,  # pyright: ignore[reportExplicitAny] — urllib opener is injected by tests
+) -> str:
+    """Resolve and validate the configured data branch's immutable Git SHA."""
+    request = urllib.request.Request(
+        GITHUB_API.format(repo=DATA_REPO, ref=DATA_BRANCH),
+        headers={"Accept": "application/vnd.github+json", "User-Agent": "nousergon-data-spot-dispatcher"},
+    )
+    with opener(request, timeout=GITHUB_TIMEOUT_SECONDS) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    code_sha = payload.get("sha")
+    if not isinstance(code_sha, str) or re.fullmatch(r"[0-9a-f]{40}", code_sha) is None:
+        raise RuntimeError(f"GitHub returned an invalid commit SHA for {DATA_REPO}@{DATA_BRANCH}")
+    return code_sha
+
+
+def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # pyright: ignore[reportExplicitAny]  # noqa: ARG001 — Lambda JSON contract
     """Step Function handler — launch the data spot box for one workload.
 
     Two pure-computation actions launch nothing and return before any of the
@@ -1861,17 +1857,25 @@ def handler(
     up before the error is torn down first so nothing orphans.
     """
     event = event or {}
+    if event.get("action") == "prepare-execution":
+        return {**_trading_day_check(), "code_sha": _resolve_code_sha()}
+    if event.get("action") == "resolve-code-sha":
+        return {"code_sha": _resolve_code_sha()}
     if event.get("action") == "trading-day-check":
         return _trading_day_check()
     if event.get("action") == "completion-check":
         return _completion_check(event)
-    if event.get("action") == "resolve-code-sha":
-        return _resolve_code_sha()
     workload, collector_cmd = _resolve_workload(event)
+    # State-machine executions carry the SHA resolved once during preparation.
+    # Direct EventBridge/operator invocations have no execution state, so they
+    # resolve once here before launching their single workload.
+    supplied_pin = cast(object | None, event.get("code_sha"))
+    if isinstance(supplied_pin, dict):
+        supplied_pin = cast(dict[str, object], supplied_pin).get("code_sha")
+    code_sha = str(supplied_pin or _resolve_code_sha())
+    if re.fullmatch(r"[0-9a-f]{40}", code_sha) is None:
+        raise ValueError("code_sha must be a 40-character lowercase hexadecimal commit SHA")
     force_on_demand = bool(event.get("force_on_demand", False))
-    code_sha = str(event.get("code_sha") or _resolve_code_sha()["code_sha"])
-    if CODE_SHA_RE.fullmatch(code_sha) is None:
-        raise ValueError("code_sha must be a full lowercase Git commit SHA")
 
     # Per-run identity tags (config#5504): attribute every launched instance
     # to the SF execution so per-run EC2 cost is measurable. Gracefully

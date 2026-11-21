@@ -21,7 +21,6 @@ These tests use the REAL `nousergon_lib.phase_registry.PhaseRegistry` and the
 REAL run-manifest wrapper over one in-memory S3, so the marker, the manifest and
 the predicate all read what the others wrote.
 """
-# ruff: noqa: ANN001, ANN003, ANN201, ANN202, ANN204
 
 from __future__ import annotations
 
@@ -158,18 +157,6 @@ def test_a_retry_recomputes_a_degraded_phase_instead_of_skipping_it():
     assert s3.json(D02_MARKER)["status"] == "ok"
     assert s3.json(D02_MARKER)["artifact_keys"] == [D02_KEY]
     assert [m["status"] for m in s3.manifests("D02")] == ["failed", "ok"]
-
-
-def test_branch_head_change_cannot_change_the_execution_pinned_sha():
-    """A retry carries execution state, not a newly resolved branch head."""
-    first_head = "a" * 40
-    later_head = "b" * 40
-    execution = {"code_sha": first_head, "attempts": 0}
-
-    retry = {**execution, "attempts": execution["attempts"] + 1, "force_on_demand": True}
-
-    assert later_head != first_head
-    assert retry["code_sha"] == first_head
 
 
 @pytest.mark.parametrize("status", ["partial", "skipped"])
