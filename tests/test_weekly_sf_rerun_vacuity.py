@@ -25,6 +25,9 @@ public, and the topic plays no part in the analysis.)
 
 from __future__ import annotations
 
+# Existing modules predate the repository-wide ANN gate.
+# ruff: noqa: ANN001, ANN003, ANN201, ANN202, ANN204, ANN205
+
 import importlib.util
 import json
 import sys
@@ -137,6 +140,20 @@ def test_the_accepted_reason_rides_into_the_execution_input(mod):
     assert emitted["vacuous_rerun_accepted_reason"] == (
         "completion marker re-stamp, nothing else to run"
     )
+
+
+def test_every_emitted_recovery_skip_retains_a_nonempty_reason(mod):
+    plan = mod.RerunPlan(
+        run_date="2026-09-18",
+        run_date_provenance="test",
+        original_input={},
+        skip_flags={"skip_scanner": True, "skip_report_card": True},
+    )
+    emitted = plan.rerun_input()
+    skipped = {key for key, value in emitted.items() if key.startswith("skip_") and value is True}
+    reasons = emitted["skipped_producer_reasons"]
+    assert set(reasons) == skipped
+    assert all(flag in reason for flag, reason in reasons.items())
 
 
 # ---------------------------------------------------------------------------

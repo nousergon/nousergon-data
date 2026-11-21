@@ -56,6 +56,9 @@ page. The one thing this must never do is emit a scope that looks complete.
 """
 from __future__ import annotations
 
+# Existing modules predate the repository-wide ANN gate.
+# ruff: noqa: ANN001, ANN003, ANN201, ANN202, ANN204, ANN205
+
 import json
 import logging
 import os
@@ -65,6 +68,7 @@ import boto3
 from krepis.dates import resolve_trading_day
 
 from run_scope import build_run_scope, merge_run_scopes, stamp_provenance
+from run_scope import classify_execution_scope
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -403,6 +407,14 @@ def handler(event, _context):
             execution_arn=execution_arn,
             state_machine_arn=state_machine_arn,
             input_flags=flags,
+            # The ordinary invocation is intentionally taken before ReportCard.
+            # The terminal invocation has observed every producer and must not
+            # classify those downstream gates as merely "after scope".
+            scope_state=(
+                "__terminal_scope__"
+                if bool(event.get("terminal_scope"))  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
+                else "RunScope"
+            ),
         )
         # Both dates ride along: `run_date` stays the resolved trading day (the
         # consumer's existing contract, unchanged), and the raw calendar date
@@ -428,6 +440,8 @@ def handler(event, _context):
             "No stage is graded. This is not a narrow run; it is an unmeasured "
             f"one. Cause: {type(exc).__name__}."
         )
+
+    scope["execution_scope"] = classify_execution_scope(scope)  # pyright: ignore[reportUnknownArgumentType]
 
     scope["written_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     stamp_provenance(scope, execution_arn, scope["written_at"])
@@ -467,7 +481,11 @@ def handler(event, _context):
         )
         return scope
 
+    execution_scope = scope["execution_scope"]
     written = _persist(scope, scope_key(run_date, rehearsal))
+    # `_persist` returns the cycle merge.  Never let an earlier execution's
+    # stronger rows replace the terminal decision about this execution.
+    written["execution_scope"] = execution_scope
     written["stage_coverage"] = _assert_stage_coverage(
         "RunScope", _stage_coverage_started, run_date, rehearsal
     )

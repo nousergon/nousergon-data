@@ -106,6 +106,9 @@ Read-only by default; nothing is mutated without ``--start``.
 
 from __future__ import annotations
 
+# Existing modules predate the repository-wide ANN gate.
+# ruff: noqa: ANN001, ANN003, ANN201, ANN202, ANN204, ANN205
+
 import argparse
 import json
 import re
@@ -1126,7 +1129,7 @@ class CadenceSkipsUnreadable(RuntimeError):
     """
 
 
-def cadence_declared_skips(path: Path = None) -> dict:
+def cadence_declared_skips(path: Path | None = None) -> dict[str, bool]:
     """The ``skip_*`` flags the SCHEDULED weekly run declares for itself.
 
     Parsed out of ``SaturdayTrigger.Targets[saturday-pipeline].Input`` in
@@ -1177,7 +1180,7 @@ class RerunPlan:
     completed: list = field(default_factory=list)   # stage names
     degraded: list = field(default_factory=list)    # stage names (re-run!)
     failed: list = field(default_factory=list)      # stage names
-    skip_flags: dict = field(default_factory=dict)  # flag -> True
+    skip_flags: dict[str, bool] = field(default_factory=dict)  # flag -> True
     warnings: list = field(default_factory=list)
     notes: list = field(default_factory=list)
 
@@ -1271,6 +1274,21 @@ class RerunPlan:
         out["pipeline_role"] = EMITTED_ROLE
         out.update(declared)
         out.update(self.skip_flags)
+        # alpha-engine-config-I13864: every producer deliberately omitted from
+        # a recovery carries its own durable explanation. This is generated
+        # from the emitted set (not inherited input), so the record cannot name
+        # a skip the recovery did not request or omit one it did.
+        emitted_skip_flags = sorted(
+            {str(flag) for flag in declared} | {str(flag) for flag in self.skip_flags}
+        )
+        out["skipped_producer_reasons"] = {
+            flag: (
+                f"{flag} is declared by the weekly cadence"
+                if flag in declared else
+                f"{flag} was derived from producer completion in the recovery chain"
+            )
+            for flag in emitted_skip_flags
+        }
         if self.accept_vacuous_reason:
             out["vacuous_rerun_accepted_reason"] = self.accept_vacuous_reason
         if self.collection_not_before:
