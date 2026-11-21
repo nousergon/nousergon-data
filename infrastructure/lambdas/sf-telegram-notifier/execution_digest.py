@@ -496,6 +496,7 @@ def fetch_execution_history(
     *,
     max_pages: Optional[int] = None,
     page_size: Optional[int] = None,
+    include_execution_data: bool = False,
 ) -> Tuple[List[dict], bool]:
     """Returns ``(events, truncated)``. ``truncated`` is True only when
     ``max_pages`` was exhausted with a ``nextToken`` still outstanding —
@@ -511,6 +512,11 @@ def fetch_execution_history(
     leaves the service default (100), which is what the live notifier has
     always used; the batch floor calibration passes 1000 so a ~900-event
     execution is one call instead of nine (alpha-engine-config-I11792).
+    ``maxResults`` is only an upper bound: response-size constraints can
+    produce smaller pages, especially when ``include_execution_data`` is
+    true, so pagination always follows ``nextToken``. The live notifier
+    keeps execution data disabled; offline calibration enables it to read
+    Task outputs used as ground-truth poll statuses.
     """
     if max_pages is None:
         max_pages = _MAX_HISTORY_PAGES
@@ -520,7 +526,7 @@ def fetch_execution_history(
     for _ in range(max_pages):
         kwargs: dict[str, Any] = {
             "executionArn": execution_arn,
-            "includeExecutionData": False,
+            "includeExecutionData": include_execution_data,
         }
         if page_size:
             kwargs["maxResults"] = page_size

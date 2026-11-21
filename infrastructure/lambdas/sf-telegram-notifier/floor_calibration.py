@@ -208,7 +208,9 @@ HISTORY_PAGE_SIZE = 1000
 # declaring a new poll key changes what an entry must contain, so it
 # invalidates the whole cache rather than serving entries computed without it.
 # A truncated history is never cached — it is re-read next run.
-_CACHE_SCHEMA = 1
+# Schema 2 entries are derived from histories fetched with execution data.
+# Schema 1 could only store missing poll statuses, so it must be re-read.
+_CACHE_SCHEMA = 2
 
 
 def _cache_version() -> str:
@@ -594,9 +596,8 @@ def render_report(recommendations: Sequence[FloorRecommendation]) -> str:
 def _default_fetch_history(sf_client: Any, execution_arn: str) -> List[dict]:
     # alpha-engine-config-I10545: fetch_execution_history now returns
     # (events, truncated) so callers can surface truncation; this adapter
-    # keeps collect_state_duration_samples' injected
-    # ``fetch_history(sf_client, execution_arn) -> List[dict]`` contract
-    # unchanged. Calibration is a batch/offline tool over many executions —
+    # keeps truncation explicit for collect_state_duration_samples.
+    # Calibration is a batch/offline tool over many executions —
     # a truncated sample here silently understates one execution's duration
     # rather than corrupting a live alert, and floor_calibration.py's own
     # min-based recommendation logic is naturally robust to an UNDERSTATED
@@ -607,8 +608,11 @@ def _default_fetch_history(sf_client: Any, execution_arn: str) -> List[dict]:
 
     # Returns (events, truncated) so collect_state_duration_samples can keep a
     # truncated history out of the cache (alpha-engine-config-I11792).
-    return fetch_execution_history(
-        sf_client, execution_arn, page_size=HISTORY_PAGE_SIZE
+    return fetch_execution_history(  # pyright: ignore[reportReturnType, reportUnknownVariableType]
+        sf_client,
+        execution_arn,
+        page_size=HISTORY_PAGE_SIZE,
+        include_execution_data=True,
     )
 
 
