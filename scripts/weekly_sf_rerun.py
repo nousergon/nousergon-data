@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: ANN001, ANN201, ANN202
 """Mechanical weekly-SF recovery helper (config#2277).
 
 Derives, from a FAILED ``ne-weekly-freshness-pipeline`` execution, the exact
@@ -791,6 +792,7 @@ STAGES: tuple[Stage, ...] = (
         degraded_witness=frozenset({
             "PublishDirectorDegraded", "DirectorSubStatusDegraded",
             "SetDirectorSubStatusDegradedSummary",
+            "PublishDirectorSubStatusDegraded",
             "RecordDirectorDegraded", "RecordDirectorDegradedRetroRefused",
         }),
     ),

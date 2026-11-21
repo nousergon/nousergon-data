@@ -1,3 +1,4 @@
+# ruff: noqa: ANN001, ANN201, ANN202
 """alpha-engine-config#6684 — structural contract over every
 ``infrastructure/step_function*.json`` orchestration definition.
 
@@ -142,6 +143,7 @@ _TIMEOUT_EXEMPT: dict[str, dict[str, str]] = {
         "NotifyCompleteParityDegraded": "sns:publish completion notifier — SDK call, not a wait (alpha-engine-config-I6025)",
         "PublishScannerLeaderboardDegraded": "sns:publish degraded-gate notifier — SDK call, not a wait (alpha-engine-config-I7813)",
         "PublishAggregateCostsDegraded": "sns:publish degraded-gate notifier — SDK call, not a wait (alpha-engine-config-I8336)",
+        "PublishDirectorSubStatusDegraded": "sns:publish degraded-gate notifier — SDK call, not a wait",
         "NotifyCompleteScannerLeaderboardDegraded": "sns:publish completion notifier — SDK call, not a wait (alpha-engine-config-I7813)",
         "NotifyShellRunComplete": "sns:publish completion notifier — SDK call, not a wait",
         "NotifyComplete": "sns:publish completion notifier — SDK call, not a wait",
