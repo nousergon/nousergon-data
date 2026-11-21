@@ -2071,120 +2071,96 @@ def test_dynamic_severity_no_listed_rows_skips_pointer_read(fake_s3):
     assert calls == []
 
 
-def test_champion_policy_includes_rows_already_declared_critical(fake_s3):
-    """The freshness floor is champion-dependent even when severity needs no
-    coercion."""
-    fake_s3._registry_body = _CHAMPION_ARM_REGISTRY
-    import dataclasses
+def test_champion_floor_ids_include_matching_already_critical_row(
+    fake_s3: object,
+) -> None:
+    """Floor policy depends on the declaration, not a severity transition."""
     import index
-    specs, _r, arms, _esc, _rem, _pt, _do, _rev = index.load_registry_with_recovery(
-        fake_s3, "b", "k"
-    )
-    specs[0] = dataclasses.replace(specs[0], severity="critical")
     _keyed_get_object(fake_s3, {
         index.CHAMPION_POINTER_KEY:
             b'{"schema_version": 1, "champion": "scanner_predictor_direct"}',
     })
+    arms = {
+        "already_critical": ["scanner_predictor_direct"],
+        "other_arm": ["think_tank"],
+    }
+    assert index._champion_freshness_floor_ids(fake_s3, arms) == {
+        "already_critical"
+    }
 
-    effective_specs, champion_ids = index.apply_dynamic_severity(
-        fake_s3, specs, arms
-    )
 
-    assert effective_specs[0].severity == "critical"
-    assert champion_ids == {"champion_feed"}
+def test_champion_floor_ids_fail_loud_for_unreadable_pointer(
+    fake_s3: object,
+) -> None:
+    import index
+    _keyed_get_object(fake_s3, {index.CHAMPION_POINTER_KEY: None})
+    arms = {
+        "champion_feed": ["scanner_predictor_direct"],
+        "other_arm": ["think_tank"],
+    }
+    assert index._champion_freshness_floor_ids(fake_s3, arms) == set(arms)
 
 
 @pytest.mark.parametrize(
-    ("now", "last_modified", "expected_state", "expected_floor"),
+    ("now", "last_modified", "expected_state"),
     [
-        # A Saturday write remains usable Monday before the close, but is
-        # stale by Tuesday's daily probe: one closed trading session later.
-        (
-            datetime(2026, 8, 10, 12, tzinfo=timezone.utc),
-            datetime(2026, 8, 8, 11, 31, 1, tzinfo=timezone.utc),
-            "fresh",
-            None,
-        ),
-        (
-            datetime(2026, 8, 11, 12, tzinfo=timezone.utc),
-            datetime(2026, 8, 8, 11, 31, 1, tzinfo=timezone.utc),
-            "stale",
-            "2026-08-10T00:00:00+00:00",
-        ),
-        # MLK Day (2026-01-19) is not a trading session. Tuesday pre-open
-        # still uses Friday; Wednesday advances the floor to Tuesday.
-        (
-            datetime(2026, 1, 20, 12, tzinfo=timezone.utc),
-            datetime(2026, 1, 16, 18, tzinfo=timezone.utc),
-            "fresh",
-            None,
-        ),
-        (
-            datetime(2026, 1, 21, 12, tzinfo=timezone.utc),
-            datetime(2026, 1, 16, 18, tzinfo=timezone.utc),
-            "stale",
-            "2026-01-20T00:00:00+00:00",
-        ),
+        # A Friday or Saturday write remains valid through Monday's pre-open
+        # check, then fails Wednesday once Tuesday is the last closed session.
+        ("2026-08-17T12:00:00+00:00", "2026-08-14T11:31:00+00:00", "fresh"),
+        ("2026-08-19T12:00:00+00:00", "2026-08-14T11:31:00+00:00", "stale"),
+        ("2026-08-19T12:00:00+00:00", "2026-08-15T11:31:00+00:00", "stale"),
+        # Labor Day is not treated as a closed session; the first post-holiday
+        # close advances the floor on Wednesday's pre-open check.
+        ("2026-09-08T12:00:00+00:00", "2026-09-05T11:31:00+00:00", "fresh"),
+        ("2026-09-09T12:00:00+00:00", "2026-09-05T11:31:00+00:00", "stale"),
     ],
 )
-def test_champion_freshness_floor_is_at_most_one_closed_trading_day(
-    now, last_modified, expected_state, expected_floor,
-):
+def test_champion_floor_is_one_closed_trading_day(
+    now: str, last_modified: str, expected_state: str
+) -> None:
     import index
-    spec = index.ArtifactSpec(
-        artifact_id="research_free_backfill",
-        s3_bucket="alpha-engine-research",
-        s3_key_template=(
-            "predictor/research_free_backfill/"
-            "predictor_outcomes_research_free.parquet"
-        ),
-        cadence="eod_sf",
-        sla_minutes_after_cron=360,
-        severity="critical",
-        owner_repo="nousergon-data",
-        created_at=date(2026, 1, 1),
-    )
-    substrate_result = index.CheckResult(
+    from nousergon_lib.artifact_freshness import CheckResult
+    result = CheckResult(
         state="fresh",
-        last_modified=last_modified,
-        reason="fresh under shared eod_sf floor",
+        last_modified=datetime.fromisoformat(last_modified),
+        reason="shared cadence floor says fresh",
     )
-
-    result = index._apply_champion_freshness_floor(spec, substrate_result, now)
-
-    assert result.state == expected_state
-    if expected_floor is not None:
-        assert expected_floor in result.reason
-        # A dynamically-critical champion dependency reaches the critical
-        # page decision as soon as the monitor-side floor marks it stale.
-        assert index._maybe_alert(spec, result, now) is True
+    graded = index._apply_champion_freshness_floor(
+        result, datetime.fromisoformat(now)
+    )
+    assert graded.state == expected_state
+    if expected_state == "stale":
+        assert graded.sla_violated_by_minutes > 0
+        assert "monitor-side one-trading-day freshness floor" in graded.reason
 
 
-def test_champion_floor_does_not_change_nonmatching_row_verdict():
-    """Only IDs returned by champion resolution are re-graded in the pass."""
+def test_champion_floor_stale_result_enters_critical_page_path(monkeypatch) -> None:
     import index
-    spec = index.ArtifactSpec(
+    from nousergon_lib.artifact_freshness import ArtifactSpec, CheckResult
+    monkeypatch.setattr(index, "ALERTS_ENABLED", True)
+    spec = ArtifactSpec(
         artifact_id="research_free_backfill",
         s3_bucket="alpha-engine-research",
         s3_key_template="predictor/research_free_backfill/feed.parquet",
         cadence="eod_sf",
         sla_minutes_after_cron=360,
-        severity="warning",
+        severity="critical",
         owner_repo="nousergon-data",
-        created_at=date(2026, 1, 1),
+        created_at="2026-01-01",
     )
-    result = index.CheckResult(
-        state="fresh",
-        last_modified=datetime(2026, 8, 8, 11, 31, tzinfo=timezone.utc),
+    result = index._apply_champion_freshness_floor(
+        CheckResult(
+            state="fresh",
+            last_modified=datetime.fromisoformat("2026-08-15T11:31:00+00:00"),
+            reason="shared cadence floor says fresh",
+        ),
+        datetime.fromisoformat("2026-08-19T12:00:00+00:00"),
     )
-
-    pairs, *_rest = index._run_probe_pass(
-        mock.Mock(), [spec], {}, datetime(2026, 8, 11, 12, tzinfo=timezone.utc),
-        precomputed_results={spec.artifact_id: result},
-        champion_dependent_ids=set(),
-    )
-
-    assert pairs[0][1] is result
+    decision = index._alert_decision(spec, result, datetime.fromisoformat(
+        "2026-08-19T12:00:00+00:00"
+    ))
+    assert decision is not None
+    assert decision["severity"] == "critical"
 
 
 def _warning_spec_and_missing_result(index):
