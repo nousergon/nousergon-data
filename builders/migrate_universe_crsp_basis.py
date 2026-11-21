@@ -1,3 +1,4 @@
+# ruff: noqa: ANN001, ANN201, ANN202, ANN204
 """builders/migrate_universe_crsp_basis.py — OFFLINE CRSP-basis universe build.
 
 Corporate-actions program PR7, step 7a (epic config#1433 / config#1434).
@@ -131,6 +132,7 @@ import pandas as pd
 
 import corporate_actions as ca
 from features.compute import DEFAULT_BUCKET
+from nousergon_lib.yfinance_quiet import quiet_yfinance  # pyright: ignore[reportAttributeAccessIssue, reportUnknownVariableType]
 from store.arctic_store import (
     TOTAL_RETURN_COL,
     get_scratch_universe_lib,
@@ -377,16 +379,17 @@ def _yfinance_frame(ticker: str, period: str) -> pd.DataFrame:
     not raw and why ``Stock Splits`` is pulled alongside it."""
     import yfinance as yf
 
-    raw = yf.download(
-        tickers=ticker,
-        period=period,
-        interval="1d",
-        auto_adjust=False,
-        actions=True,  # the split events yfinance folded into Close
-        progress=False,
-        group_by="ticker",
-        threads=False,
-    )
+    with quiet_yfinance():
+        raw = yf.download(  # pyright: ignore[reportUnknownMemberType]
+            tickers=ticker,
+            period=period,
+            interval="1d",
+            auto_adjust=False,
+            actions=True,  # the split events yfinance folded into Close
+            progress=False,
+            group_by="ticker",
+            threads=False,
+        )
     if raw is None or len(raw) == 0:
         raise RawPriceFetchError(f"yfinance returned no rows for {ticker} (auto_adjust=False)")
 
