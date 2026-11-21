@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import sqlite3
 import tempfile
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
 import pytest
@@ -168,7 +168,9 @@ class TestEmitHorizonGradingLagMetric:
         _seed_predictor_outcomes(db, "2026-05-04", horizon_days=21)
         cw = MagicMock()
         cw.get_metric_statistics.return_value = {
-            "Datapoints": [{"Timestamp": datetime.now(timezone.utc), "Maximum": 4}],
+            "Datapoints": [
+                {"Timestamp": datetime.now(timezone.utc) - timedelta(days=7), "Maximum": 4},
+            ],
         }
         monkeypatch.setattr("collectors.signal_returns.boto3.client", lambda svc: cw)
         monkeypatch.setattr(
@@ -179,6 +181,52 @@ class TestEmitHorizonGradingLagMetric:
         assert out["universe_returns_lag_consecutive_weeks"] == 5
         assert out["predictor_outcomes_lag_consecutive_weeks"] == 0
         assert cw.get_metric_statistics.call_count == 1
+
+    def test_same_day_rerun_does_not_double_increment(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        db = _make_db()
+        _seed_universe_returns(db, "2026-05-01", has_21d=True)
+        _seed_universe_returns(db, "2026-05-04", has_21d=False)
+        _seed_predictor_outcomes(db, "2026-05-01", horizon_days=21)
+        _seed_predictor_outcomes(db, "2026-05-04", horizon_days=None)
+        store: list[dict[str, datetime | float]] = []  # fake CloudWatch: datapoints from prior emits
+        clock = {"now": datetime(2026, 7, 19, 6, tzinfo=timezone.utc)}
+
+        class _DT(datetime):
+            @classmethod
+            def now(cls, tz: timezone | None = None) -> datetime:
+                return clock["now"]
+
+        cw = MagicMock()
+
+        def get_stats(**kw: datetime) -> dict[str, list[dict[str, datetime]]]:
+            return {"Datapoints": [
+                p for p in store if kw["StartTime"] <= p["Timestamp"] < kw["EndTime"]
+            ]}
+
+        def put(**kw: list[dict[str, str | float]]) -> None:
+            for m in kw["MetricData"]:
+                if m["MetricName"].endswith("consecutive_weeks"):
+                    store.append({"Timestamp": clock["now"], "Maximum": m["Value"]})
+
+        cw.get_metric_statistics.side_effect = get_stats
+        cw.put_metric_data.side_effect = put
+        monkeypatch.setattr("collectors.signal_returns.datetime", _DT)
+        monkeypatch.setattr("collectors.signal_returns.boto3.client", lambda svc: cw)
+        monkeypatch.setattr(
+            "collectors.signal_returns._market_today", lambda: date(2026, 7, 19),
+        )
+
+        first = _emit_horizon_grading_lag_metric(db, forward_days=21)
+        clock["now"] = datetime(2026, 7, 19, 18, tzinfo=timezone.utc)
+        rerun = _emit_horizon_grading_lag_metric(db, forward_days=21)
+        clock["now"] = datetime(2026, 7, 20, 6, tzinfo=timezone.utc)
+        nxt = _emit_horizon_grading_lag_metric(db, forward_days=21)
+
+        for key in ("universe_returns_lag_consecutive_weeks",
+                    "predictor_outcomes_lag_consecutive_weeks"):
+            assert first[key] == 1
+            assert rerun[key] == 1
+            assert nxt[key] == 2
 
     def test_failed_prior_value_read_starts_at_one(self, monkeypatch) -> None:
         db = _make_db()

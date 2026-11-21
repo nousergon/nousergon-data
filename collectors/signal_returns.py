@@ -1644,7 +1644,12 @@ def _emit_horizon_grading_lag_metric(db_path: str, forward_days: int) -> dict:
             if lag == 0:
                 return 0
             try:
-                end = datetime.now(timezone.utc)
+                # Count only datapoints from COMPLETED UTC days: a same-day
+                # rerun must not see (and increment on) its own earlier
+                # datapoint, so the count advances once per run date.
+                end = datetime.now(timezone.utc).replace(
+                    hour=0, minute=0, second=0, microsecond=0,
+                )
                 get_statistics = cast(Callable[..., object], cw.get_metric_statistics)
                 response = get_statistics(
                     Namespace="AlphaEngine/Data",
@@ -1666,6 +1671,15 @@ def _emit_horizon_grading_lag_metric(db_path: str, forward_days: int) -> dict:
                     for point in cast(list[object], prior)
                     if isinstance(point, dict)
                 ]
+                points = [
+                    point for point in points
+                    if not (
+                        isinstance(point.get("Timestamp"), datetime)
+                        and cast(datetime, point["Timestamp"]) >= end
+                    )
+                ]
+                if not points:
+                    return 1
                 latest = max(points, key=lambda point: str(point.get("Timestamp")))
                 previous = latest.get("Maximum", 0)
                 return int(previous) + 1 if isinstance(previous, (int, float)) else 1
