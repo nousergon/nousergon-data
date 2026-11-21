@@ -17,11 +17,15 @@ The third is the one a naive wrapper breaks: swallowing the exception to
 guarantee the record is exactly how a dying producer starts reporting success.
 """
 
+# ruff: noqa: ANN001, ANN002, ANN003, ANN201, ANN202, ANN204, ANN205, ANN206 -- legacy fixtures predate annotation linting.
+
 from __future__ import annotations
 
 import importlib.util
 import io
 import json
+import os
+import subprocess
 import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -134,6 +138,21 @@ def test_d36_writes_one_manifest_with_every_published_key(sink, daily_news, monk
     assert manifest["rows_out"] == 474
     assert manifest["rows_in"] == 412
     assert any("holdings_universe.json" in i["key"] for i in manifest["inputs"])
+
+
+def test_rehearsal_launcher_stamps_recorded_unit_manifest(sink, daily_news, monkeypatch):
+    """The launcher's generated worker environment reaches the manifest writer."""
+    common = REPO_ROOT / "infrastructure" / "_spot_common.sh"
+    command = f'source "{common}"; eval "$_RUN_TOKEN_EXPORT"; printf %s "$NE_DATA_TRIGGER"'
+    env = {**os.environ, "RUN_TOKEN": "rehearsal-2026-11-19-1", "NE_DATA_TRIGGER": "scheduled"}
+    trigger = subprocess.run(
+        ["bash", "-c", command], env=env, check=True, capture_output=True, text=True
+    ).stdout
+    monkeypatch.setenv(run_units.TRIGGER_ENV, trigger)
+    monkeypatch.setattr(daily_news, "collect", lambda *a, **kw: _daily_news_result())  # noqa: ARG005
+
+    assert daily_news.main() == 0
+    assert sink.only["trigger"] == "rehearsal"
 
 
 def test_d36_failure_writes_a_failed_manifest_and_keeps_the_exit_code(sink, daily_news, monkeypatch):

@@ -6,6 +6,8 @@ old gate-day-only reader got wrong, or one of the three survives_phase4 states.
 No AWS: live Scheduler / Step Functions state is a fake attached to a LocalStore.
 """
 
+# ruff: noqa: ANN001, ANN002, ANN003, ANN201, ANN202, ANN204, ANN205, ANN206 -- legacy fixtures predate annotation linting.
+
 from __future__ import annotations
 
 import dataclasses
@@ -312,6 +314,27 @@ def test_survives_phase4_is_met_on_a_standalone_manifest_inside_a_succeeded_exec
     reading = standalone.read_survives_phase4(store, units["D19"], trading_day=TUESDAY, now=WEDNESDAY_NOON)
     assert reading.met is True, reading.detail
     assert EOD_EXECUTION["executionArn"] in reading.evidence
+
+
+def test_rehearsal_manifest_does_not_count_as_a_scheduled_fire(tmp_path, units):
+    _write(
+        tmp_path, "D19", "2026-09-15", "REHEARSAL",
+        trigger="rehearsal",
+        started=_iso(_EOD_START + dt.timedelta(minutes=5)),
+        finished=_iso(_EOD_START + dt.timedelta(minutes=20)),
+    )
+    store = _live_store(tmp_path, _Scheduler(), _Sfn({"ne-data-collection-eod": [EOD_EXECUTION]}))
+    reading = standalone.read_survives_phase4(store, units["D19"], trading_day=TUESDAY, now=WEDNESDAY_NOON)
+    assert reading.met is False
+    assert "no scheduled-trigger manifest" in reading.detail
+
+    _write(
+        tmp_path, "D19", "2026-09-15", "SCHEDULED",
+        started=_iso(_EOD_START + dt.timedelta(minutes=6)),
+        finished=_iso(_EOD_START + dt.timedelta(minutes=21)),
+    )
+    reading = standalone.read_survives_phase4(store, units["D19"], trading_day=TUESDAY, now=WEDNESDAY_NOON)
+    assert reading.met is True, reading.detail
 
 
 def test_a_fire_after_1759_et_is_still_graded_for_its_own_trading_day(tmp_path, units):
