@@ -456,7 +456,7 @@ def test_backtester_spot_exit_sources_are_declared(source: str) -> None:
 
 
 @pytest.mark.parametrize(
-    ("class_id", "source", "severities"),
+    ("class_name", "source", "severities"),
     (
         (
             "backtester_parity_tolerance_band",
@@ -471,10 +471,11 @@ def test_backtester_spot_exit_sources_are_declared(source: str) -> None:
     ),
 )
 def test_backtester_parity_alert_classes_are_declared(
-    class_id: str, source: str, severities: list[str]
+    class_name: str, source: str, severities: list[str]
 ) -> None:
-    rows = [r for r in REGISTRY["alert_classes"] if r["class"] == class_id]
-    assert len(rows) == 1, f"{class_id!r}: expected exactly one alert-class row, got {len(rows)}"
+    """Parity findings retain the distinct classes emitted by each check."""
+    rows = [r for r in REGISTRY["alert_classes"] if r["class"] == class_name]
+    assert len(rows) == 1, f"{class_name!r}: expected exactly one alert-class row"
     row = rows[0]
     assert row["source"] == source
     assert row["severities"] == severities
@@ -663,7 +664,7 @@ _SWEEP_SRC = (REPO_ROOT / "infrastructure" / "lambdas" / "freshness-monitor"
               / "unregistered_envelopes.py")
 
 
-def _sweep_constant(name: str) -> Any:
+def _sweep_constant(name: str) -> str:
     """Read a constant from the sweep module's SOURCE — importing it would pull
     in nousergon_lib, and the registry tests must not depend on that."""
     m = re.search(rf'^{name}\s*=\s*"([^"]+)"', _SWEEP_SRC.read_text(encoding="utf-8"),

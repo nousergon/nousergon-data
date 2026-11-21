@@ -1038,6 +1038,7 @@ alert_classes:
     severities: [warning]
     intake: bus
     response: drain-queue
+    # DECLARED: tolerance-band drift is a measurement-quality finding.
     tier: tracked-only
     chat: none
   - class: backtester_parity_step_change
@@ -1045,8 +1046,13 @@ alert_classes:
     severities: [warning, error]
     intake: bus
     response: drain-queue
+    # derived: error-capable, automated response declared
     tier: tracked-only
     chat: none
+    operator_reason: >-
+      A step change needs diagnosis of the compared backtester runs.
+      drain-queue T0-T3 triage is the closed loop; no separate human action
+      is waiting on this notice.
   - class: backtester_input_quality
     source: "alpha-engine-backtester/analysis/input_quality.py"
     severities: [warning]
