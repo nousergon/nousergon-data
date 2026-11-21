@@ -3246,41 +3246,19 @@ def _self_heal_chronic_polygon_gaps(
       1. Read ArcticDB universe ``last_date``.
       2. If ``last_date >= target_date``, skip (already fresh — common case
          after the first heal lands).
-      3. Else yfinance-fetch ``[last_date+1, target_date]`` OHLCV.
-      4. Append the new rows to ``predictor/price_cache/{ticker}.parquet``
-         (dedupe by date keep="last" so repeated heals are idempotent). Wave 3
-         PR1 mirrors the put to ``reference/price_cache/{ticker}.parquet`` via
-         the ``_price_cache_write_prefixes`` helper.
-      5. Invoke ``builders.backfill(ticker_filter=ticker)`` — reuses the
-         per-ticker compute_features + ArcticDB write path so the new
-         rows get the same feature schema as every other ticker.
-
-    Closes the multi-day rot caused by polygon never serving the chronic
-    gaps + the EOD yfinance pass occasionally dropping a day. Origin:
-    2026-05-09 weekly SF DataPhase1 postflight failure — PSTG ended at
-    5/5 (ArcticDB) vs SPY at 5/8 (3d stale, > 2d threshold), every other
-    chronic ticker at 5/6 (2d, just under threshold). Without this step
-    the only recovery was hand-running a yfinance backfill script.
+      3. Else yfinance-fetch from ``last_date`` through ``target_date`` so the
+         response overlaps the cache. If adjusted prices differ on that date,
+         re-fetch and replace the full history; otherwise append the new rows.
+      4. Invoke ``builders.backfill(ticker_filter=ticker)`` so new rows use the
+         same feature-computation and ArcticDB write path as other tickers.
 
     Idempotent: tickers already at target_date are skipped, so re-running
     after a partial completion costs only the freshness reads. Best-effort
-    per-ticker — one ticker's ordinary yfinance/network failure does not
-    block the others. NOT best-effort for a run-level contract violation:
-    a caret-prefixed ticker reaching the write-time guard
-    (``CaretTickerError``) or a post-close/future bar
-    (``dates.FutureBarError``) propagates out of this loop rather than
-    being folded into ``summary["errors"]`` — both are population/clock
-    bugs upstream of any one ticker's fetch, and the caller
-    (``_run_chronic_gap_self_heal_step`` / weekly_collector's
-    `chronic_gap_self_heal` state) already has a broad handler that
-    records the step as ``status: error`` without failing the pipeline
-    (alpha-engine-config-I10904).
+    per-ticker — ordinary fetch failures do not block other tickers. Contract
+    violations (``CaretTickerError`` and ``dates.FutureBarError``) propagate;
+    the caller records those as a step error without failing the pipeline.
 
-    Returns a summary dict with per-ticker outcomes; the caller should
-    log it (not raise) so a yfinance hiccup on a chronic gap doesn't
-    halt the whole pipeline. Postflight will catch any remaining staleness
-    via its uniform check.
-    """
+    Returns a summary containing healed, skipped, and failed tickers."""
     import io as _io
 
     import yfinance as _yf
@@ -3321,11 +3299,7 @@ def _self_heal_chronic_polygon_gaps(
                 )
                 continue
 
-            start_ts = (
-                (existing_last + _pd.Timedelta(days=1))
-                if existing_last is not None
-                else (target_ts - _pd.Timedelta(days=30))
-            )
+            start_ts = existing_last or (target_ts - _pd.Timedelta(days=30))
             end_excl = target_ts + _pd.Timedelta(days=1)
 
             with quiet_yfinance():
@@ -3361,7 +3335,7 @@ def _self_heal_chronic_polygon_gaps(
             # only). Post-cutover both chains resolve to the reference home;
             # the legacy ``predictor/price_cache/`` tree is removed live via
             # ``aws s3 rm`` (see builders/_price_cache_writeboth.py).
-            existing_pcache = _pd.DataFrame(columns=ohlcv_cols)
+            existing_pcache = _pd.DataFrame(columns=ohlcv_cols)  # pyright: ignore[reportArgumentType]
             for _read_prefix in _price_cache_read_prefixes():
                 try:
                     obj = s3.get_object(
@@ -3373,7 +3347,33 @@ def _self_heal_chronic_polygon_gaps(
                     break
                 except s3.exceptions.NoSuchKey:
                     continue
-
+            if not dry_run:
+                _assert_no_bar_after(existing_pcache.index, target_date, artifact=f"price_cache/{ticker}.parquet")
+            # auto_adjust restates pre-dividend prices.  The overlapping row
+            # exposes that factor change; appending such a response would leave
+            # the old and newly adjusted regimes joined by a false price seam.
+            overlap = existing_pcache.index.intersection(new_rows.index)  # pyright: ignore[reportUnknownVariableType, reportUnknownMemberType, reportAttributeAccessIssue]
+            price_cols = [
+                c for c in ("Open", "High", "Low", "Close")
+                if c in existing_pcache.columns and c in new_rows.columns  # pyright: ignore[reportUnknownMemberType, reportAttributeAccessIssue]
+            ]
+            restate_history = bool(
+                len(overlap) and price_cols and not _pd.DataFrame.equals(  # pyright: ignore[reportUnknownArgumentType]
+                    existing_pcache.loc[overlap, price_cols],  # pyright: ignore[reportUnknownArgumentType]
+                    new_rows.loc[overlap, price_cols],  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType, reportAttributeAccessIssue]
+                )
+            )
+            if restate_history:
+                with quiet_yfinance():
+                    yf_df = _yf.download(  # pyright: ignore[reportUnknownMemberType]
+                        ticker, period="max", end=end_excl.strftime("%Y-%m-%d"),
+                        progress=False, auto_adjust=True, timeout=30,
+                    )
+                assert isinstance(yf_df, _pd.DataFrame)
+                if isinstance(yf_df.columns, _pd.MultiIndex):
+                    yf_df.columns = yf_df.columns.get_level_values(0)  # pyright: ignore[reportUnknownMemberType]
+                new_rows = yf_df.loc[yf_df.index <= target_ts, ohlcv_cols].copy()  # pyright: ignore[reportUnknownVariableType, reportUnknownMemberType]
+                existing_pcache = _pd.DataFrame(columns=ohlcv_cols)  # pyright: ignore[reportArgumentType]
             combined_pcache = _pd.concat([existing_pcache, new_rows])
             combined_pcache = combined_pcache[
                 ~combined_pcache.index.duplicated(keep="last")

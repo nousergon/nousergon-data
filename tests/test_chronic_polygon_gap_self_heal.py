@@ -221,6 +221,49 @@ def test_self_heal_backfills_pstg_via_yfinance_and_invokes_per_ticker_backfill()
     )
 
 
+def test_self_heal_refetches_full_history_when_adjusted_overlap_changes():
+    """A dividend adjustment visible on the overlap must restate old rows."""
+    from weekly_collector import _self_heal_chronic_polygon_gaps
+
+    universe_lib = _stub_universe_lib({"PSTG": "2026-05-05"})
+    existing = pd.DataFrame(
+        {"Open": 100.0, "High": 101.0, "Low": 99.0, "Close": 100.0, "Volume": 1_000},
+        index=pd.DatetimeIndex(["2026-05-02", "2026-05-05"]),
+    )
+    incremental = pd.DataFrame(
+        {
+            "Open": [99.5, 101.0], "High": [100.5, 102.0],
+            "Low": [98.5, 100.0], "Close": [99.5, 101.0], "Volume": [1_000, 1_100],
+        },
+        index=pd.DatetimeIndex(["2026-05-05", "2026-05-06"]),
+    )
+    full = pd.DataFrame(
+        {
+            "Open": [99.5, 99.5, 101.0], "High": [100.5, 100.5, 102.0],
+            "Low": [98.5, 98.5, 100.0], "Close": [99.5, 99.5, 101.0],
+            "Volume": [1_000, 1_000, 1_100],
+        },
+        index=pd.DatetimeIndex(["2026-05-02", "2026-05-05", "2026-05-06"]),
+    )
+    s3 = _stub_s3_with_pcache({"PSTG": existing})
+
+    with patch("weekly_collector.boto3.client", return_value=s3), \
+         patch("store.arctic_store.get_universe_lib", return_value=universe_lib), \
+         patch("yfinance.download", side_effect=[incremental, full]) as download, \
+         patch("builders.backfill.backfill"):
+        result = _self_heal_chronic_polygon_gaps(
+            bucket="test-bucket", target_date="2026-05-06", chronic_tickers=["PSTG"]
+        )
+
+    assert len(result["healed"]) == 1
+    assert download.call_count == 2
+    assert download.call_args_list[1].kwargs["period"] == "max"
+    written = pd.read_parquet(io.BytesIO(
+        s3.written["reference/price_cache/PSTG.parquet"]
+    ))
+    assert written.loc[pd.Timestamp("2026-05-02"), "Close"] == 99.5
+
+
 def test_self_heal_dry_run_skips_writes_and_backfill_invocation():
     """``dry_run=True`` exercises the read paths + computes the healed
     summary, but writes nothing to S3 and invokes no per-ticker backfill."""
