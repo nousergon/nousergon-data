@@ -45,6 +45,8 @@ done
 
 # shellcheck source=infrastructure/lambdas/_shared/deploy_run.sh
 source "${SCRIPT_DIR}/../_shared/deploy_run.sh"
+# shellcheck source=infrastructure/lambdas/_shared/apply_iam_policy.sh
+source "${SCRIPT_DIR}/../_shared/apply_iam_policy.sh"
 
 # ----- Preflight handler unit tests (shared gate — config#2381) -------------
 # These tests existed beside index.py and this deploy.sh never ran them, so
@@ -79,28 +81,9 @@ fi
 if $APPLY_IAM; then
   echo "Applying IAM (role=${ROLE_NAME}, policy=${POLICY_NAME})..."
   TRUST_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
-  if ! aws iam get-role --role-name "${ROLE_NAME}" --query 'Role.RoleName' --output text >/dev/null 2>&1; then
-    echo "  Creating IAM role: ${ROLE_NAME}"
-    run aws iam create-role \
-      --role-name "${ROLE_NAME}" \
-      --assume-role-policy-document "${TRUST_POLICY}" \
-      --query 'Role.RoleName' --output text
-    run aws iam attach-role-policy \
-      --role-name "${ROLE_NAME}" \
-      --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-    if ! $DRY_RUN; then
-      echo "  Waiting 10s for IAM role propagation..."
-      sleep 10
-    fi
-  else
-    echo "  IAM role exists: ${ROLE_NAME}"
-  fi
-
-  echo "  Applying inline policy: ${POLICY_NAME}"
-  run aws iam put-role-policy \
-    --role-name "${ROLE_NAME}" \
-    --policy-name "${POLICY_NAME}" \
-    --policy-document "file://${SCRIPT_DIR}/iam-policy.json"
+  apply_iam_policy "${ROLE_NAME}" "${POLICY_NAME}" \
+    "${SCRIPT_DIR}/iam-policy.json" "${TRUST_POLICY}" \
+    "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
   echo "  ✓ IAM applied. Nothing else was touched — no code, no env, no alarms."
   exit 0
 fi

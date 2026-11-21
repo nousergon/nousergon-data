@@ -23,6 +23,7 @@ diverge again on a thirty-sixth.
 from __future__ import annotations
 
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -30,22 +31,9 @@ import pytest
 REPO = Path(__file__).resolve().parents[1]
 DEPLOY_SCRIPTS = sorted(REPO.glob("infrastructure/lambdas/*/deploy.sh"))
 
-# deploy.sh files that still hand-roll the role/policy apply inline instead of
-# sourcing _shared/apply_iam_policy.sh. Both predate the shared helper and
-# both additionally attach AWSLambdaBasicExecutionRole, which the shared
-# function does not yet support -- folding them in needs that parameter and is
-# tracked separately, so they are grandfathered here rather than rewritten
-# approximately.
-#
-# This list may only ever SHRINK. Adding to it is adding a copy of logic whose
-# duplication already produced one silent failure: `alert-drain-liveness-probe`
-# printed `apply_iam_policy: command not found` behind a `|| echo "expected in
-# CI"` and its IAM auto-apply had never once run (see the header of
-# _shared/apply_iam_policy.sh).
-GRANDFATHERED_INLINE_APPLY = frozenset({
-    "alpha-engine-alerts-forwarder",
-    "changelog-incident-mirror",
-})
+# This list may only ever SHRINK. It is empty now that every deploy.sh with an
+# --apply-iam path uses the shared helper.
+GRANDFATHERED_INLINE_APPLY: frozenset[str] = frozenset()
 
 
 def _apply_iam_scripts() -> "list[Path]":
@@ -58,7 +46,7 @@ def _apply_iam_block(path: Path) -> str:
     return m.group(1)
 
 
-def test_there_are_apply_iam_scripts_to_check():
+def test_there_are_apply_iam_scripts_to_check() -> None:
     """A guard that silently matches nothing is not a guard."""
     assert len(_apply_iam_scripts()) >= 30
 
@@ -66,7 +54,9 @@ def test_there_are_apply_iam_scripts_to_check():
 @pytest.mark.parametrize(
     "script", _apply_iam_scripts(), ids=lambda p: p.parent.name
 )
-def test_apply_iam_exits_and_never_falls_through_to_a_code_deploy(script: Path):
+def test_apply_iam_exits_and_never_falls_through_to_a_code_deploy(
+    script: Path,
+) -> None:
     """`--apply-iam` must terminate the script.
 
     Falling through means an operator applying a GRANT also ships whatever
@@ -85,7 +75,7 @@ def test_apply_iam_exits_and_never_falls_through_to_a_code_deploy(script: Path):
 @pytest.mark.parametrize(
     "script", _apply_iam_scripts(), ids=lambda p: p.parent.name
 )
-def test_apply_iam_says_that_nothing_else_was_touched(script: Path):
+def test_apply_iam_says_that_nothing_else_was_touched(script: Path) -> None:
     """The operator must be able to tell from the output that this did not
     deploy anything. `✓ IAM applied.` alone does not say that."""
     body = _apply_iam_block(script)
@@ -99,7 +89,7 @@ def test_apply_iam_says_that_nothing_else_was_touched(script: Path):
 @pytest.mark.parametrize(
     "script", _apply_iam_scripts(), ids=lambda p: p.parent.name
 )
-def test_apply_iam_uses_the_shared_helper(script: Path):
+def test_apply_iam_uses_the_shared_helper(script: Path) -> None:
     """One applier, so the no-op detection added for I7444 reaches every
     caller. The grandfather list may only shrink."""
     name = script.parent.name
@@ -114,7 +104,7 @@ def test_apply_iam_uses_the_shared_helper(script: Path):
     )
 
 
-def test_grandfather_list_names_only_real_scripts():
+def test_grandfather_list_names_only_real_scripts() -> None:
     """A stale grandfather entry hides a script that no longer exists, and
     makes the list look smaller than the debt it represents."""
     names = {p.parent.name for p in _apply_iam_scripts()}
@@ -125,7 +115,7 @@ def test_grandfather_list_names_only_real_scripts():
     )
 
 
-def test_shared_applier_detects_a_no_op_apply():
+def test_shared_applier_detects_a_no_op_apply() -> None:
     """The header property: apply_iam_policy compares live against the file
     and says which, so an apply from the wrong checkout is not silent."""
     shared = (REPO / "infrastructure" / "lambdas" / "_shared"
@@ -139,3 +129,47 @@ def test_shared_applier_detects_a_no_op_apply():
             f"apply_iam_policy no longer reports {marker!r}; the operator "
             f"cannot distinguish an applied change from an idempotent rewrite"
         )
+
+
+@pytest.mark.parametrize("managed_policy_arn", [None, "arn:aws:iam::aws:policy/example"])
+def test_shared_applier_optionally_attaches_managed_policy(
+    tmp_path: Path, managed_policy_arn: str | None
+) -> None:
+    """The fifth argument adds exactly one post-creation attachment."""
+    policy_file = tmp_path / "policy.json"
+    policy_file.write_text("{}")
+    helper = REPO / "infrastructure/lambdas/_shared/apply_iam_policy.sh"
+    arguments = "" if managed_policy_arn is None else f" {managed_policy_arn!r}"
+    command = f"""
+source {str(helper)!r}
+DRY_RUN=true
+aws() {{
+  if [ "$1 $2" = "iam get-role" ]; then
+    echo 'NoSuchEntity' >&2
+    return 1
+  fi
+  if [ "$1 $2" = "iam get-role-policy" ]; then
+    echo 'NoSuchEntity' >&2
+    return 1
+  fi
+}}
+run() {{ printf '%s\\n' "$*"; }}
+apply_iam_policy role policy {str(policy_file)!r} '{{}}'{arguments}
+"""
+    result = subprocess.run(
+        ["bash", "-c", command],
+        cwd=REPO,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    attachments = [
+        line for line in result.stdout.splitlines() if "attach-role-policy" in line
+    ]
+    if managed_policy_arn is None:
+        assert attachments == []
+    else:
+        assert attachments == [
+            f"aws iam attach-role-policy --role-name role --policy-arn {managed_policy_arn}"
+        ]

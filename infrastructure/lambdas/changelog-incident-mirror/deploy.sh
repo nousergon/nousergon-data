@@ -58,6 +58,8 @@ done
 
 # shellcheck source=infrastructure/lambdas/_shared/deploy_run.sh
 source "${SCRIPT_DIR}/../_shared/deploy_run.sh"
+# shellcheck source=infrastructure/lambdas/_shared/apply_iam_policy.sh
+source "${SCRIPT_DIR}/../_shared/apply_iam_policy.sh"
 
 # Validate index.py syntax + run handler smoke tests locally before shipping.
 python3 -c "
@@ -80,36 +82,15 @@ fi
 # ----- IAM apply (opt-in, config#865) ---------------------------------------
 # Mirror the cloudwatch-mirror sibling's --bootstrap IAM block so an
 # iam-policy.json change can ship without a manual `aws iam put-role-policy`.
-# Idempotent: create the execution role only if missing, then overwrite the
-# inline policy in place. Trust policy + managed AWSLambdaBasicExecutionRole
-# are first-time concerns handled in README "Recreate from scratch"; this
-# flag intentionally only re-applies the inline S3 policy that actually
-# drifts, matching cloudwatch-mirror's put-role-policy semantics.
+# Idempotent: create the execution role only if missing, attach its managed
+# AWSLambdaBasicExecutionRole policy after creation, then overwrite the inline
+# policy in place.
 if $APPLY_IAM; then
   echo "Applying IAM (role=${ROLE_NAME}, policy=${POLICY_NAME})..."
   TRUST_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
-  if ! aws iam get-role --role-name "${ROLE_NAME}" --query 'Role.RoleName' --output text >/dev/null 2>&1; then
-    echo "  Creating IAM role: ${ROLE_NAME}"
-    run aws iam create-role \
-      --role-name "${ROLE_NAME}" \
-      --assume-role-policy-document "${TRUST_POLICY}" \
-      --query 'Role.RoleName' --output text
-    run aws iam attach-role-policy \
-      --role-name "${ROLE_NAME}" \
-      --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-    if ! $DRY_RUN; then
-      echo "  Waiting 10s for IAM role propagation..."
-      sleep 10
-    fi
-  else
-    echo "  IAM role exists: ${ROLE_NAME}"
-  fi
-
-  echo "  Applying inline policy: ${POLICY_NAME}"
-  run aws iam put-role-policy \
-    --role-name "${ROLE_NAME}" \
-    --policy-name "${POLICY_NAME}" \
-    --policy-document "file://${SCRIPT_DIR}/iam-policy.json"
+  apply_iam_policy "${ROLE_NAME}" "${POLICY_NAME}" \
+    "${SCRIPT_DIR}/iam-policy.json" "${TRUST_POLICY}" \
+    "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
   echo "  ✓ IAM applied. Nothing else was touched — no code, no env, no alarms."
   exit 0
 fi
