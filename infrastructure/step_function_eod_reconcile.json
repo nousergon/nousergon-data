@@ -624,34 +624,44 @@
         }
       ],
       "ResultPath": "$.eod_result",
-      "Next": "WaitForEOD"
+      "Next": "WaitForEOD",
+      "ResultSelector": {
+        "Command.$": "$.Command",
+        "poll": {
+          "verdict": "INIT",
+          "attempts": 0,
+          "ping_misses": 0
+        }
+      }
     },
     "WaitForEOD": {
       "Type": "Task",
-      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
-        "CommandId.$": "$.eod_result.Command.CommandId",
-        "InstanceId.$": "$.trading_instance_id[0]"
+        "FunctionName": "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-ssm-liveness-poller",
+        "Payload": {
+          "instance_id.$": "$.trading_instance_id[0]",
+          "command_id.$": "$.eod_result.Command.CommandId",
+          "attempts.$": "$.eod_result.poll.attempts",
+          "ping_misses.$": "$.eod_result.poll.ping_misses",
+          "max_attempts": 180,
+          "max_ping_misses": 3,
+          "step": "eod-reconcile"
+        }
       },
-      "TimeoutSeconds": 60,
+      "TimeoutSeconds": 20,
       "Retry": [
         {
           "ErrorEquals": [
-            "Ssm.InvocationDoesNotExistException",
-            "Ssm.InvocationDoesNotExist"
-          ],
-          "MaxAttempts": 10,
-          "IntervalSeconds": 10,
-          "BackoffRate": 1.5
-        },
-        {
-          "ErrorEquals": [
-            "Ssm.SdkClientException",
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException",
             "States.Timeout"
           ],
-          "MaxAttempts": 2,
+          "MaxAttempts": 3,
           "IntervalSeconds": 5,
-          "BackoffRate": 1.5
+          "BackoffRate": 2.0
         }
       ],
       "Catch": [
@@ -664,36 +674,41 @@
         }
       ],
       "ResultSelector": {
-        "Status.$": "$.Status",
-        "ResponseCode.$": "$.ResponseCode",
-        "StatusDetails.$": "$.StatusDetails",
-        "CommandId.$": "$.CommandId",
-        "InstanceId.$": "$.InstanceId"
+        "verdict.$": "$.Payload.verdict",
+        "attempts.$": "$.Payload.attempts",
+        "ping_misses.$": "$.Payload.ping_misses",
+        "Status.$": "$.Payload.status",
+        "ResponseCode.$": "$.Payload.response_code",
+        "StatusDetails.$": "$.Payload.status_details",
+        "StandardErrorContent.$": "$.Payload.stderr_tail",
+        "ping_status.$": "$.Payload.ping_status",
+        "detail.$": "$.Payload.detail"
       },
-      "ResultPath": "$.eod_poll",
-      "Next": "CheckEODStatus"
+      "ResultPath": "$.eod_result.poll",
+      "Next": "CheckEODStatus",
+      "Comment": "alpha-engine-config-I8703: liveness-aware poll in OBSERVE mode. The existing Status Choice remains authoritative, so SUCCESS, pending, retry and failure outcomes are unchanged; verdict, ping_status and counters are visible but not routed. Promotion criterion: after 5 consecutive EOD cycles show expected verdicts and no false INSTANCE_UNRESPONSIVE or POLL_BUDGET_EXHAUSTED classification, a separate change may route on verdict."
     },
     "CheckEODStatus": {
       "Type": "Choice",
       "Comment": "Default routes to HandleFailure so any unexpected SSM status (Failed, Cancelled, TimedOut, ...) is surfaced, not silently swallowed.",
       "Choices": [
         {
-          "Variable": "$.eod_poll.Status",
+          "Variable": "$.eod_result.poll.Status",
           "StringEquals": "Success",
           "Next": "CheckBoxOwnedBeforeStop"
         },
         {
-          "Variable": "$.eod_poll.Status",
+          "Variable": "$.eod_result.poll.Status",
           "StringEquals": "InProgress",
           "Next": "EODWait"
         },
         {
-          "Variable": "$.eod_poll.Status",
+          "Variable": "$.eod_result.poll.Status",
           "StringEquals": "Pending",
           "Next": "EODWait"
         },
         {
-          "Variable": "$.eod_poll.Status",
+          "Variable": "$.eod_result.poll.Status",
           "StringEquals": "Delayed",
           "Next": "EODWait"
         }
@@ -705,11 +720,12 @@
       "Comment": "Choice Default path \u2014 synthesize $.error from poll result so HandleFailure's JsonToString($.error) has something to stringify.",
       "Parameters": {
         "source": "eod_status",
-        "status.$": "$.eod_poll.Status",
-        "status_details.$": "$.eod_poll.StatusDetails",
-        "response_code.$": "$.eod_poll.ResponseCode",
-        "command_id.$": "$.eod_poll.CommandId",
-        "instance_id.$": "$.eod_poll.InstanceId"
+        "status.$": "$.eod_result.poll.Status",
+        "status_details.$": "$.eod_result.poll.StatusDetails",
+        "response_code.$": "$.eod_result.poll.ResponseCode",
+        "command_id.$": "$.eod_result.Command.CommandId",
+        "instance_id.$": "$.trading_instance_id[0]",
+        "detail.$": "$.eod_result.poll.detail"
       },
       "ResultPath": "$.error",
       "Next": "HandleFailure"
@@ -798,34 +814,44 @@
         }
       ],
       "ResultPath": "$.refresh_executor_deploy_result",
-      "Next": "WaitForRefreshExecutorDeploy"
+      "Next": "WaitForRefreshExecutorDeploy",
+      "ResultSelector": {
+        "Command.$": "$.Command",
+        "poll": {
+          "verdict": "INIT",
+          "attempts": 0,
+          "ping_misses": 0
+        }
+      }
     },
     "WaitForRefreshExecutorDeploy": {
       "Type": "Task",
-      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
-        "CommandId.$": "$.refresh_executor_deploy_result.Command.CommandId",
-        "InstanceId.$": "$.trading_instance_id[0]"
+        "FunctionName": "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-ssm-liveness-poller",
+        "Payload": {
+          "instance_id.$": "$.trading_instance_id[0]",
+          "command_id.$": "$.refresh_executor_deploy_result.Command.CommandId",
+          "attempts.$": "$.refresh_executor_deploy_result.poll.attempts",
+          "ping_misses.$": "$.refresh_executor_deploy_result.poll.ping_misses",
+          "max_attempts": 90,
+          "max_ping_misses": 3,
+          "step": "refresh-executor-deploy"
+        }
       },
-      "TimeoutSeconds": 60,
+      "TimeoutSeconds": 20,
       "Retry": [
         {
           "ErrorEquals": [
-            "Ssm.InvocationDoesNotExistException",
-            "Ssm.InvocationDoesNotExist"
-          ],
-          "MaxAttempts": 10,
-          "IntervalSeconds": 10,
-          "BackoffRate": 1.5
-        },
-        {
-          "ErrorEquals": [
-            "Ssm.SdkClientException",
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException",
             "States.Timeout"
           ],
-          "MaxAttempts": 2,
+          "MaxAttempts": 3,
           "IntervalSeconds": 5,
-          "BackoffRate": 1.5
+          "BackoffRate": 2.0
         }
       ],
       "Catch": [
@@ -838,36 +864,41 @@
         }
       ],
       "ResultSelector": {
-        "Status.$": "$.Status",
-        "ResponseCode.$": "$.ResponseCode",
-        "StatusDetails.$": "$.StatusDetails",
-        "CommandId.$": "$.CommandId",
-        "InstanceId.$": "$.InstanceId"
+        "verdict.$": "$.Payload.verdict",
+        "attempts.$": "$.Payload.attempts",
+        "ping_misses.$": "$.Payload.ping_misses",
+        "Status.$": "$.Payload.status",
+        "ResponseCode.$": "$.Payload.response_code",
+        "StatusDetails.$": "$.Payload.status_details",
+        "StandardErrorContent.$": "$.Payload.stderr_tail",
+        "ping_status.$": "$.Payload.ping_status",
+        "detail.$": "$.Payload.detail"
       },
-      "ResultPath": "$.refresh_executor_deploy_poll",
-      "Next": "CheckRefreshExecutorDeployStatus"
+      "ResultPath": "$.refresh_executor_deploy_result.poll",
+      "Next": "CheckRefreshExecutorDeployStatus",
+      "Comment": "alpha-engine-config-I8703: liveness-aware poll in OBSERVE mode. The existing Status Choice remains authoritative, so SUCCESS, pending, retry and failure outcomes are unchanged; verdict, ping_status and counters are visible but not routed. Promotion criterion: after 5 consecutive EOD cycles show expected verdicts and no false INSTANCE_UNRESPONSIVE or POLL_BUDGET_EXHAUSTED classification, a separate change may route on verdict."
     },
     "CheckRefreshExecutorDeployStatus": {
       "Type": "Choice",
       "Comment": "Default routes to HandleFailure so any unexpected SSM status (Failed, Cancelled, TimedOut, ...) is surfaced, not silently swallowed \u2014 a stale checkout must never reach the work steps.",
       "Choices": [
         {
-          "Variable": "$.refresh_executor_deploy_poll.Status",
+          "Variable": "$.refresh_executor_deploy_result.poll.Status",
           "StringEquals": "Success",
           "Next": "CaptureSnapshot"
         },
         {
-          "Variable": "$.refresh_executor_deploy_poll.Status",
+          "Variable": "$.refresh_executor_deploy_result.poll.Status",
           "StringEquals": "InProgress",
           "Next": "RefreshExecutorDeployWait"
         },
         {
-          "Variable": "$.refresh_executor_deploy_poll.Status",
+          "Variable": "$.refresh_executor_deploy_result.poll.Status",
           "StringEquals": "Pending",
           "Next": "RefreshExecutorDeployWait"
         },
         {
-          "Variable": "$.refresh_executor_deploy_poll.Status",
+          "Variable": "$.refresh_executor_deploy_result.poll.Status",
           "StringEquals": "Delayed",
           "Next": "RefreshExecutorDeployWait"
         }
@@ -884,11 +915,12 @@
       "Comment": "Choice Default path \u2014 synthesize $.error from poll result so HandleFailure's JsonToString($.error) has something to stringify.",
       "Parameters": {
         "source": "refresh_executor_deploy_status",
-        "status.$": "$.refresh_executor_deploy_poll.Status",
-        "status_details.$": "$.refresh_executor_deploy_poll.StatusDetails",
-        "response_code.$": "$.refresh_executor_deploy_poll.ResponseCode",
-        "command_id.$": "$.refresh_executor_deploy_poll.CommandId",
-        "instance_id.$": "$.refresh_executor_deploy_poll.InstanceId"
+        "status.$": "$.refresh_executor_deploy_result.poll.Status",
+        "status_details.$": "$.refresh_executor_deploy_result.poll.StatusDetails",
+        "response_code.$": "$.refresh_executor_deploy_result.poll.ResponseCode",
+        "command_id.$": "$.refresh_executor_deploy_result.Command.CommandId",
+        "instance_id.$": "$.trading_instance_id[0]",
+        "detail.$": "$.refresh_executor_deploy_result.poll.detail"
       },
       "ResultPath": "$.error",
       "Next": "HandleFailure"
@@ -1024,8 +1056,8 @@
         "status_details.$": "$.snapshot_poll.StatusDetails",
         "response_code.$": "$.snapshot_poll.ResponseCode",
         "stderr.$": "$.snapshot_poll.StandardErrorContent",
-        "command_id.$": "$.snapshot_poll.CommandId",
-        "instance_id.$": "$.snapshot_poll.InstanceId"
+        "command_id.$": "$.snapshot_result.Command.CommandId",
+        "instance_id.$": "$.trading_instance_id[0]"
       },
       "ResultPath": "$.error",
       "Next": "PageCaptureSnapshotIrreversibleFailure"
