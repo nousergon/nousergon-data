@@ -32,7 +32,9 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -44,7 +46,9 @@ _SF_FILES = {
 }
 
 
-def _walk_states(states: dict):
+def _walk_states(
+    states: dict[str, Any],
+) -> Iterator[tuple[str, dict[str, Any]]]:
     for name, st in states.items():
         if not isinstance(st, dict):
             continue
@@ -58,7 +62,7 @@ def _walk_states(states: dict):
                 yield from _walk_states(b["States"])
 
 
-def _is_liveness_poller(st: dict) -> bool:
+def _is_liveness_poller(st: dict[str, Any]) -> bool:
     """config#1811: the weekday SF's poll loops migrated from bare
     aws-sdk getCommandInvocation to the ssm-liveness-poller Lambda. The
     256 KB invariant applies identically — the poller's result rides in
@@ -74,7 +78,7 @@ def _is_liveness_poller(st: dict) -> bool:
     )
 
 
-def _poll_states():
+def _poll_states() -> list[tuple[str, str, dict[str, Any], str]]:
     """Yield (sf, name, state, sf_text) for every SSM command poll —
     bare getCommandInvocation Tasks AND ssm-liveness-poller invocations —
     across all three SFs."""
@@ -93,7 +97,45 @@ def _poll_states():
 _POLLS = _poll_states()
 
 
-def _fields_read_downstream(result_path: str, sf_text: str) -> set:
+def _send_command_states() -> list[tuple[str, str, dict[str, Any]]]:
+    """Return every SSM sendCommand task in each pipeline definition."""
+    out = []
+    for sf, path in _SF_FILES.items():
+        sf_def = json.loads(path.read_text())
+        for name, st in _walk_states(sf_def.get("States", {})):
+            if "aws-sdk:ssm:sendCommand" in str(st.get("Resource", "")):
+                out.append((sf, name, st))
+    return out
+
+
+_SEND_COMMANDS = _send_command_states()
+
+
+def test_all_pipelines_have_send_command_states() -> None:
+    """Prevent the S3-output conformance check from passing vacuously."""
+    assert _SEND_COMMANDS
+    assert {sf for sf, _, _ in _SEND_COMMANDS} == {"saturday", "weekday", "eod"}
+
+
+@pytest.mark.parametrize(
+    "sf,name,st",
+    _SEND_COMMANDS,
+    ids=[f"{sf}:{name}" for sf, name, _ in _SEND_COMMANDS],
+)
+def test_send_command_output_is_durable(
+    sf: str, name: str, st: dict[str, Any]
+) -> None:
+    """Require full SSM output in a distinct location for every stage."""
+    params = st.get("Parameters", {})
+    assert params.get("OutputS3BucketName") == "alpha-engine-research", (
+        f"[{sf}] {name} does not ship SSM output to alpha-engine-research"
+    )
+    prefix = params.get("OutputS3KeyPrefix")
+    assert isinstance(prefix, str) and prefix.startswith("_ssm_logs/")
+    assert prefix != "_ssm_logs/", f"[{sf}] {name} needs a stage-specific prefix"
+
+
+def _fields_read_downstream(result_path: str, sf_text: str) -> set[str]:
     """Every field read off ``$.<poll>.<Field>`` anywhere in the SF. Each such
     field is a real data dependency the ResultSelector MUST keep."""
     if not result_path:
@@ -105,7 +147,7 @@ def _fields_read_downstream(result_path: str, sf_text: str) -> set:
     return set(re.findall(rf"{esc}\.([A-Za-z][A-Za-z0-9_]*)", sf_text))
 
 
-def _rs_keeps(rs: dict) -> set:
+def _rs_keeps(rs: dict[str, Any]) -> set[str]:
     """Field names a ResultSelector keeps (strip the trailing ``.$``)."""
     return {k[:-2] if k.endswith(".$") else k for k in rs}
 
