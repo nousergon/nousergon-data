@@ -13,34 +13,24 @@
         "verify_units.$": "$.verify_units",
         "started_at.$": "$$.Execution.StartTime"
       },
-      "Next": "CheckRequireTradingDay"
-    },
-    "CheckRequireTradingDay": {
-      "Type": "Choice",
-      "Choices": [
-        {
-          "Variable": "$.require_trading_day",
-          "BooleanEquals": true,
-          "Next": "TradingDayCheck"
-        }
-      ],
-      "Default": "RunWorkloads"
+      "Next": "TradingDayCheck"
     },
     "TradingDayCheck": {
       "Type": "Task",
-      "Comment": "The dispatcher answers from krepis.trading_calendar for today's America/New_York date. It launches nothing for this action.",
+      "Comment": "Resolve the data repository branch once per execution. Every workload attempt receives this immutable commit; resolution failure fails the execution rather than silently using a later branch head.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "${DispatcherFunctionArn}",
         "Payload": {
-          "action": "trading-day-check"
+          "action": "prepare-execution"
         }
       },
       "ResultSelector": {
+        "code_sha.$": "$.Payload.code_sha",
         "date.$": "$.Payload.trading_day.date",
         "is_trading_day.$": "$.Payload.trading_day.is_trading_day"
       },
-      "ResultPath": "$.trading_day",
+      "ResultPath": "$.preparation",
       "Retry": [
         {
           "ErrorEquals": [
@@ -61,13 +51,24 @@
           "Next": "NotifyFailure"
         }
       ],
-      "Next": "IsTradingDay"
+      "Next": "CheckRequireTradingDay"
+    },
+    "CheckRequireTradingDay": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.require_trading_day",
+          "BooleanEquals": true,
+          "Next": "IsTradingDay"
+        }
+      ],
+      "Default": "RunWorkloads"
     },
     "IsTradingDay": {
       "Type": "Choice",
       "Choices": [
         {
-          "Variable": "$.trading_day.is_trading_day",
+          "Variable": "$.preparation.is_trading_day",
           "BooleanEquals": true,
           "Next": "RunWorkloads"
         }
@@ -87,6 +88,7 @@
         "workload.$": "$$.Map.Item.Value",
         "execution_id.$": "$$.Execution.Id",
         "pipeline_role.$": "$.collection",
+        "code_sha.$": "$.preparation",
         "force_on_demand": false,
         "attempts": 0
       },
@@ -105,6 +107,7 @@
                 "workload.$": "$.workload",
                 "execution_id.$": "$.execution_id",
                 "pipeline_role.$": "$.pipeline_role",
+                "code_sha.$": "$.code_sha",
                 "force_on_demand.$": "$.force_on_demand"
               }
             },
@@ -230,6 +233,7 @@
               "workload.$": "$.workload",
               "execution_id.$": "$.execution_id",
               "pipeline_role.$": "$.pipeline_role",
+              "code_sha.$": "$.code_sha",
               "force_on_demand": true,
               "attempts.$": "States.MathAdd($.attempts, 1)"
             },

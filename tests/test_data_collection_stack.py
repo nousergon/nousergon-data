@@ -16,6 +16,7 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
@@ -34,7 +35,7 @@ V1_PIPELINES = (
 
 
 @pytest.fixture(scope="module")
-def stack():
+def stack() -> Any:
     spec = importlib.util.spec_from_file_location("data_collection_stack", HELPER_PATH)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -42,23 +43,94 @@ def stack():
 
 
 @pytest.fixture(scope="module")
-def tpl(stack):
+def tpl(stack: Any) -> Any:
     return stack.load_template()
 
 
-def test_lint_is_clean(stack):
+@pytest.fixture(scope="module")
+def dispatcher() -> Any:
+    path = REPO / "infrastructure" / "lambdas" / "data-spot-dispatcher" / "index.py"
+    spec = importlib.util.spec_from_file_location("data_collection_sha_dispatcher", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_execution_pins_one_sha_across_workloads_and_retry(dispatcher: Any) -> None:
+    asl = json.loads(dispatcher_path().read_text(encoding="utf-8"))
+    states = asl["States"]
+    assert states["Init"]["Next"] == "TradingDayCheck"
+    resolve = states["TradingDayCheck"]
+    assert resolve["Parameters"]["Payload"] == {"action": "prepare-execution"}
+    assert resolve["ResultSelector"]["code_sha.$"] == "$.Payload.code_sha"
+    assert resolve["Catch"][0]["Next"] == "NotifyFailure"
+
+    run = states["RunWorkloads"]
+    assert run["ItemSelector"]["code_sha.$"] == "$.preparation"
+    inner = run["ItemProcessor"]["States"]
+    assert inner["LaunchWorkload"]["Parameters"]["Payload"]["code_sha.$"] == "$.code_sha"
+    assert inner["RetryOnDemand"]["Parameters"]["code_sha.$"] == "$.code_sha"
+
+    pinned = "a" * 40
+    first = dispatcher._bootstrap_command("weekly-phase-one", "true", "run-1", pinned)
+    retry = dispatcher._bootstrap_command("weekly-phase-one", "true", "run-2", pinned)
+    for command in (first, retry):
+        assert f"git fetch --depth 1 origin {pinned}" in command
+        assert f"git checkout --detach {pinned}" in command
+        assert "pip install" in command
+        assert command.index(f"git checkout --detach {pinned}") < command.index("pip install")
+
+
+def dispatcher_path() -> Path:
+    return REPO / "infrastructure" / "step-functions" / "data-collection.asl.json"
+
+
+def test_code_sha_resolution_is_immutable_and_fails_closed(dispatcher: Any) -> None:
+    class Response:
+        def __init__(self: Any, sha: str) -> None:
+            self.sha = sha
+
+        def __enter__(self: Any) -> "Response":
+            return self
+
+        def __exit__(self: Any, *_args: object) -> None:
+            return None
+
+        def read(self: Any) -> bytes:
+            return json.dumps({"sha": self.sha}).encode()
+
+    heads = iter(("a" * 40, "b" * 40))
+
+    def opener(_request: object, *, timeout: int) -> Response:
+        assert timeout == dispatcher.GITHUB_TIMEOUT_SECONDS
+        return Response(next(heads))
+
+    pinned = dispatcher._resolve_code_sha(opener)
+    assert pinned == "a" * 40
+    assert pinned != dispatcher._resolve_code_sha(opener)
+
+    def invalid(_request: object, *, timeout: int) -> Response:
+        assert timeout == dispatcher.GITHUB_TIMEOUT_SECONDS
+        return Response("main")
+
+    with pytest.raises(RuntimeError, match="invalid commit SHA"):
+        dispatcher._resolve_code_sha(invalid)
+
+
+def test_lint_is_clean(stack: Any) -> None:
     assert stack.lint() == []
 
 
 @pytest.mark.skipif(shutil.which("cfn-lint") is None, reason="cfn-lint not installed")
-def test_cfn_lint_is_clean(stack):
+def test_cfn_lint_is_clean(stack: Any) -> None:
     proc = subprocess.run(
         ["cfn-lint", str(stack.TEMPLATE)], capture_output=True, text=True, check=False
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
-def test_four_schedules_each_driving_its_own_state_machine(stack, tpl):
+def test_four_schedules_each_driving_its_own_state_machine(stack: Any, tpl: Any) -> None:
     """alpha-engine-config-I11233 adds a FIFTH schedule that targets the
     dispatcher Lambda directly rather than a state machine — asserted
     separately below rather than folded in here, so this test keeps meaning
@@ -78,7 +150,7 @@ def test_four_schedules_each_driving_its_own_state_machine(stack, tpl):
         ("data-collection-shadow-morning", "shadow-morning"),
     ],
 )
-def test_the_shadow_schedules_target_the_dispatcher_lambda_directly(stack, tpl, name, workload):
+def test_the_shadow_schedules_target_the_dispatcher_lambda_directly(stack: Any, tpl: Any, name: Any, workload: Any) -> None:
     """alpha-engine-config-I11233 / -I11352: the two schedules in this stack
     with no state machine of their own — each invokes
     alpha-engine-data-spot-dispatcher directly, using the dispatcher's own
@@ -92,7 +164,7 @@ def test_the_shadow_schedules_target_the_dispatcher_lambda_directly(stack, tpl, 
     assert sched["input"] == {"workload": workload}
 
 
-def test_the_morning_shadow_fires_after_v1s_own_morning_run(stack, tpl):
+def test_the_morning_shadow_fires_after_v1s_own_morning_run(stack: Any, tpl: Any) -> None:
     """alpha-engine-config-I11352. The fifteen minutes ARE the mechanism: v1's
     MorningSchedule writes the keys at 07:30 ET and parity grades against them,
     so a shadow morning run that fired first would read `live_missing` on every
@@ -107,7 +179,7 @@ def test_the_morning_shadow_fires_after_v1s_own_morning_run(stack, tpl):
     assert by_name["data-collection-shadow-sameday"]["expression"] == "cron(30 18 ? * MON-FRI *)"
 
 
-def test_the_eod_schedule_fires_at_the_declared_settlement_hour(stack, tpl):
+def test_the_eod_schedule_fires_at_the_declared_settlement_hour(stack: Any, tpl: Any) -> None:
     """alpha-engine-config-I11354. The EOD collection fires at
     ``dates.SETTLED_AFTER_ET``, not at some remembered literal.
 
@@ -134,7 +206,7 @@ def test_the_eod_schedule_fires_at_the_declared_settlement_hour(stack, tpl):
     assert eod["timezone"] == "America/New_York"
 
 
-def test_the_eod_schedule_leaves_the_morning_run_a_full_overnight(stack, tpl):
+def test_the_eod_schedule_leaves_the_morning_run_a_full_overnight(stack: Any, tpl: Any) -> None:
     """The later start must not push EOD collection into the next morning's run.
 
     alpha-engine-config-I11363: derived from the declared caps, not from one
@@ -152,7 +224,7 @@ def test_the_eod_schedule_leaves_the_morning_run_a_full_overnight(stack, tpl):
     assert whole_run < gap_seconds, (whole_run, gap_seconds)
 
 
-def test_the_eod_unit_writers_carry_declared_caps(stack):
+def test_the_eod_unit_writers_carry_declared_caps(stack: Any) -> None:
     """alpha-engine-config-I11363: the two workloads that write the EOD
     verify_units are capped explicitly (measured 30.4-45.7 and 24.7-28.1 min
     over 2026-09-15..23) rather than riding the 7200 s default, so every
@@ -166,7 +238,7 @@ def test_the_eod_unit_writers_carry_declared_caps(stack):
     }
 
 
-def test_the_eod_ordering_chain_is_derived_from_the_template(stack, tpl):
+def test_the_eod_ordering_chain_is_derived_from_the_template(stack: Any, tpl: Any) -> None:
     """alpha-engine-config-I11363. From the EOD cron, the last minute any EOD
     verify_unit can still be written is the cron plus (SSM-online budget + cap)
     of each workload up to the last unit writer: 18:15 + 95 + 65 = 20:55 ET.
@@ -182,7 +254,7 @@ def test_the_eod_ordering_chain_is_derived_from_the_template(stack, tpl):
     assert h * 60 + m + -(-worst // 60) == 20 * 60 + 55
 
 
-def test_the_sameday_shadow_is_not_enabled_beside_a_live_eod_run(stack, tpl):
+def test_the_sameday_shadow_is_not_enabled_beside_a_live_eod_run(stack: Any, tpl: Any) -> None:
     """alpha-engine-config-I11363's ordering assertion, decided for a DISABLED
     shadow: the check stays ARMED rather than being deleted with the shadow.
     Its 18:30 ET cron does not clear the 20:55 ET bound above, so the committed
@@ -196,7 +268,7 @@ def test_the_sameday_shadow_is_not_enabled_beside_a_live_eod_run(stack, tpl):
     assert shadow_h * 60 + shadow_m < 20 * 60 + 55  # the premise the DISABLED state carries
 
 
-def _with_shadow(stack, tpl, *, state: str, expression: str | None = None) -> list[dict]:
+def _with_shadow(stack: Any, tpl: Any, *, state: str, expression: str | None = None) -> list[dict]:
     import copy
 
     sched = copy.deepcopy(stack.schedules(tpl))
@@ -208,7 +280,7 @@ def _with_shadow(stack, tpl, *, state: str, expression: str | None = None) -> li
     return sched
 
 
-def test_re_enabling_the_sameday_shadow_at_its_cron_is_refused(stack, tpl):
+def test_re_enabling_the_sameday_shadow_at_its_cron_is_refused(stack: Any, tpl: Any) -> None:
     problems = stack.sameday_ordering_problems(_with_shadow(stack, tpl, state="ENABLED"))
     assert len(problems) == 1 and "alpha-engine-config-I11363" in problems[0], problems
 
@@ -217,12 +289,12 @@ def test_re_enabling_the_sameday_shadow_at_its_cron_is_refused(stack, tpl):
     "expression,refused",
     [("cron(54 20 ? * MON-FRI *)", True), ("cron(55 20 ? * MON-FRI *)", False)],
 )
-def test_the_ordering_check_moves_exactly_at_the_derived_bound(stack, tpl, expression, refused):
+def test_the_ordering_check_moves_exactly_at_the_derived_bound(stack: Any, tpl: Any, expression: Any, refused: Any) -> None:
     sched = _with_shadow(stack, tpl, state="ENABLED", expression=expression)
     assert bool(stack.sameday_ordering_problems(sched)) is refused
 
 
-def test_lint_carries_the_ordering_check(stack, tpl, monkeypatch):
+def test_lint_carries_the_ordering_check(stack: Any, tpl: Any, monkeypatch: Any) -> None:
     """The lint (run by the deploy workflow) is the guard, so it is graded
     rather than assumed: a template with the shadow re-enabled fails lint."""
     assert not any("alpha-engine-config-I11363" in p for p in stack.lint())
@@ -240,7 +312,7 @@ def _cron_hour_minute(expression: str) -> tuple[int, int]:
     return int(m.group(2)), int(m.group(1))
 
 
-def test_schedule_names_are_unique_without_their_group(stack, tpl):
+def test_schedule_names_are_unique_without_their_group(stack: Any, tpl: Any) -> None:
     """CloudFormation's AWS::EarlyValidation::ResourceExistenceCheck compares a
     schedule's Name WITHOUT its group. The first create (2026-09-14) named one
     `weekly`, collided with crucible-v2's `crucible-v2/weekly`, and rolled the whole
@@ -250,7 +322,7 @@ def test_schedule_names_are_unique_without_their_group(stack, tpl):
         assert s["name"].startswith("data-collection-"), s["name"]
 
 
-def test_declared_states_at_the_decoupled_cutover(stack, tpl):
+def test_declared_states_at_the_decoupled_cutover(stack: Any, tpl: Any) -> None:
     """alpha-engine-config-I11269 (Brian's ruling (b), 2026-09-21). This was
     `test_ships_disabled` (alpha-engine-config-I10739 deliverable 2: nothing
     double-writes market_data/* while the v1 SFs still run), and the enable PR
@@ -281,7 +353,7 @@ def test_declared_states_at_the_decoupled_cutover(stack, tpl):
     }
 
 
-def test_daily_heal_has_its_own_state_switch(stack, tpl):
+def test_daily_heal_has_its_own_state_switch(stack: Any, tpl: Any) -> None:
     """Its v1 rule is paused by the 2026-08-07 ruling; the cutover must be able
     to enable collection without un-pausing the heal."""
     by_name = {s["name"]: s for s in stack.schedules(tpl)}
@@ -291,7 +363,7 @@ def test_daily_heal_has_its_own_state_switch(stack, tpl):
     } == {"CollectionState"}
 
 
-def test_eod_verifies_every_unit_its_workloads_run(stack, tpl):
+def test_eod_verifies_every_unit_its_workloads_run(stack: Any, tpl: Any) -> None:
     """alpha-engine-config-I10787 (P-20): the completion claim is the run manifest
     of every unit the machine runs, not a HEAD on the two keys Metron reads most.
     The set below is `run_units.PHASE_UNITS` for the "daily" mode (minus the arctic
@@ -312,7 +384,7 @@ def test_eod_verifies_every_unit_its_workloads_run(stack, tpl):
     }
 
 
-def test_every_schedule_verifies_units_and_none_verifies_keys(stack, tpl):
+def test_every_schedule_verifies_units_and_none_verifies_keys(stack: Any, tpl: Any) -> None:
     """No STATE-MACHINE-TARGETING schedule keeps the "no key verification"
     posture: an SSM exit code was never a completion claim, and the morning
     enrich is what the predictor reads next. Every such schedule names at
@@ -336,13 +408,13 @@ def test_every_schedule_verifies_units_and_none_verifies_keys(stack, tpl):
         assert "verify_keys" not in s["input"]
 
 
-def test_lint_refuses_an_undeclared_or_empty_verify_units(stack, monkeypatch):
+def test_lint_refuses_an_undeclared_or_empty_verify_units(stack: Any, monkeypatch: Any) -> None:
     """The lint is the guard, so it is graded rather than assumed."""
     import json as _json
 
     real_loader = stack.load_template
 
-    def _mutate(inputs):
+    def _mutate(inputs: Any) -> Any:
         base = real_loader()
         for res in base["Resources"].values():
             if res["Type"] != "AWS::Scheduler::Schedule":
@@ -366,7 +438,7 @@ def test_lint_refuses_an_undeclared_or_empty_verify_units(stack, monkeypatch):
 _NON_ARCTIC_WRITERS = {"edgar-pit-fundamentals-daily", "features-settled-regrade"}
 
 
-def test_eod_and_morning_probe_arcticdb_after_its_last_writer(stack, tpl):
+def test_eod_and_morning_probe_arcticdb_after_its_last_writer(stack: Any, tpl: Any) -> None:
     """P-05 (alpha-engine-config-I10748): the in-region ArcticDB probe must run
     after every ArcticDB-writing workload of both schedules so data_gate's
     ArcticDB-derived clauses see the day's collection before the probe
@@ -386,7 +458,7 @@ def test_eod_and_morning_probe_arcticdb_after_its_last_writer(stack, tpl):
     assert set(after) <= _NON_ARCTIC_WRITERS
 
 
-def test_the_morning_regrade_follows_the_settle_and_is_verified(stack, tpl):
+def test_the_morning_regrade_follows_the_settle_and_is_verified(stack: Any, tpl: Any) -> None:
     """alpha-engine-config-I12023: D50 rebuilds features/{D-1} from the bar D17
     settled, so it runs after morning-enrich in the same strictly ordered Map,
     and its run manifest is part of the morning completion claim."""
@@ -403,7 +475,7 @@ def test_the_morning_regrade_follows_the_settle_and_is_verified(stack, tpl):
     assert stack.worst_case_seconds(morning["workloads"], through="features-settled-regrade") <= ceiling
 
 
-def test_weekly_mirrors_the_v1_order(stack, tpl):
+def test_weekly_mirrors_the_v1_order(stack: Any, tpl: Any) -> None:
     """alpha-engine-config-I10753: DataPhase2 (D15) and RAGIngestion (D16/D46)
     join morning-enrich/weekly-phase-one in v1 data order. D40/D41 are
     retired (R7) and get no workload; D46 is a substep of rag-weekly-ingestion,
@@ -455,7 +527,7 @@ def _unit_descriptors() -> dict[str, dict]:
     return out
 
 
-def test_every_standalone_successor_unit_is_covered_or_retired(stack, tpl):
+def test_every_standalone_successor_unit_is_covered_or_retired(stack: Any, tpl: Any) -> None:
     """alpha-engine-config-I10753 closes-when, as an executable predicate.
 
     The issue's deliverable is per-unit prose ("a workload, or a recorded
@@ -527,7 +599,7 @@ def test_every_standalone_successor_unit_is_covered_or_retired(stack, tpl):
     # trading day, so a second grader is a second real claim, not a duplicate.
 
 
-def test_no_dependency_on_a_v1_pipeline(stack):
+def test_no_dependency_on_a_v1_pipeline(stack: Any) -> None:
     for path in (stack.TEMPLATE, stack.DEFINITION, HELPER_PATH, WORKFLOW):
         text = path.read_text(encoding="utf-8")
         for name in V1_PIPELINES:
@@ -540,7 +612,7 @@ def test_no_dependency_on_a_v1_pipeline(stack):
             assert refs == [], f"{path.name} references {name}: {refs}"
 
 
-def test_pause_manifest_disagreement_is_reported_both_ways(stack, tpl):
+def test_pause_manifest_disagreement_is_reported_both_ways(stack: Any, tpl: Any) -> None:
     sched = stack.schedules(tpl)
     empty = {"pending": {}, "paused": {}, "not_paused": {}}
     # One problem per schedule against a manifest naming none of them — DISABLED
@@ -556,7 +628,7 @@ def test_pause_manifest_disagreement_is_reported_both_ways(stack, tpl):
     assert any("still listed as pending/paused" in p for p in problems)
 
 
-def test_asl_checker_catches_a_dangling_transition(stack):
+def test_asl_checker_catches_a_dangling_transition(stack: Any) -> None:
     asl = json.loads(stack.DEFINITION.read_text(encoding="utf-8"))
     assert stack.asl_problems(asl) == []
     asl["States"]["Init"]["Next"] = "NoSuchState"
@@ -567,7 +639,7 @@ def test_asl_checker_catches_a_dangling_transition(stack):
     assert any("Nowhere" in p for p in problems)
 
 
-def test_the_definition_fails_loud_rather_than_skipping(stack):
+def test_the_definition_fails_loud_rather_than_skipping(stack: Any) -> None:
     """Collection has no downstream stage to protect, so unlike the v1 SFs'
     fail-open data-spot stages every failure path ends in a Fail state and a
     disabled dispatcher is a failure, never a skip."""
@@ -600,7 +672,7 @@ def test_the_definition_fails_loud_rather_than_skipping(stack):
     assert asl["States"]["NotifyCompletionFindings"]["Catch"][0]["Next"] == "CompletionFailureMode"
 
 
-def test_the_four_failure_modes_the_asl_switches_on_are_the_lambdas_own(stack):
+def test_the_four_failure_modes_the_asl_switches_on_are_the_lambdas_own(stack: Any) -> None:
     """The ASL's Choice arms and the shared predicate's precedence tuple are one
     list. Drift here is a mode that fails the execution as "unknown" rather than
     named. The tuple lives in data_gate/run_manifest_predicate.py since
@@ -619,7 +691,7 @@ def test_the_four_failure_modes_the_asl_switches_on_are_the_lambdas_own(stack):
     assert arms == modes
 
 
-def test_the_dispatcher_zip_carries_the_descriptors_it_grades(stack):
+def test_the_dispatcher_zip_carries_the_descriptors_it_grades(stack: Any) -> None:
     """A descriptor edit must reach the deployed function on the merge button
     alone: deploy.sh packages the loader and the descriptors, and the deploy
     workflow's path filter fires on them. Without the filter the Lambda would go
@@ -643,14 +715,14 @@ def test_the_dispatcher_zip_carries_the_descriptors_it_grades(stack):
             assert rel in paths, (workflow, rel)
 
 
-def test_yaml_aliases_are_refused(stack, tmp_path):
+def test_yaml_aliases_are_refused(stack: Any, tmp_path: Any) -> None:
     bad = tmp_path / "t.yaml"
     bad.write_text("Resources:\n  A: &x\n    Type: AWS::SNS::Topic\n  B: *x\n", encoding="utf-8")
     with pytest.raises(ValueError):
         stack.load_template(bad)
 
 
-def test_definition_key_is_content_addressed(stack, tmp_path):
+def test_definition_key_is_content_addressed(stack: Any, tmp_path: Any) -> None:
     a = tmp_path / "a.json"
     a.write_text("{}", encoding="utf-8")
     key1 = stack.definition_key(a)
@@ -661,22 +733,22 @@ def test_definition_key_is_content_addressed(stack, tmp_path):
 
 
 class _Cfn:
-    def __init__(self, status, tags):
+    def __init__(self: Any, status: Any, tags: Any) -> None:
         self._stack = {"StackStatus": status, "Tags": [{"Key": k, "Value": v} for k, v in tags.items()]}
 
-    def describe_stacks(self, StackName):  # noqa: N803 — boto3 kwarg
+    def describe_stacks(self: Any, StackName: Any):  # noqa -> Any: N803 — boto3 kwarg
         return {"Stacks": [self._stack]}
 
 
 class _Scheduler:
-    def __init__(self, overrides=None):
+    def __init__(self: Any, overrides: Any=None) -> None:
         self.overrides = overrides or {}
 
-    def get_schedule(self, GroupName, Name):  # noqa: N803 — boto3 kwarg
+    def get_schedule(self: Any, GroupName: Any, Name: Any):  # noqa -> Any: N803 — boto3 kwarg
         return self.overrides.get(Name, self._declared[Name])
 
 
-def _scheduler_matching(stack, tpl, **overrides):
+def _scheduler_matching(stack: Any, tpl: Any, **overrides: Any) -> Any:
     s = _Scheduler(overrides)
     s._declared = {
         x["name"]: {"State": x["declared_state"], "ScheduleExpression": x["expression"]}
@@ -685,13 +757,13 @@ def _scheduler_matching(stack, tpl, **overrides):
     return s
 
 
-def test_check_live_clean_when_live_matches(stack, tpl):
+def test_check_live_clean_when_live_matches(stack: Any, tpl: Any) -> None:
     f = stack.deploy_fields()
     cfn = _Cfn("UPDATE_COMPLETE", {k: f[k] for k in ("template-sha256", "definition-sha256")})
     assert stack.live_findings(cfn, _scheduler_matching(stack, tpl)) == []
 
 
-def test_check_live_reports_unapplied_template_and_console_flip(stack, tpl):
+def test_check_live_reports_unapplied_template_and_console_flip(stack: Any, tpl: Any) -> None:
     cfn = _Cfn("UPDATE_ROLLBACK_COMPLETE", {"template-sha256": "old", "definition-sha256": "old"})
     # The expression comes from the TEMPLATE, not a literal: this test is about
     # the console-flip (State) finding, and a hard-coded cron silently became a
@@ -715,7 +787,7 @@ def test_check_live_reports_unapplied_template_and_console_flip(stack, tpl):
     )
 
 
-def test_check_live_key_is_the_one_the_gate_reads(stack):
+def test_check_live_key_is_the_one_the_gate_reads(stack: Any) -> None:
     """The producer is a standalone script and imports nothing from data_gate,
     so the two spellings are pinned here (alpha-engine-config-I10870)."""
     from data_gate import evidence
@@ -725,20 +797,20 @@ def test_check_live_key_is_the_one_the_gate_reads(stack):
 
 
 class _S3:
-    def __init__(self, fail=False):
+    def __init__(self: Any, fail: Any=False) -> None:
         self.fail, self.puts = fail, []
 
-    def put_object(self, **kw):
+    def put_object(self: Any, **kw: Any) -> None:
         if self.fail:
             raise PermissionError("AccessDenied")
         self.puts.append(kw)
 
 
-def _fake_boto3(monkeypatch, *, cfn=None, sched=None, s3):
+def _fake_boto3(monkeypatch: Any, *, cfn: Any=None, sched: Any=None, s3: Any) -> None:
     import sys
     import types
 
-    def client(name):
+    def client(name: Any) -> Any:
         if name == "s3":
             return s3
         if name == "cloudformation":
@@ -751,7 +823,7 @@ def _fake_boto3(monkeypatch, *, cfn=None, sched=None, s3):
     monkeypatch.setenv("GITHUB_SHA", "b" * 40)
 
 
-def test_check_live_publishes_drift_and_still_exits_non_zero(stack, tpl, monkeypatch):
+def test_check_live_publishes_drift_and_still_exits_non_zero(stack: Any, tpl: Any, monkeypatch: Any) -> None:
     s3 = _S3()
     cfn = _Cfn("UPDATE_ROLLBACK_COMPLETE", {"template-sha256": "old", "definition-sha256": "old"})
     _fake_boto3(monkeypatch, cfn=cfn, sched=_scheduler_matching(stack, tpl), s3=s3)
@@ -763,7 +835,7 @@ def test_check_live_publishes_drift_and_still_exits_non_zero(stack, tpl, monkeyp
     assert doc["code_sha"] == "b" * 40 and doc["stack"] == stack.STACK_NAME
 
 
-def test_check_live_publishes_when_it_cannot_measure(stack, monkeypatch):
+def test_check_live_publishes_when_it_cannot_measure(stack: Any, monkeypatch: Any) -> None:
     s3 = _S3()
     _fake_boto3(monkeypatch, cfn=None, s3=s3)
     assert stack.main(["check-live"]) == 2
@@ -771,7 +843,7 @@ def test_check_live_publishes_when_it_cannot_measure(stack, monkeypatch):
     assert doc["measured"] is False and doc["in_sync"] is False and "AccessDenied" in doc["error"]
 
 
-def test_check_live_in_sync_publishes_and_a_failed_publish_is_loud(stack, tpl, monkeypatch):
+def test_check_live_in_sync_publishes_and_a_failed_publish_is_loud(stack: Any, tpl: Any, monkeypatch: Any) -> None:
     f = stack.deploy_fields()
     cfn = _Cfn("UPDATE_COMPLETE", {k: f[k] for k in ("template-sha256", "definition-sha256")})
     s3 = _S3()
@@ -782,23 +854,23 @@ def test_check_live_in_sync_publishes_and_a_failed_publish_is_loud(stack, tpl, m
     assert stack.main(["check-live"]) == 3
 
 
-def _workflow():
+def _workflow() -> Any:
     return yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
 
 
-def test_workflow_path_filters_match():
+def test_workflow_path_filters_match() -> None:
     on = _workflow()[True]  # PyYAML reads the bare `on` key as boolean True
     assert on["push"]["paths"] == on["pull_request"]["paths"]
     for p in on["push"]["paths"]:
         assert (REPO / p).exists(), p
 
 
-def test_only_this_workflow_assumes_the_stack_deploy_role():
+def test_only_this_workflow_assumes_the_stack_deploy_role() -> None:
     users = sorted(p.name for p in WORKFLOWS.glob("*.yml") if f"role/{NEW_ROLE}" in p.read_text(encoding="utf-8"))
     assert users == [WORKFLOW.name]
 
 
-def test_apply_runs_only_on_main_and_never_on_a_pull_request():
+def test_apply_runs_only_on_main_and_never_on_a_pull_request() -> None:
     jobs = _workflow()["jobs"]
     cond = jobs["deploy"]["if"]
     assert "refs/heads/main" in cond and "pull_request" not in cond
@@ -806,7 +878,7 @@ def test_apply_runs_only_on_main_and_never_on_a_pull_request():
     assert jobs["lint"].get("permissions", {}).get("id-token") is None
 
 
-def test_deploy_script_verifies_its_own_effect(stack):
+def test_deploy_script_verifies_its_own_effect(stack: Any) -> None:
     script = (REPO / "infrastructure" / "deploy-data-collection-stack.sh").read_text(encoding="utf-8")
     deploy_at = script.index("aws cloudformation deploy")
     assert "check-live" in script[deploy_at:], "a deploy must be followed by the live comparison"
@@ -834,7 +906,7 @@ _UNTAGGABLE = {"AWS::Scheduler::Schedule"}
 _COST_TAG = {"Key": "system", "Value": "data-collection"}
 
 
-def test_every_taggable_resource_carries_the_ruled_cost_attribution_tag(tpl):
+def test_every_taggable_resource_carries_the_ruled_cost_attribution_tag(tpl: Any) -> None:
     """alpha-engine-config-I10905 (ruled 2026-09-28): the fleet attributes cost
     by `system`, value = the component. An untagged resource is missing from the
     monthly cost row's denominator (`data.cost.monthly`), and a `component` tag
@@ -851,13 +923,13 @@ def test_every_taggable_resource_carries_the_ruled_cost_attribution_tag(tpl):
     assert not bad, bad
 
 
-def test_deploy_script_tags_the_stack_with_the_ruled_key():
+def test_deploy_script_tags_the_stack_with_the_ruled_key() -> None:
     text = (REPO / "infrastructure" / "deploy-data-collection-stack.sh").read_text()
     assert "system=data-collection" in text
     assert "component=" not in text
 
 
-def test_daily_heal_runs_on_trading_days_only(stack, tpl):
+def test_daily_heal_runs_on_trading_days_only(stack: Any, tpl: Any) -> None:
     """alpha-engine-config-I11812. The heal targets the previous trading day, so
     a weekday-holiday run would re-heal a day already healed, publish no
     `staging/daily_closes/*` key and fail VerifyRunManifests over a run that
@@ -883,7 +955,7 @@ _EOD_BACKSTOP_DEPLOY = REPO / "infrastructure" / "lambdas" / "eod-backstop" / "d
 _EOD_RECONCILE_SF = REPO / "infrastructure" / "step_function_eod_reconcile.json"
 
 
-def _machine_names(tpl) -> dict[str, str]:
+def _machine_names(tpl: Any) -> dict[str, str]:
     return {
         logical: res["Properties"]["StateMachineName"]
         for logical, res in tpl["Resources"].items()
@@ -891,7 +963,7 @@ def _machine_names(tpl) -> dict[str, str]:
     }
 
 
-def test_the_reconcile_trigger_chain_cannot_include_the_panel(stack, tpl):
+def test_the_reconcile_trigger_chain_cannot_include_the_panel(stack: Any, tpl: Any) -> None:
     names = _machine_names(tpl)
     # 1. The reconcile's trigger keys on exactly one machine: ne-data-collection-eod.
     text = _EOD_BACKSTOP_DEPLOY.read_text(encoding="utf-8")
@@ -924,7 +996,7 @@ def test_the_reconcile_trigger_chain_cannot_include_the_panel(stack, tpl):
     assert rule["declared_state"] == "ENABLED"
 
 
-def test_the_panel_machine_fits_its_ceiling(stack, tpl):
+def test_the_panel_machine_fits_its_ceiling(stack: Any, tpl: Any) -> None:
     rule = next(r for r in stack.event_rules(tpl) if r["name"] == "ne-data-collection-panel-on-eod")
     ceiling = json.loads(stack.DEFINITION.read_text(encoding="utf-8"))["TimeoutSeconds"]
     assert stack.worst_case_seconds(rule["input"]["workloads"], through="daily-panel") <= ceiling
@@ -940,8 +1012,8 @@ def test_the_panel_machine_fits_its_ceiling(stack, tpl):
     ],
 )
 def test_d48_d49_run_in_their_own_executions_after_their_source_succeeds(
-    stack, tpl, rule_name, source, workload, unit
-):
+    stack: Any, tpl: Any, rule_name: Any, source: Any, workload: Any, unit: Any
+) -> None:
     """alpha-engine-config-I11306. D48 needs that day's closes in ArcticDB, so
     it follows the EOD collection's SUCCEEDED; D49 needs D10's fundamentals
     archive, so it follows the weekly collection's. Each is its OWN execution
@@ -964,20 +1036,20 @@ def test_d48_d49_run_in_their_own_executions_after_their_source_succeeds(
     assert stack.worst_case_seconds(rule["input"]["workloads"], through=workload) <= ceiling
 
 
-def test_lint_holds_rules_to_the_schedule_contract(stack, monkeypatch):
+def test_lint_holds_rules_to_the_schedule_contract(stack: Any, monkeypatch: Any) -> None:
     real_loader = stack.load_template
 
-    def _mutate(fn):
+    def _mutate(fn: Any) -> Any:
         base = real_loader()
         fn(base["Resources"]["PanelOnEodSucceededRule"]["Properties"])
         return base
 
-    def _bad_workload(p):
+    def _bad_workload(p: Any) -> None:
         payload = json.loads(p["Targets"][0]["Input"])
         payload["workloads"] = ["no-such-workload"]
         p["Targets"][0]["Input"] = json.dumps(payload)
 
-    def _self_start(p):
+    def _self_start(p: Any) -> None:
         p["Targets"][0]["Arn"] = {"Ref": "EodStateMachine"}
 
     monkeypatch.setattr(stack, "load_template", lambda *a, **k: _mutate(_bad_workload))
@@ -989,7 +1061,7 @@ def test_lint_holds_rules_to_the_schedule_contract(stack, monkeypatch):
     ) == ["rule x-rule: declared ENABLED but not in automation_pause.json not_paused"]
 
 
-def test_check_live_reads_the_resolved_targets_region(stack, monkeypatch):
+def test_check_live_reads_the_resolved_targets_region(stack: Any, monkeypatch: Any) -> None:
     # codex 7b153118c1d38fac: the clients took no region, so check-live measured
     # the caller's default region instead of the target's.
     import sys
@@ -997,7 +1069,7 @@ def test_check_live_reads_the_resolved_targets_region(stack, monkeypatch):
 
     seen: dict[str, dict] = {}
 
-    def client(name, **kw):
+    def client(name: Any, **kw: Any) -> Any:
         seen[name] = kw
         return _S3()  # live_findings then fails on it; measured=false, exit 2
 
