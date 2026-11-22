@@ -3,11 +3,9 @@
 > Part of [**Crucible**](https://nousergon.ai) — a [Nous Ergon](https://nousergon.ai) product: a harness for rigorous AI/ML experiments in finance, an equity research-and-trading system instrumented end-to-end. Repo and S3 names use the underlying project codename `alpha-engine`.
 
 [![Part of Crucible](https://img.shields.io/badge/Part_of-Crucible-1a73e8?style=flat-square)](https://nousergon.ai)
-[![Python](https://img.shields.io/badge/python-3.13+-blue?style=flat-square)](https://www.python.org/)
 [![ArcticDB](https://img.shields.io/badge/ArcticDB-0e1117?style=flat-square)](https://docs.arcticdb.io/)
 [![Polygon.io](https://img.shields.io/badge/Polygon.io-1a73e8?style=flat-square)](https://polygon.io/)
-[![License: AGPL-3.0-only](https://img.shields.io/badge/License-AGPL--3.0--only-yellow?style=flat-square)](LICENSE)
-[![Phase 2 · Reliability](https://img.shields.io/badge/Phase_2-Reliability-e9c46a?style=flat-square)](https://github.com/nousergon/nousergon-docs#phase-trajectory)
+[![License](https://img.shields.io/github/license/nousergon/nousergon-data?style=flat-square)](LICENSE)
 
 Centralized data collection, storage, and distribution. Owns the price universe (ArcticDB), macro indicators, universe returns, the engineered feature store, the RAG ingestion step, and per-ticker alternative data.
 
@@ -57,6 +55,18 @@ Quality gates run automatically after each refresh: OHLC ordering, zero-price, e
 ## Configuration
 
 This repo is **public**. `config.yaml` is gitignored locally; real values (S3 bucket names, API keys, email recipients) live in the private [`alpha-engine-config`](https://github.com/nousergon/alpha-engine-config) repo. Architecture and approach are public; specific values are private.
+
+## Development and testing
+
+This project is the data-collection, storage, and distribution component of
+Crucible. It exists to give downstream research and execution components a
+validated, freshness-tracked source of market, macro, feature, filing, and
+alternative data.
+
+Run a local dry collection with
+`python weekly_collector.py --phase 1 --dry-run`. Run the test suite with
+`pytest tests/`. See [`OVERVIEW.md`](OVERVIEW.md) for the code index, run modes,
+storage layout, and further operational documentation.
 
 ## Sister repos
 
