@@ -121,6 +121,7 @@ def _provenance_note(installed: str | None, pinned: str | None) -> str:
         f"tracked as alpha-engine-config-I9070.)\n\n"
     )
 
+
 _SF_JSON_FILES = [
     ("Saturday", REPO_ROOT / "infrastructure" / "step_function.json"),
     ("Weekday", REPO_ROOT / "infrastructure" / "step_function_daily.json"),
@@ -161,7 +162,9 @@ def _all_substantive_states(json_path: Path) -> set:
 
 
 @pytest.mark.parametrize("label,json_path", _SF_JSON_FILES)
-def test_every_substantive_state_has_registry_entry(label, json_path):
+def test_every_substantive_state_has_registry_entry(
+    label: str, json_path: Path
+) -> None:
     """The load-bearing cross-repo invariant, enforced from the SOURCE side
     (config#2480) so the PR that introduces a new substantive Task state
     fails here instead of days/weeks later as a dashboard "Registry drift"
@@ -178,7 +181,8 @@ def test_every_substantive_state_has_registry_entry(label, json_path):
     missing = substantive - set(STATE_TO_ARCHIVE_PAGE.keys())
 
     assert not missing, _provenance_note(
-        _installed_lib_version(), _pinned_lib_version((REPO_ROOT / "requirements.txt").read_text())
+        _installed_lib_version(),
+        _pinned_lib_version((REPO_ROOT / "requirements.txt").read_text()),
     ) + (
         f"{label} SF ({json_path.relative_to(REPO_ROOT)}) has {len(missing)} "
         f"substantive Task state(s) NOT in "
@@ -190,12 +194,18 @@ def test_every_substantive_state_has_registry_entry(label, json_path):
         f"the single version writer — config-I2716 — and version-bump-check.yml "
         f"FORBIDS version edits inside a lib PR), then bump this "
         f"repo's requirements.txt pin in the SAME PR that adds the state — "
-        f"do not merge the SF JSON change ahead of the registry entry."
+        f"do not merge the SF JSON change ahead of the new registry key. "
+        f"For removals or renames, keep the old registry key until AFTER the "
+        f"consuming SF change merges: a lib pin bump can carry a premature "
+        f"removal or rename just as easily as an addition. Registry editors "
+        f"must use the additive-then-subtractive protocol."
     )
 
 
 @pytest.mark.parametrize("label,json_path", _SF_JSON_FILES)
-def test_wait_companions_in_json_are_in_wait_grouping(label, json_path):
+def test_wait_companions_in_json_are_in_wait_grouping(
+    label: str, json_path: Path
+) -> None:
     """Every state named ``WaitFor*`` in the SF JSON must appear in
     WAIT_GROUPING — otherwise it would render as its own row instead of
     rolling into its parent. Verbatim port of the dashboard test's
@@ -222,7 +232,8 @@ def test_wait_companions_in_json_are_in_wait_grouping(label, json_path):
     missing = wait_states - set(WAIT_GROUPING.keys())
 
     assert not missing, _provenance_note(
-        _installed_lib_version(), _pinned_lib_version((REPO_ROOT / "requirements.txt").read_text())
+        _installed_lib_version(),
+        _pinned_lib_version((REPO_ROOT / "requirements.txt").read_text()),
     ) + (
         f"{label} SF has {len(missing)} ``WaitFor*`` state(s) NOT in "
         f"nousergon_lib.pipeline_status.registry.WAIT_GROUPING: "
@@ -232,7 +243,7 @@ def test_wait_companions_in_json_are_in_wait_grouping(label, json_path):
     )
 
 
-def test_groom_sf_registry_coverage_visibility():
+def test_groom_sf_registry_coverage_visibility() -> None:
     """Non-blocking visibility check for the groom-pipeline SF (never
     covered by crucible-dashboard's test). Reports current registry
     coverage rather than asserting, since the groom SF has pre-existing
@@ -323,7 +334,9 @@ def test_unreadable_provenance_produces_no_qualifier() -> None:
     assert _provenance_note("v0.124.96", None) == ""
 
 
-def test_real_drift_still_fails_loudly_when_versions_match(monkeypatch) -> None:
+def test_real_drift_still_fails_loudly_when_versions_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The other half. Inject a substantive Task state that no registry entry
     covers, with installed == pinned, and assert the check still fails AND still
     names the offending state. Without this, the change could have turned a real
@@ -353,7 +366,7 @@ def test_real_drift_still_fails_loudly_when_versions_match(monkeypatch) -> None:
 
 
 def test_the_real_assertion_renders_the_qualifier_under_a_stale_install(
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """End-to-end, through the REAL assertion — not the helper in isolation.
 
@@ -392,7 +405,9 @@ def test_the_real_assertion_renders_the_qualifier_under_a_stale_install(
     )
 
 
-def test_the_real_assertion_accuses_the_sf_when_versions_match(monkeypatch) -> None:
+def test_the_real_assertion_accuses_the_sf_when_versions_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """And the inverse: with the clocks in lockstep, a genuine gap must produce
     the original, correct accusation with no hedge in front of it."""
     label, json_path = _SF_JSON_FILES[0]
@@ -417,3 +432,10 @@ def test_the_real_assertion_accuses_the_sf_when_versions_match(monkeypatch) -> N
         f"a version qualifier appeared with the versions in lockstep:\n{rendered}"
     )
     assert dropped in rendered and "STATE_TO_ARCHIVE_PAGE" in rendered, rendered
+    assert "do not merge the SF JSON change ahead of the new registry key" in rendered
+    assert (
+        "keep the old registry key until AFTER the consuming SF change merges"
+        in rendered
+    )
+    assert "a lib pin bump can carry a premature removal or rename" in rendered
+    assert "additive-then-subtractive protocol" in rendered
