@@ -64,12 +64,7 @@ _DECLARED_CARVE_OUTS = {
 #     migrated onto deploy_run.sh / run_handler_tests.sh / apply_iam_policy.sh,
 #     and tests/test_thinktank_deploy_uses_shared_helpers.py EXECUTES the result
 #     against a fake `aws` to prove the code-only path reaches no IAM write.
-#   weekly-freshness-spot-dispatcher — nousergon-data#1562 (draft) is editing
-#     this exact deploy.sh; a second concurrent edit to it would collide.
-#     Tracked: alpha-engine-config-I9115.
-_TRACKED_UNGATED = {
-    "weekly-freshness-spot-dispatcher",
-}
+_TRACKED_UNGATED: set[str] = set()
 
 # A hand-rolled gate is any direct `python3 -m pytest` invocation inside a
 # deploy.sh. The helper is the only sanctioned way to reach pytest from one.
