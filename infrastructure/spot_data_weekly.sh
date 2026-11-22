@@ -155,6 +155,17 @@ _STAGE_WINDOW_TRACKS_CYCLE=1
 # path is the only assignment (2026-07-18: the missing default killed every
 # SF-driven rag-only dispatch with "MAX_RUNTIME_EXPLICIT: unbound variable").
 MAX_RUNTIME_EXPLICIT="${MAX_RUNTIME_EXPLICIT:-0}"
+# RUN_TOKEN is the SF execution name, exported to this launcher by
+# krepis.ssm_log_capture (empty on an ad-hoc run). Declared here, in the
+# DISPATCHING shell, because the phase2-only heredoc forwards it on purpose:
+# its `export RUN_TOKEN=$(printf '%q' "${RUN_TOKEN:-}")` line expands HERE,
+# before SSM ships the body. The shared heredoc detector
+# (nousergon_lib.shell_contracts, tests/test_shared_heredoc_expansion.py)
+# reads a variable assigned only inside a heredoc as a lost worker-local, so
+# this assignment is what marks the expansion as a dispatcher-side injection.
+# Behaviour is unchanged: every read of it is `${RUN_TOKEN:-...}` or `-n`, and
+# an unset token stays unexported to child processes.
+RUN_TOKEN="${RUN_TOKEN:-}"
 # ── Spot-interruption resilience (2026-05-30 incident) ──────────────────────
 # The Saturday SF DataPhase1 failed when this run's nested spot
 # (i-02e498e018441751f, c5.large/us-east-1a) was reclaimed by AWS *mid-

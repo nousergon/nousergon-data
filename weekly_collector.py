@@ -41,10 +41,13 @@ import logging
 import os
 import signal
 import time
-from contextlib import contextmanager, nullcontext
+from collections.abc import Callable, Generator
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
+from types import FrameType
+from typing import Any, NoReturn, cast
 
 import boto3
 import yaml
@@ -82,7 +85,7 @@ _load_dotenv()
 # Module-top so import-time errors in the collectors block below are also
 # captured by flow-doctor's ERROR handler.
 from nousergon_lib.logging import setup_logging, guard_entrypoint, get_flow_doctor
-from nousergon_lib.phase_registry import PhaseRegistry
+from nousergon_lib.phase_registry import PhaseContext, PhaseRegistry
 from shadow.root import active_root as _active_shadow_root  # I10891: run state under a shadow root
 from shadow.run_state import RunStatePhaseRegistry
 # Canonical experiment-package config resolver (alpha-engine-config#1157): the
@@ -142,7 +145,7 @@ from validators import expectations
 logger = logging.getLogger(__name__)
 
 
-def load_config(path: str = "config.yaml") -> dict:
+def load_config(path: str = "config.yaml") -> _ResultDict:
     """Load config.yaml, experiment-package first (config#1042).
 
     Search order mirrors features/feature_engineer.py::_load_feature_cfg_overrides:
@@ -166,7 +169,7 @@ def load_config(path: str = "config.yaml") -> dict:
         return yaml.safe_load(f)
 
 
-def _load_chronic_polygon_gaps(config: dict) -> list[str]:
+def _load_chronic_polygon_gaps(config: _ResultDict) -> list[str]:
     """Return the sorted list of chronic-polygon-gap tickers from config.
 
     Empty list when the config section is missing or malformed: the
@@ -256,7 +259,7 @@ _DEGRADED_DEFECT_REGISTRY: dict[str, dict[str, str]] = {
 _EOD_NON_HALTING_PHASES: frozenset[str] = frozenset({"metron_macro_data"})
 
 
-def _aggregate_daily_status(collectors: dict) -> tuple[str, list[str]]:
+def _aggregate_daily_status(collectors: _ResultDict) -> tuple[str, list[str]]:
     """The EOD daily run's status from its per-collector results.
 
     Returns ``(status, degraded_collectors)``:
@@ -285,7 +288,7 @@ def _aggregate_daily_status(collectors: dict) -> tuple[str, list[str]]:
     return "ok", []
 
 
-def _write_guard_skip_record(path: str, results: dict) -> None:
+def _write_guard_skip_record(path: str, results: _ResultDict) -> None:
     """Record, for the stage launcher, that this run's own guard skipped it.
 
     alpha-engine-config-I11474: MorningEnrich's stale-overwrite guard returns
@@ -315,7 +318,7 @@ def _write_guard_skip_record(path: str, results: dict) -> None:
     logger.info("guard-skip record written to %s: %s", target, reason)
 
 
-def _describe_degraded_defects(results: dict) -> str:
+def _describe_degraded_defects(results: _ResultDict) -> str:
     """Build the `Defect detail: ...` clause of the DEGRADED alert.
 
     Pulled out of ``main()`` so it can be unit-tested without driving the
@@ -359,12 +362,16 @@ def _describe_degraded_defects(results: dict) -> str:
     return " | ".join(lines) or "no detail available"
 
 
+#: A collector's result dict: heterogeneous JSON-shaped values by design.
+_ResultDict = dict[str, Any]  # pyright: ignore[reportExplicitAny]
+
+
 class _CollectorError(RuntimeError):
     """Raised inside a phase block when a collector returns ``status=error`` so the
     phase writes an ``error`` marker (→ a recovery RE-RUNS it) instead of a lying
     ``ok`` marker. Caught at the call site to preserve best-effort-continue."""
 
-    def __init__(self, name: str, detail, result: dict | None = None) -> None:
+    def __init__(self, name: str, detail: object, result: _ResultDict | None = None) -> None:
         super().__init__(f"{name}: {detail}")
         self.detail = detail
         #: The collector's own result dict, when it produced one before failing.
@@ -403,7 +410,7 @@ class _DegradedRun(RuntimeError):
     were.
     """
 
-    def __init__(self, name: str, result: dict) -> None:
+    def __init__(self, name: str, result: _ResultDict) -> None:
         detail = result.get("error") or result.get("detail") or result.get("reason") or "no detail reported"
         kind = "DEGRADED" if result.get("status") == "degraded" else "PARTIAL"
         super().__init__(f"{name} produced a {kind} artifact: {detail}")
@@ -435,7 +442,7 @@ class _MarkerNotOk(Exception):
     marker does, and a retry now recomputes the phase instead of skipping it.
     """
 
-    def __init__(self, name: str, result: dict) -> None:
+    def __init__(self, name: str, result: _ResultDict) -> None:
         detail = result.get("error") or result.get("detail") or result.get("reason") or ""
         super().__init__(
             f"{name} finished with status={result.get('status')!r}, which is not ok — "
@@ -460,7 +467,7 @@ class _GuardRejectedPublish(_MarkerNotOk):
     raises it: there the verdict has no consequence, by definition.
     """
 
-    def __init__(self, name: str, result: dict, detail: str) -> None:
+    def __init__(self, name: str, result: _ResultDict, detail: str) -> None:
         Exception.__init__(
             self,
             f"{name}: enforcing empty_fresh guard rejected this publish — marker withheld so a "
@@ -490,7 +497,7 @@ class _PhaseNotApplicable(run_manifest.NotApplicable):
     honest, the exit code does not move.
     """
 
-    def __init__(self, name: str, result: dict, reason: str, detail: str) -> None:
+    def __init__(self, name: str, result: _ResultDict, reason: str, detail: str) -> None:
         super().__init__(reason, detail)
         self.name = name
         self.result = result
@@ -592,7 +599,7 @@ def _record_swallowed_step(step: str, detail: str, *, unit_id: str | None = None
     )
 
 
-def _build_registry(config: dict, args: argparse.Namespace, date: str) -> "PhaseRegistry | None":
+def _build_registry(config: _ResultDict, args: argparse.Namespace, date: str) -> "PhaseRegistry | None":
     """Construct a per-date :class:`PhaseRegistry` for marker-based skip/resume +
     watchdog (L4528 — data is the 2nd consumer of the lib phase framework, after
     the backtester), or ``None`` in dry-run.
@@ -664,7 +671,7 @@ def _s3_object_exists(bucket: str, key: str) -> bool:
         raise
 
 
-def _rows_out(result: dict, rows_key: str | None) -> int | None:
+def _rows_out(result: _ResultDict, rows_key: str | None) -> int | None:
     """The row count this collector reported, or ``None`` when it reports none.
 
     ``None`` is never coerced to 0: "the collector did not count" and "the
@@ -727,10 +734,10 @@ def _feature_group_extra_outputs(run_date: str) -> tuple[tuple[str, object, obje
     from ``groups_written`` had no columns available this run (writer.py:60) and
     is correctly NOT recorded — never a copy of the descriptor's 5-entry list
     regardless of what actually landed on S3 (alpha-engine-config-I10855)."""
-    def _present(group: str):
+    def _present(group: str) -> Callable[[_ResultDict], bool]:
         return lambda r: group in (r.get("groups_written") or {})
 
-    def _rows(group: str):
+    def _rows(group: str) -> Callable[[_ResultDict], int]:
         return lambda r: (r.get("groups_written") or {}).get(group) or 0
 
     return tuple(
@@ -771,10 +778,10 @@ def _prices_extra_outputs(s3_prefix: str) -> tuple[tuple[object, object, object]
     because the key SET is per-run; ``rows_fn`` returns the
     ``{key: rows}`` mapping so each key is graded on ITS OWN count, not the
     batch's aggregate ``refreshed``."""
-    def _keys(r: dict) -> list[str]:
+    def _keys(r: _ResultDict) -> list[str]:
         return list(prices.written_keys(r, s3_prefix))
 
-    def _rows(r: dict) -> dict[str, int]:
+    def _rows(r: _ResultDict) -> dict[str, int]:
         return prices.written_keys(r, s3_prefix)
 
     return (
@@ -790,10 +797,10 @@ def _fred_history_extra_outputs(s3_prefix: str) -> tuple[tuple[object, object, o
     all landed at 23:05, so I11011 filed it ``failed``). Same shape as
     :func:`_prices_extra_outputs`: the key SET comes from what the run wrote
     (``fred_history.written_keys``), never from the requested series list."""
-    def _keys(r: dict) -> list[str]:
+    def _keys(r: _ResultDict) -> list[str]:
         return list(fred_history.written_keys(r, s3_prefix))
 
-    def _rows(r: dict) -> dict[str, int]:
+    def _rows(r: _ResultDict) -> dict[str, int]:
         return fred_history.written_keys(r, s3_prefix)
 
     return (
@@ -808,10 +815,10 @@ def _signal_returns_extra_outputs() -> tuple[tuple[object, object, object], ...]
     when the run wrote no rows and so uploaded nothing. Each is recorded with
     ``total_written``, the rows this run changed in the database (the same
     convention D08's ``research.db`` outputs use with ``rows_inserted``)."""
-    def _present(field: str):
+    def _present(field: str) -> Callable[[_ResultDict], bool]:
         return lambda r: bool((r.get("db_upload") or {}).get(field))
 
-    def _key(field: str):
+    def _key(field: str) -> Callable[[_ResultDict], list[str]]:
         return lambda r: [(r.get("db_upload") or {})[field]]
 
     return tuple(
@@ -872,7 +879,7 @@ def _check_arctic_library_output(unit_id: str, key: str, rows: int) -> "expectat
     )
 
 
-def _run_manifest_context(reg: "PhaseRegistry", unit: run_units.PhaseUnit) -> dict:
+def _run_manifest_context(reg: "PhaseRegistry", unit: run_units.PhaseUnit) -> _ResultDict:
     """The per-run manifest arguments shared by every wrapped call site here."""
     return {
         "sink": run_units.manifest_sink(reg.bucket, reg.s3_client),
@@ -885,14 +892,14 @@ def _run_manifest_context(reg: "PhaseRegistry", unit: run_units.PhaseUnit) -> di
 def _phase_collect(
     reg: "PhaseRegistry | None",
     name: str,
-    run_fn,
+    run_fn: Callable[[], _ResultDict],
     *,
     artifact_key: str | None = None,
     extra_outputs: tuple[tuple[str, object, object], ...] = (),
     supports_auto_skip: bool = True,
     verify_artifact_exists: bool = False,
     bucket: str | None = None,
-) -> dict:
+) -> _ResultDict:
     """Run a collector under the phase registry (markers + L4524 artifact-validated
     auto-skip + watchdog), preserving the module's best-effort-continue posture.
 
@@ -946,9 +953,9 @@ def _phase_collect(
     # wiring them per call site is how a unit ends up unobserved on the one day
     # someone adds a collector in a hurry.
     unit = run_units.unit_for(reg.data_mode, name)
-    captured: dict = {}
+    captured: _ResultDict = {}
 
-    def _withhold_marker_if_rejected(result: dict) -> None:
+    def _withhold_marker_if_rejected(result: _ResultDict) -> None:
         # `alpha-engine-config-I10786` (P-19): an ENFORCING empty_fresh guard
         # must reject the publish BEFORE the phase marker says `ok`, or the
         # retry auto-skips the artifact it just refused (`_GuardRejectedPublish`).
@@ -964,7 +971,7 @@ def _phase_collect(
         if not worst.clean:
             raise _GuardRejectedPublish(name, result, worst.detail)
 
-    def _body(run_ctx) -> dict:
+    def _body(run_ctx: run_manifest.UnitRun) -> _ResultDict:
         try:
             result = _phase_body(
                 reg,
@@ -991,7 +998,7 @@ def _phase_collect(
         return result
 
     try:
-        run_result = run_manifest.run_unit(
+        run_result: run_manifest.UnitRunResult[_ResultDict] = run_manifest.run_unit(
             unit.unit_id, _body, **_run_manifest_context(reg, unit)
         )
         # `run_unit` does not re-raise `NotApplicable` — it records the declared
@@ -999,7 +1006,7 @@ def _phase_collect(
         # collector's own result dict, so the captured one is returned rather
         # than the wrapper's None (the same restoration `_run_whole_mode_unit`
         # makes, for the same reason).
-        if run_result.status == "not_applicable":
+        if run_result.status == "not_applicable" or run_result.value is None:
             return captured["result"]
         return run_result.value
     except run_units.EmptyProduction:
@@ -1034,7 +1041,7 @@ def _phase_not_run(
     *,
     reason: str,
     applicable: bool,
-) -> dict:
+) -> _ResultDict:
     """Record a phase that did NOT run, and return the caller's status dict.
 
     `alpha-engine-config-I10784` (P-17). Before this existed, every one of these
@@ -1072,7 +1079,7 @@ def _phase_not_run(
 
     unit = run_units.unit_for(reg.data_mode, name)
 
-    def _body(run_ctx) -> dict:
+    def _body(run_ctx: run_manifest.UnitRun) -> _ResultDict:
         run_ctx.record_guard(
             expectations.EMPTY_FRESH_GUARD.name,
             mode=expectations.EMPTY_FRESH_GUARD.mode.value,
@@ -1097,10 +1104,10 @@ def _phase_not_run(
 
 
 def _record_phase_lineage(
-    run_ctx,
+    run_ctx: run_manifest.UnitRun,
     unit: run_units.PhaseUnit,
     name: str,
-    result: dict,
+    result: _ResultDict,
     artifact_key: str | None,
     bucket: str | None,
     reg: "PhaseRegistry",
@@ -1281,7 +1288,7 @@ def _record_phase_lineage(
 
 
 def _extra_writes(
-    result: dict, extra_outputs: tuple[tuple[str, object, object], ...]
+    result: _ResultDict, extra_outputs: tuple[tuple[str, object, object], ...]
 ) -> list[tuple[str, int]]:
     """Every extra key this run actually wrote, paired with its measured rows.
 
@@ -1398,7 +1405,7 @@ def _prior_same_date_ok_manifest(reg: "PhaseRegistry", unit_id: str) -> str | No
     return None
 
 
-def _record_collector_guards(run_ctx, result: dict) -> None:
+def _record_collector_guards(run_ctx: run_manifest.UnitRun, result: _ResultDict) -> None:
     """Fold guard readings a COLLECTOR graded itself onto its run manifest.
 
     `alpha-engine-config-I10827`. Most guards on this board are evaluated here,
@@ -1430,7 +1437,7 @@ def _record_collector_guards(run_ctx, result: dict) -> None:
         run_ctx.record_metric(metric)
 
 
-def _with_bar_settlement(result: dict, *, fetched_at, run_date: str, keys: tuple[str, ...]) -> dict:
+def _with_bar_settlement(result: dict, *, fetched_at: datetime, run_date: str, keys: tuple[str, ...]) -> _ResultDict:
     """``result`` with one `bar_settlement` guard entry per written key.
 
     `alpha-engine-config-I11203`. The same observe-mode reading D03/D19 already
@@ -1451,7 +1458,7 @@ def _with_bar_settlement(result: dict, *, fetched_at, run_date: str, keys: tuple
     return stamped
 
 
-def _record_rejections(run_ctx, result: dict, pairs: tuple[tuple[str, str], ...]) -> None:
+def _record_rejections(run_ctx: run_manifest.UnitRun, result: _ResultDict, pairs: tuple[tuple[str, str], ...]) -> None:
     """Fold a collector's own not-published counts onto its manifest, by reason.
 
     `alpha-engine-config-I10810` deliverable 2. A count that is absent, is not a
@@ -1478,14 +1485,14 @@ def _record_rejections(run_ctx, result: dict, pairs: tuple[tuple[str, str], ...]
 def _phase_body(
     reg: "PhaseRegistry",
     name: str,
-    run_fn,
+    run_fn: Callable[[], _ResultDict],
     *,
     artifact_key: str | None,
     supports_auto_skip: bool,
     verify_artifact_exists: bool,
     bucket: str | None,
-    before_marker=None,
-) -> dict:
+    before_marker: Callable[[_ResultDict], None] | None = None,
+) -> _ResultDict:
     """The phase-registry half of :func:`_phase_collect`.
 
     Split out so it RAISES rather than returning an error dict: the run-manifest
@@ -1514,14 +1521,14 @@ def _phase_body(
 def _phase_body_marked(
     reg: "PhaseRegistry",
     name: str,
-    run_fn,
+    run_fn: Callable[[], _ResultDict],
     *,
     artifact_key: str | None,
     supports_auto_skip: bool,
     verify_artifact_exists: bool,
     bucket: str | None,
-    before_marker=None,
-) -> dict:
+    before_marker: Callable[[_ResultDict], None] | None = None,
+) -> _ResultDict:
     """:func:`_phase_body`'s work, inside the phase marker's context manager.
 
     ``before_marker(result)``, when given, runs last inside the block, after
@@ -1596,7 +1603,9 @@ def _phase_body_marked(
         return result
 
 
-def _maybe_phase(reg: "PhaseRegistry | None", name: str, **log_ctx):
+def _maybe_phase(
+    reg: "PhaseRegistry | None", name: str, **log_ctx: object
+) -> AbstractContextManager[PhaseContext | None]:
     """Marker-only phase wrapper (watchdog + START/END marker, no auto-skip) for
     steps whose body manages its own hard-fail/best-effort posture inline —
     MorningEnrich's preflight/append/self-heal. Returns the registry's phase
@@ -1617,7 +1626,9 @@ def _maybe_phase(reg: "PhaseRegistry | None", name: str, **log_ctx):
 _CLASSIFIED_SKIP_REASONS: tuple[str, ...] = ("stale_overwrite", "already_regraded")
 
 
-def _run_whole_mode_unit(mode: str, fn, config: dict, args: argparse.Namespace) -> dict:
+def _run_whole_mode_unit(
+    mode: str, fn: Callable[[_ResultDict, argparse.Namespace], _ResultDict], config: _ResultDict, args: argparse.Namespace
+) -> _ResultDict:
     """Run a whole-mode unit under the run-manifest wrapper.
 
     Five of this module's run modes ARE one audit unit end to end — morning
@@ -1661,9 +1672,9 @@ def _run_whole_mode_unit(mode: str, fn, config: dict, args: argparse.Namespace) 
     if getattr(args, "dry_run", False):
         return fn(config, args)
 
-    captured: dict = {}
+    captured: _ResultDict = {}
 
-    def _body(run_ctx) -> dict:
+    def _body(run_ctx: run_manifest.UnitRun) -> _ResultDict:
         token = _CURRENT_RUN_CTX.set(run_ctx)
         try:
             result = fn(config, args)
@@ -1728,7 +1739,7 @@ def _run_whole_mode_unit(mode: str, fn, config: dict, args: argparse.Namespace) 
         return result
 
     try:
-        run_result = run_manifest.run_unit(
+        run_result: run_manifest.UnitRunResult[_ResultDict] = run_manifest.run_unit(
             unit_id,
             _body,
             sink=run_units.manifest_sink(config["bucket"]),
@@ -1740,7 +1751,7 @@ def _run_whole_mode_unit(mode: str, fn, config: dict, args: argparse.Namespace) 
         # and returns with `value=None`. The caller's contract is the mode's own
         # result dict, so the captured one is returned rather than the wrapper's
         # None, which would turn an honest non-run into an AttributeError.
-        if run_result.status == "not_applicable":
+        if run_result.status == "not_applicable" or run_result.value is None:
             return captured["result"]
         return run_result.value
     except run_units.EmptyProduction:
@@ -1755,7 +1766,7 @@ def _run_whole_mode_unit(mode: str, fn, config: dict, args: argparse.Namespace) 
         return captured["result"]
 
 
-def _daily_heal_daily_closes_keys(result: dict) -> list[str]:
+def _daily_heal_daily_closes_keys(result: _ResultDict) -> list[str]:
     """The ``staging/daily_closes/{day}.parquet`` keys D33's universe-gap heal
     actually staged this run — one per entry in
     ``collectors.universe_gap_heal.healed_days``, never a copy of the
@@ -1771,7 +1782,7 @@ def _daily_heal_daily_closes_keys(result: dict) -> list[str]:
     return [f"staging/daily_closes/{d}.parquet" for d in dates if d]
 
 
-def _chronic_gap_heal_price_cache_keys(result: dict) -> list[str]:
+def _chronic_gap_heal_price_cache_keys(result: _ResultDict) -> list[str]:
     """The ``reference/price_cache/{ticker}.parquet`` keys D34's chronic-gap
     self-heal actually wrote this run (``_self_heal_chronic_polygon_gaps`` via
     ``_price_cache_write_prefixes`` — never ``staging/daily_closes``, which
@@ -1827,18 +1838,18 @@ _MODE_INPUT_COLLECTORS: dict[str, tuple[str, ...]] = {
 }
 
 
-def _mode_collector_guards(mode: str, result: dict | None) -> list[dict]:
+def _mode_collector_guards(mode: str, result: _ResultDict | None) -> list[_ResultDict]:
     """The guard entries :data:`_MODE_GUARD_COLLECTORS` names for ``mode``."""
     collectors = (result or {}).get("collectors") or {}
-    guards: list[dict] = []
+    guards: list[_ResultDict] = []
     for name in _MODE_GUARD_COLLECTORS.get(mode, ()):
         entry = collectors.get(name)
         if isinstance(entry, dict):
-            guards.extend(entry.get("guards") or ())
+            guards.extend(cast(_ResultDict, entry).get("guards") or ())
     return guards
 
 
-def _settled_regrade_keys(result: dict) -> dict[str, int]:
+def _settled_regrade_keys(result: _ResultDict) -> dict[str, int]:
     """Every key D50 wrote this run, with its row count: each rebuilt feature
     group (``groups_written``, whatever groups the snapshot produced) and the
     ``settlement.json`` marker, written last. Empty when it wrote nothing."""
@@ -1855,7 +1866,7 @@ def _settled_regrade_keys(result: dict) -> dict[str, int]:
     return keys
 
 
-def _daily_panel_keys(result: dict) -> dict[str, int]:
+def _daily_panel_keys(result: _ResultDict) -> dict[str, int]:
     """The two keys D51 published, with their counts: the panel (``rows``) and
     its manifest (1), which the publisher writes last. Empty unless it wrote."""
     panel = (result.get("collectors") or {}).get("daily_panel") or {}
@@ -1864,7 +1875,7 @@ def _daily_panel_keys(result: dict) -> dict[str, int]:
     return {panel["panel_key"]: int(panel.get("rows") or 0), panel["manifest_key"]: 1}
 
 
-def _index_contributions_keys(result: dict) -> dict[str, int]:
+def _index_contributions_keys(result: _ResultDict) -> dict[str, int]:
     """Every key D48 wrote this run (``paths_written``): a dated file and
     ``latest.json`` per index it published, each counted as one file. Empty
     when it wrote nothing; a ``partial`` run still records the index it did
@@ -1873,7 +1884,7 @@ def _index_contributions_keys(result: dict) -> dict[str, int]:
     return {key: 1 for key in collector.get("paths_written") or ()}
 
 
-def _nasdaq100_keys(result: dict) -> dict[str, int]:
+def _nasdaq100_keys(result: _ResultDict) -> dict[str, int]:
     """The two keys D49 wrote (latest and the dated snapshot), each carrying
     the membership count. Empty unless it wrote."""
     collector = (result.get("collectors") or {}).get("nasdaq100_constituents") or {}
@@ -1956,7 +1967,9 @@ _MODE_EXTRA_OUTPUTS: dict[str, tuple[tuple[object, object, object], ...]] = {
 }
 
 
-def _record_mode_lineage(run_ctx, mode: str, unit_id: str, result: dict) -> None:
+def _record_mode_lineage(
+    run_ctx: run_manifest.UnitRun, mode: str, unit_id: str, result: _ResultDict
+) -> None:
     """Fold a whole-mode unit's published outputs onto its run manifest.
 
     ``alpha-engine-config-I10861``: every S3 key the mode's own result shows
@@ -1976,10 +1989,11 @@ def _record_mode_lineage(run_ctx, mode: str, unit_id: str, result: dict) -> None
             rows = rows_fn(result)
             for k in keys:
                 rows_out = int((rows.get(k) if isinstance(rows, dict) else rows) or 0)
-                run_ctx.record_output(k, rows_out=rows_out)
+                run_ctx.record_output(cast(str, k), rows_out=rows_out)
 
     for name in _MODE_INPUT_COLLECTORS.get(mode, ()):
-        nested = (result.get("collectors") or {}).get(name) or {}
+        mode_collectors: _ResultDict = result.get("collectors") or {}
+        nested: _ResultDict = mode_collectors.get(name) or {}
         for ref in nested.get("input_refs") or ():
             run_ctx.record_input(
                 str(ref["key"]),
@@ -1989,7 +2003,8 @@ def _record_mode_lineage(run_ctx, mode: str, unit_id: str, result: dict) -> None
             )
 
     spec = run_units.MODE_ROWS.get(mode)
-    published = (result.get("collectors") or {}).get(spec.collector, {}) if spec else {}
+    unit_collectors: _ResultDict = result.get("collectors") or {}
+    published: _ResultDict = unit_collectors.get(spec.collector, {}) if spec else {}
     rows: int | None = None
     if spec:
         raw = published.get(spec.rows_key)
@@ -2040,7 +2055,7 @@ def _record_mode_lineage(run_ctx, mode: str, unit_id: str, result: dict) -> None
     )
 
 
-def run_weekly(config: dict, args: argparse.Namespace) -> dict:
+def run_weekly(config: _ResultDict, args: argparse.Namespace) -> _ResultDict:
     """Run collectors based on mode selection."""
     if getattr(args, "morning_enrich", False):
         return _run_whole_mode_unit("morning_enrich", _run_morning_enrich, config, args)
@@ -2095,7 +2110,7 @@ def run_weekly(config: dict, args: argparse.Namespace) -> dict:
         raise ValueError(f"Unknown phase: {phase}")
 
 
-def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
+def _run_phase1(config: _ResultDict, args: argparse.Namespace) -> _ResultDict:
     """Phase 1: constituents, historical (PIT) constituents, prices, macro, universe returns."""
     bucket = config["bucket"]
     price_cfg = config.get("price_cache", {})
@@ -2106,7 +2121,7 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
     only = args.only
     reg = _build_registry(config, args, run_date)
 
-    results: dict = {
+    results: _ResultDict = {
         "phase": 1,
         "date": run_date,
         "started_at": datetime.now(timezone.utc).isoformat(),
@@ -2577,7 +2592,7 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
     return results
 
 
-def _run_phase2(config: dict, args: argparse.Namespace) -> dict:
+def _run_phase2(config: _ResultDict, args: argparse.Namespace) -> _ResultDict:
     """Phase 2: alternative data for the constituent universe (after research)."""
     bucket = config["bucket"]
     market_prefix = config.get("market_data", {}).get("s3_prefix", "market_data/")
@@ -2585,7 +2600,7 @@ def _run_phase2(config: dict, args: argparse.Namespace) -> dict:
     dry_run = args.dry_run
     reg = _build_registry(config, args, run_date)
 
-    results: dict = {
+    results: _ResultDict = {
         "phase": 2,
         "date": run_date,
         "started_at": datetime.now(timezone.utc).isoformat(),
@@ -2655,7 +2670,7 @@ def _run_phase2(config: dict, args: argparse.Namespace) -> dict:
     # which reaches the run manifest as `status: failed`.
     scope_key = f"{market_prefix}weekly/{run_date}/alternative/scope.json"
 
-    def _collect_alternative() -> dict:
+    def _collect_alternative() -> _ResultDict:
         # Inside the phase body, so the failure below lands on D15's own run
         # manifest as `status: failed` rather than crashing outside every
         # record this unit writes. Still strictly before the first vendor call,
@@ -2820,7 +2835,7 @@ def _detect_chronic_gap_polygon_recovery(
     target_date: str,
     chronic_tickers: list[str],
     daily_closes_prefix: str = "staging/daily_closes/",
-) -> dict:
+) -> _ResultDict:
     """Drift alarm: detect when polygon STARTS covering a chronic-gap ticker.
 
     Pairs with ``_self_heal_chronic_polygon_gaps``. The chronic_polygon_gaps
@@ -2844,7 +2859,7 @@ def _detect_chronic_gap_polygon_recovery(
     Returns a summary dict; caller logs at INFO + persists in collector
     results so the manifest carries a record.
     """
-    summary: dict = {
+    summary: _ResultDict = {
         "status": "ok",
         "chronic_tickers_checked": len(chronic_tickers),
         "polygon_recovered": [],
@@ -2924,7 +2939,7 @@ def _detect_chronic_gap_polygon_recovery(
 def _detect_chronic_gap_constituents_drift(
     bucket: str,
     chronic_tickers: list[str],
-) -> dict:
+) -> _ResultDict:
     """Drift alarm: detect when a chronic_polygon_gaps allowlist ticker has
     dropped out of the current S&P 500/400 constituents set.
 
@@ -2969,7 +2984,7 @@ def _detect_chronic_gap_constituents_drift(
            "still_constituents": list[str], "dropped_non_constituent": list[str],
            "weekly_date": str|None, "errors": list[dict]}``
     """
-    summary: dict = {
+    summary: _ResultDict = {
         "status": "ok",
         "chronic_tickers_checked": len(chronic_tickers),
         "still_constituents": list(chronic_tickers),
@@ -3111,7 +3126,7 @@ _PENDING_UPGRADES_LEDGER_KEY = "_data_quality/pending_upgrades.json"
 def _load_pending_upgrades_ledger(
     bucket: str = _PENDING_UPGRADES_LEDGER_BUCKET,
     key: str = _PENDING_UPGRADES_LEDGER_KEY,
-) -> dict:
+) -> _ResultDict:
     """Read the pending-upgrades ledger — ``{trading_day: {reason, detected_at}}``.
 
     Best-effort: a missing object (first-ever write) or any read/parse
@@ -3137,7 +3152,7 @@ def _load_pending_upgrades_ledger(
 
 
 def _write_pending_upgrades_ledger(
-    doc: dict,
+    doc: _ResultDict,
     bucket: str = _PENDING_UPGRADES_LEDGER_BUCKET,
     key: str = _PENDING_UPGRADES_LEDGER_KEY,
 ) -> None:
@@ -3207,7 +3222,7 @@ class _HardTimeout(BaseException):
 
 
 @contextmanager
-def _hard_timeout(seconds: int, label: str):
+def _hard_timeout(seconds: int, label: str) -> Generator[None, None, None]:
     """SIGALRM-based hard wall-clock bound for a best-effort block.
 
     Main-thread only (weekly_collector runs as the main thread under both
@@ -3217,7 +3232,7 @@ def _hard_timeout(seconds: int, label: str):
     the bound. SIGALRM interrupts blocking syscalls (socket recv), so it bounds
     a hung network fetch, not just CPU-bound loops.
     """
-    def _handler(signum, frame):
+    def _handler(signum: int, frame: FrameType | None) -> NoReturn:
         raise _HardTimeout(f"{label} exceeded {seconds}s hard timeout")
 
     try:
@@ -3239,7 +3254,7 @@ def _self_heal_chronic_polygon_gaps(
     target_date: str,
     chronic_tickers: list[str],
     dry_run: bool = False,
-) -> dict:
+) -> _ResultDict:
     """Yfinance-backfill any ArcticDB row gap for chronic-polygon-gap tickers.
 
     For each ticker in ``chronic_tickers``:
@@ -3291,7 +3306,7 @@ def _self_heal_chronic_polygon_gaps(
     universe_lib = get_universe_lib(bucket)
     target_ts = __import__("pandas").Timestamp(target_date).normalize()
 
-    summary: dict = {
+    summary: _ResultDict = {
         "checked": len(chronic_tickers),
         "healed": [],
         "skipped_already_fresh": [],
@@ -3431,7 +3446,7 @@ def _self_heal_chronic_polygon_gaps(
 
 
 def _daily_closes_written_keys(
-    dc_result: dict, s3_prefix: str, target_date: str
+    dc_result: _ResultDict, s3_prefix: str, target_date: str
 ) -> list[str]:
     """The ``staging/daily_closes/{date}.parquet`` key(s) a
     ``daily_closes.collect`` call actually wrote.
@@ -3461,7 +3476,7 @@ def _daily_closes_written_keys(
     return []
 
 
-def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
+def _run_morning_enrich(config: _ResultDict, args: argparse.Namespace) -> _ResultDict:
     """Morning polygon enrichment: overwrite the prior trading day's parquet
     + ArcticDB row with polygon's authoritative OHLCV+VWAP.
 
@@ -3529,7 +3544,7 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
     # so markers land under data/{target_date}/.phases/. None in dry-run.
     reg = _build_registry(config, args, target_date)
 
-    results: dict = {
+    results: _ResultDict = {
         "mode": "morning_enrich",
         "date": target_date,
         "started_at": started_at,
@@ -3702,14 +3717,14 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
                 raise _CollectorError(
                     "morning_daily_closes",
                     run_units.describe_mode_failure("morning_daily_closes", dc_result),
-                    dc_result,
+                    cast("_ResultDict | None", dc_result),
                 )
             if dc_ctx is not None and not dry_run:
                 # Declare what this phase actually wrote — an empty
                 # `artifact_keys` on a phase that wrote nine parquet files is
                 # a false declaration (I10942 deliverable 3).
                 for written_key in _daily_closes_written_keys(
-                    dc_result, daily_closes_s3_prefix, target_date
+                    cast(_ResultDict, dc_result), daily_closes_s3_prefix, target_date
                 ):
                     dc_ctx.record_artifact(written_key)
         results["collectors"]["daily_closes"] = dc_result
@@ -3736,7 +3751,7 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
         if not dry_run and not (dc_result or {}).get("vendor_divergence"):
             from collectors.cross_source_observer import vendor_crosscheck_guard_entry
 
-            fallback_record: dict = {}
+            fallback_record: _ResultDict = {}
             try:
                 from collectors.cross_source_observer import write_vendor_divergence_metric
 
@@ -4039,11 +4054,11 @@ def _detect_fallback_quality_universe_days(
 def _self_heal_missing_universe_days(
     bucket: str,
     target_date: str,
-    config: dict,
+    config: _ResultDict,
     dry_run: bool = False,
     lookback_trading_days: int = _UNIVERSE_GAP_HEAL_LOOKBACK_TD,
     max_heal_days: int = _UNIVERSE_GAP_HEAL_MAX_PER_RUN,
-) -> dict:
+) -> _ResultDict:
     """Backfill trading days missing OR fallback-quality in the ArcticDB
     universe (config#1228; fallback-quality healing added config#2664).
 
@@ -4087,7 +4102,7 @@ def _self_heal_missing_universe_days(
     same-day load-bearing append is the caller's responsibility and must not
     be blocked by a heal failure here.
     """
-    summary: dict = {
+    summary: _ResultDict = {
         "scan_window_td": lookback_trading_days,
         "max_per_run": max_heal_days,
         "missing_days": [],
@@ -4274,7 +4289,7 @@ def _self_heal_missing_universe_days(
     return summary
 
 
-def _run_daily_heal(config: dict, args: argparse.Namespace) -> dict:
+def _run_daily_heal(config: _ResultDict, args: argparse.Namespace) -> _ResultDict:
     """Standalone daily data-heal workload (alpha-engine-config-I2717).
 
     Brian ruling 2026-07-16 (I2717 + the shared I2722 scope note): the
@@ -4326,7 +4341,7 @@ def _run_daily_heal(config: dict, args: argparse.Namespace) -> dict:
         target_date = args.date
 
     dry_run = args.dry_run
-    results: dict = {
+    results: _ResultDict = {
         "mode": "daily_heal",
         "date": target_date,
         "started_at": started_at,
@@ -4445,7 +4460,7 @@ def _run_daily_heal(config: dict, args: argparse.Namespace) -> dict:
     return results
 
 
-def _run_morning_arctic_append(config: dict, args: argparse.Namespace) -> dict:
+def _run_morning_arctic_append(config: _ResultDict, args: argparse.Namespace) -> _ResultDict:
     """Standalone ArcticDB universe append for the prior trading day (L4608).
 
     Split out of :func:`_run_morning_enrich` (2026-06-11) into its own weekday-SF
@@ -4479,7 +4494,7 @@ def _run_morning_arctic_append(config: dict, args: argparse.Namespace) -> dict:
         target_date = args.date
 
     dry_run = args.dry_run
-    results: dict = {
+    results: _ResultDict = {
         "mode": "morning_arctic_append",
         "date": target_date,
         "started_at": started_at,
@@ -4610,7 +4625,7 @@ def _run_morning_arctic_append(config: dict, args: argparse.Namespace) -> dict:
     return results
 
 
-def _run_chronic_gap_heal(config: dict, args: argparse.Namespace) -> dict:
+def _run_chronic_gap_heal(config: _ResultDict, args: argparse.Namespace) -> _ResultDict:
     """Best-effort chronic-polygon-gap drift detection + yfinance self-heal.
 
     Split out of :func:`_run_morning_enrich` (2026-06-11) into its own
@@ -4649,7 +4664,7 @@ def _run_chronic_gap_heal(config: dict, args: argparse.Namespace) -> dict:
 
     dry_run = args.dry_run
     daily_cfg = config.get("daily_closes", {})
-    results: dict = {
+    results: _ResultDict = {
         "mode": "chronic_gap_heal",
         "date": target_date,
         "started_at": started_at,
@@ -4830,7 +4845,7 @@ def _augment_with_macro_daily_tickers(tickers: list[str]) -> list[str]:
     return list(dict.fromkeys(tickers + _MACRO_DAILY_TICKERS))
 
 
-def _load_daily_universe_tickers(config: dict, run_date: str | None = None) -> list[str]:
+def _load_daily_universe_tickers(config: _ResultDict, run_date: str | None = None) -> list[str]:
     """Load the daily universe (S3 constituents → Wikipedia fallback) plus the
     macro daily tickers. Shared by :func:`_run_daily` and
     :func:`_run_daily_arctic_append` so a split EOD run (PostMarketData computes,
@@ -4882,7 +4897,7 @@ def _load_daily_universe_tickers(config: dict, run_date: str | None = None) -> l
     return _augment_with_macro_daily_tickers(tickers)
 
 
-def _run_daily(config: dict, args: argparse.Namespace) -> dict:
+def _run_daily(config: _ResultDict, args: argparse.Namespace) -> _ResultDict:
     """Daily mode: capture today's OHLCV closes for all tracked tickers, plus
     (config#2756) refresh reference/price_cache/*.parquet for any ticker that
     missed a trading session — keeps the cache daily-fresh instead of the
@@ -4894,7 +4909,7 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
     price_cfg = config.get("price_cache", {})
     reg = _build_registry(config, args, run_date)
 
-    results: dict = {
+    results: _ResultDict = {
         "mode": "daily",
         "date": run_date,
         "started_at": datetime.now(timezone.utc).isoformat(),
@@ -5351,7 +5366,7 @@ def _seed_index_entrants(
     bucket: str,
     expected_tickers: list[str],
     dry_run: bool = False,
-) -> dict:
+) -> _ResultDict:
     """Write a new index member's full history into the ArcticDB universe the
     day it joins the declared membership (alpha-engine-config-I11444).
 
@@ -5418,7 +5433,7 @@ def _seed_index_entrants(
                 len(retired), retired,
             )
     entrants = sorted(missing - set(retired))
-    summary: dict = {"entrants": entrants, "seeded": [], "errors": []}
+    summary: _ResultDict = {"entrants": entrants, "seeded": [], "errors": []}
     if retired:
         summary["retired_skipped"] = retired
     if not entrants:
@@ -5460,7 +5475,7 @@ def _seed_index_entrants(
     return {"status": status, **summary}
 
 
-def _run_entrant_seed_step(bucket: str, expected_tickers: list[str], dry_run: bool) -> dict:
+def _run_entrant_seed_step(bucket: str, expected_tickers: list[str], dry_run: bool) -> _ResultDict:
     """`_seed_index_entrants` under a hard wall-clock bound, never raising.
 
     A seed failure is logged at ERROR (so it alerts) and recorded as a
@@ -5487,7 +5502,7 @@ def _run_entrant_seed_step(bucket: str, expected_tickers: list[str], dry_run: bo
     return result
 
 
-def _run_daily_arctic_append(config: dict, args: argparse.Namespace) -> dict:
+def _run_daily_arctic_append(config: _ResultDict, args: argparse.Namespace) -> _ResultDict:
     """Standalone ArcticDB universe append for the EOD post-market path.
 
     The daily/EOD twin of :func:`_run_morning_arctic_append`. Split out of
@@ -5515,7 +5530,7 @@ def _run_daily_arctic_append(config: dict, args: argparse.Namespace) -> dict:
     bucket = config["bucket"]
     run_date = args.date or default_run_date()
     dry_run = args.dry_run
-    results: dict = {
+    results: _ResultDict = {
         "mode": "daily_arctic_append",
         "date": run_date,
         "started_at": datetime.now(timezone.utc).isoformat(),
@@ -5575,7 +5590,7 @@ def _run_daily_arctic_append(config: dict, args: argparse.Namespace) -> dict:
 
 
 def _finalize(
-    results: dict,
+    results: _ResultDict,
     bucket: str,
     market_prefix: str,
     run_date: str,
@@ -5686,7 +5701,7 @@ def _finalize(
             )
 
 
-def _write_manifest(bucket: str, s3_prefix: str, run_date: str, results: dict) -> None:
+def _write_manifest(bucket: str, s3_prefix: str, run_date: str, results: _ResultDict) -> None:
     """Write manifest.json; a Phase 1 run also advances ``latest_weekly.json``.
 
     The pointer is D01's output (alpha-engine-config-I10855): it names the
@@ -5765,7 +5780,7 @@ def _write_manifest(bucket: str, s3_prefix: str, run_date: str, results: dict) -
     logger.info("Wrote manifest + latest pointer for %s", run_date)
 
 
-def _latest_weekly_refusal(bucket: str, target_prefix: str, results: dict) -> str | None:
+def _latest_weekly_refusal(bucket: str, target_prefix: str, results: _ResultDict) -> str | None:
     """Why ``latest_weekly.json`` may not advance to ``target_prefix``, or ``None``.
 
     The pointer summarises exactly one collector — D01's ``constituents`` —
@@ -5787,7 +5802,7 @@ def _latest_weekly_refusal(bucket: str, target_prefix: str, results: dict) -> st
 
 
 def _write_validation_json(
-    bucket: str, s3_prefix: str, run_date: str, results: dict,
+    bucket: str, s3_prefix: str, run_date: str, results: _ResultDict,
 ) -> None:
     """Aggregate validation results from all collectors and write to S3."""
     collectors = results.get("collectors", {})
@@ -5852,7 +5867,7 @@ def _write_module_health(
     run_date: str,
     status: str,
     *,
-    summary: dict | None = None,
+    summary: _ResultDict | None = None,
     warnings: list | None = None,
     error: str | None = None,
     duration_seconds: float = 0.0,
@@ -6186,7 +6201,7 @@ def main() -> None:
         raise SystemExit(1)
 
 
-def _annotate_phase_marker(reg: "PhaseRegistry", name: str, result: dict) -> dict:
+def _annotate_phase_marker(reg: "PhaseRegistry", name: str, result: _ResultDict) -> _ResultDict:
     """Carry a collector's provisional acceptances onto its phase marker.
 
     alpha-engine-config-I11812 (fix D): D02 may accept one Polygon-confirmed
@@ -6205,7 +6220,7 @@ def _annotate_phase_marker(reg: "PhaseRegistry", name: str, result: dict) -> dic
     return result
 
 
-def _run_features_settled_regrade(config: dict, args: argparse.Namespace) -> dict:
+def _run_features_settled_regrade(config: _ResultDict, args: argparse.Namespace) -> _ResultDict:
     """D50: rebuild ``features/{D-1}`` from the settled bar (`features.settled_regrade`).
 
     Runs in ``ne-data-collection-morning`` after D17 settled
@@ -6243,7 +6258,7 @@ def _run_features_settled_regrade(config: dict, args: argparse.Namespace) -> dic
     return result
 
 
-def _run_daily_panel(config: dict, args: argparse.Namespace) -> dict:
+def _run_daily_panel(config: _ResultDict, args: argparse.Namespace) -> _ResultDict:
     """D51: publish the session's daily panel (`builders.daily_panel.run`).
 
     Keyed by the last closed session (``--date`` or :func:`default_run_date`),
@@ -6285,7 +6300,7 @@ MAX_PANEL_CATCH_UP_PER_RUN = 5
 
 
 @contextmanager
-def _trigger_override(trigger: str):
+def _trigger_override(trigger: str) -> Generator[None, None, None]:
     """Set ``$NE_DATA_TRIGGER`` for the run manifests written inside the block."""
     previous = os.environ.get(run_units.TRIGGER_ENV)
     os.environ[run_units.TRIGGER_ENV] = trigger
@@ -6298,7 +6313,7 @@ def _trigger_override(trigger: str):
             os.environ[run_units.TRIGGER_ENV] = previous
 
 
-def _catch_up_daily_panels(config: dict, args: argparse.Namespace, result: dict) -> dict:
+def _catch_up_daily_panels(config: _ResultDict, args: argparse.Namespace, result: _ResultDict) -> _ResultDict:
     """Publish D51 for every recent session that has no panel (alpha-engine-config-I12652).
 
     ``ne-data-collection-panel`` starts only when ``ne-data-collection-eod``
@@ -6344,7 +6359,7 @@ def _catch_up_daily_panels(config: dict, args: argparse.Namespace, result: dict)
         len(missing), latest, [d.isoformat() for d in missing], [d.isoformat() for d in todo],
         f", {len(deferred)} deferred to the next run" if deferred else "",
     )
-    caught_up: list[dict] = []
+    caught_up: list[_ResultDict] = []
     for day in todo:
         day_args = copy.copy(args)
         day_args.date = day.isoformat()
@@ -6370,7 +6385,7 @@ def _catch_up_daily_panels(config: dict, args: argparse.Namespace, result: dict)
     return out
 
 
-def _run_index_contributions(config: dict, args: argparse.Namespace) -> dict:
+def _run_index_contributions(config: _ResultDict, args: argparse.Namespace) -> _ResultDict:
     """D48: publish the per-constituent index contribution
     (`collectors.index_contributions.collect`, alpha-engine-config-I11306).
 
@@ -6421,7 +6436,7 @@ def _run_index_contributions(config: dict, args: argparse.Namespace) -> dict:
     return result
 
 
-def _run_nasdaq100_constituents(config: dict, args: argparse.Namespace) -> dict:
+def _run_nasdaq100_constituents(config: _ResultDict, args: argparse.Namespace) -> _ResultDict:
     """D49: publish Nasdaq-100 membership and weights
     (`collectors.nasdaq100.collect`, alpha-engine-config-I11306).
 

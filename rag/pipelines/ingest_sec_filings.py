@@ -551,7 +551,7 @@ def ingest_ticker(
             stats.fail("no_sections")
             continue
 
-        all_chunks = []
+        all_chunks: list[dict[str, object]] = []
         for section_label, section_text in sections.items():
             for chunk_text in _chunk_text(section_text):
                 all_chunks.append({
@@ -562,7 +562,7 @@ def ingest_ticker(
         if not all_chunks:
             continue
 
-        embeddings = embed_texts([c["content"] for c in all_chunks])
+        embeddings = embed_texts([str(c["content"]) for c in all_chunks])
         for chunk, emb in zip(all_chunks, embeddings):
             chunk["embedding"] = emb
 
@@ -585,7 +585,7 @@ def ingest_ticker(
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
-def main():
+def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     parser = argparse.ArgumentParser(description="Ingest SEC filings into RAG store")

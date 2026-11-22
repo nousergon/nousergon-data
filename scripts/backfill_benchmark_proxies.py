@@ -156,7 +156,7 @@ def verify(symbols: list[str], bucket: str = DEFAULT_BUCKET) -> dict:
     return {"present": sorted(set(symbols) - set(missing)), "missing": missing, "spans": spans}
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None) -> int | None:
     parser = argparse.ArgumentParser(
         description="Load the declared benchmark proxies into ArcticDB `universe` (run IN-REGION)",
     )
@@ -209,7 +209,7 @@ class _ProxyLoadFailed(RuntimeError):
     out is survivorship bias, which is what the panel compile refuses on.
     """
 
-    def __init__(self, failures: list[str]):
+    def __init__(self, failures: list[str]) -> None:
         self.failures = failures
         super().__init__("; ".join(failures)[:2000])
 

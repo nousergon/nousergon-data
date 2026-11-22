@@ -38,6 +38,7 @@ import io
 import json
 import logging
 import sys
+from typing import TYPE_CHECKING, Any
 
 import boto3
 import pandas as pd
@@ -49,6 +50,9 @@ from builders._price_cache_writeboth import (
 from collectors.daily_closes import _FRED_INDEX_MAP
 from collectors.prices import _CARET_SYMBOLS
 from store.arctic_store import DEFAULT_BUCKET, get_macro_lib
+
+if TYPE_CHECKING:
+    from nousergon_lib.run_manifest import UnitRun
 
 log = logging.getLogger(__name__)
 
@@ -203,7 +207,7 @@ def union_no_shrink(existing: pd.DataFrame | None, fetched: pd.DataFrame, label:
     return merged
 
 
-def _read_parquet(s3, bucket: str, s3_prefix: str, symbol: str) -> pd.DataFrame | None:
+def _read_parquet(s3: Any, bucket: str, s3_prefix: str, symbol: str) -> pd.DataFrame | None:  # pyright: ignore[reportExplicitAny] -- boto3 S3 client; the fleet ships no boto3 stubs.
     for prefix in price_cache_read_prefixes(s3_prefix):
         try:
             obj = s3.get_object(Bucket=bucket, Key=f"{prefix}{symbol}.parquet")
@@ -282,7 +286,7 @@ def repair_symbol(
     return result
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None) -> int | None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--symbols", required=True,
                         help="comma-separated macro symbols, e.g. VIX3M or VIX3M,HYOAS")
@@ -305,7 +309,7 @@ def main(argv: list[str] | None = None) -> int:
     # ArcticDB or the price-cache parquets at all, not just before the write.
     run_units.require_in_region("repair_macro_series")
 
-    def _body(ctx):
+    def _body(ctx: UnitRun) -> int:
         results = []
         for symbol in [s.strip() for s in args.symbols.split(",") if s.strip()]:
             res = repair_symbol(

@@ -150,7 +150,11 @@ arcticdb>=6.28.3
 # `contracts` already pulled the same package, but naming the extra the
 # module actually belongs to is what keeps that true if either moves.
 # `crucible` pins the same pair for the same reason: nousergon-lib[github-app,gates].
-nousergon-lib[arcticdb,flow-doctor,rag,contracts,github-app,gates] @ git+https://github.com/nousergon/nousergon-lib@v0.124.189
+# alpha-engine-config-I13952: bumped 0.124.189 -> 0.124.229 for
+# nousergon_lib.shell_contracts (nousergon-lib-PR562, first released in
+# v0.124.228), the shared heredoc expansion detector that
+# tests/test_shared_heredoc_expansion.py runs over the dispatch launchers.
+nousergon-lib[arcticdb,flow-doctor,rag,contracts,github-app,gates] @ git+https://github.com/nousergon/nousergon-lib@v0.124.229
 # krepis floor: sf_preflight.py reads the operator pricing override
 # (cost/model_pricing.yaml) via nousergon_lib.cost -> krepis.cost.PriceCard,
 # which is extra="forbid". config#1332 adds the cache_create_1h_per_1m field,
