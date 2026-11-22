@@ -305,11 +305,12 @@ _SPACE_CHARS = dict.fromkeys(map(ord, "\xa0\u2002\u2003\u2007\u2009\u200a\u202f"
 _SPACE_CHARS.update(dict.fromkeys(map(ord, "\u200b\ufeff"), None))
 _SPACE_CHARS.update({ord("\u2019"): "'", ord("\u2018"): "'", ord("\u201c"): '"', ord("\u201d"): '"'})
 
-# "Item 1A." / "ITEM 7A:" / "Items 1 and 2." / "Part II, Item 1A." at the start
+# "Item 1A." / "ITEM I." / "ITEM 7A:" / "Items 1 and 2." /
+# "Part II, Item 1A." at the start
 # of a line. The capture is the item id.
 _ITEM_PREFIX = (
     r"^[ \t]*(?:part\s+[ivx]+\s*[,.:\-\u2013\u2014]?\s*)?items?\s*"
-    r"(\d{1,2}[a-d]?)\b(?:\s*(?:and|&|,|-|\u2013)\s*\d{1,2}[a-d]?\b)*"
+    r"(\d{1,2}[a-d]?|[ivx]+)\b(?:\s*(?:and|&|,|-|\u2013)\s*\d{1,2}[a-d]?\b)*"
 )
 
 # Any item HEADING — an item prefix followed directly by a title that starts
