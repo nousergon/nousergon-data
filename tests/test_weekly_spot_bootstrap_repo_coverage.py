@@ -111,9 +111,13 @@ def _krepis_floor_program() -> str:
     return match.group(1)
 
 
-def _run_krepis_floor(tmp_path: Path, installed: str | None) -> subprocess.CompletedProcess[str]:
+def _run_krepis_floor(
+    tmp_path: Path,
+    installed: str | None,
+    pin_line: str = "krepis==0.19.0",
+) -> subprocess.CompletedProcess[str]:
     """Execute the embedded assertion with local-only distribution metadata."""
-    (tmp_path / "requirements.txt").write_text("krepis==0.19.0\n", encoding="utf-8")
+    (tmp_path / "requirements.txt").write_text(f"{pin_line}\n", encoding="utf-8")
     if installed is not None:
         dist_info = tmp_path / f"krepis-{installed}.dist-info"
         dist_info.mkdir()
@@ -200,3 +204,14 @@ def test_krepis_floor_fails_loudly_when_installation_is_missing(
     assert "required>=0.18.8" in result.stderr
     assert "alpha-engine-dashboard/requirements.txt pin=0.19.0" in result.stderr
     assert "venv is built per boot from that file" in result.stderr
+
+
+def test_krepis_floor_reports_a_pin_that_carries_extras(tmp_path: Path) -> None:
+    """crucible-dashboard pins ``krepis[flow-doctor, openai]==X``; the
+    diagnostic must still name that pin rather than ``<no exact pin>``."""
+    result = _run_krepis_floor(
+        tmp_path, "0.18.7", pin_line="krepis[flow-doctor, openai]==0.59.111"
+    )
+
+    assert result.returncode != 0
+    assert "alpha-engine-dashboard/requirements.txt pin=0.59.111" in result.stderr

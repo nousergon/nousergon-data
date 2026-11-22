@@ -440,7 +440,8 @@ from pip._vendor.packaging.version import Version
 required = Version("0.18.8")
 requirements_path = pathlib.Path(sys.argv[1])
 requirements = requirements_path.read_text(encoding="utf-8")
-pin_match = re.search(r"(?im)^krepis\\s*==\\s*([^\\s;#]+)", requirements)
+# The live pin carries extras (krepis[flow-doctor, openai]==X), so allow them.
+pin_match = re.search(r"(?im)^krepis(?:\\[[^\\]]*\\])?\\s*==\\s*([^\\s;#]+)", requirements)
 pin = pin_match.group(1) if pin_match else "<no exact pin>"
 try:
     installed = importlib.metadata.version("krepis")
