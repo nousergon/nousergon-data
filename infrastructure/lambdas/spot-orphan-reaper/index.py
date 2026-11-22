@@ -66,7 +66,7 @@ import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
 
 import boto3
 from nousergon_lib.telegram import send_message
@@ -193,7 +193,7 @@ _SCAN_SCOPES: tuple[tuple[str, dict], ...] = (
 )
 
 
-def _scan_spot_instances(ec2) -> list[dict]:
+def _scan_spot_instances(ec2: Any) -> list[dict[str, Any]]:  # pyright: ignore[reportExplicitAny]  # untyped boto3 client (no stubs)
     """List running alpha-engine run boxes: every spot instance, plus every
     on-demand instance the launcher chokepoint tagged ``LaunchMarket=on-demand``.
 
@@ -270,7 +270,7 @@ IMPAIRED_REAP_GRACE_SECONDS = int(os.environ.get("IMPAIRED_REAP_GRACE_SECONDS", 
 _STATUS_BATCH = 100  # DescribeInstanceStatus accepts at most 100 InstanceIds
 
 
-def _impaired_since(ec2, instance_ids: list[str]) -> dict[str, datetime]:
+def _impaired_since(ec2: Any, instance_ids: list[str]) -> dict[str, datetime]:  # pyright: ignore[reportExplicitAny]  # untyped boto3 client (no stubs)
     """``{instance_id: ImpairedSince}`` for boxes whose instance status check
     reports ``impaired``. Never raises: a failed call returns what it has."""
     out: dict[str, datetime] = {}
@@ -369,7 +369,7 @@ def _completion_key(kind: WatchKind, watch_tags: dict[str, str]) -> str:
     return f"{kind.completion_prefix}{'-'.join(parts)}.json"
 
 
-def _completion_marker_exists(s3, kind: WatchKind, watch_tags: dict[str, str]) -> bool:
+def _completion_marker_exists(s3: Any, kind: WatchKind, watch_tags: dict[str, str]) -> bool:  # pyright: ignore[reportExplicitAny]  # untyped boto3 client (no stubs)
     """True iff the sibling run script wrote its S3 completion marker for
     this instance's discriminator tags before the reaper's fleet-wide age cap
     fired.
@@ -461,7 +461,7 @@ REAP_COUNT_METRIC = "orphan_reaper_instances_reaped"
 OLDEST_TERMINAL_AGE_METRIC = "orphan_reaper_oldest_terminal_execution_age"
 
 
-def _emit_metric(cw, name: str, count: int, metric_name: str = ORPHAN_METRIC) -> None:
+def _emit_metric(cw: Any, name: str, count: int, metric_name: str = ORPHAN_METRIC) -> None:  # pyright: ignore[reportExplicitAny]  # untyped boto3 client (no stubs)
     """Emit one CloudWatch metric data point per terminated instance group."""
     if count == 0:
         return
@@ -523,7 +523,7 @@ def _emit_scan_metrics(
         logger.warning("CloudWatch scan metrics failed: %s", exc)
 
 
-def handler(event: dict, context) -> dict:
+def handler(event: dict, context: object) -> dict[str, object]:
     """Hourly orphan scan + termination.
 
     Returns a summary dict for CloudWatch Logs grep + observability.
