@@ -665,11 +665,13 @@ def test_config_clone_does_not_expose_pat_in_url(monkeypatch):
         {"merged_sha": "a" * 40, "head_migration_number": 7}
     )
 
-    clone_lines = [line for line in cmd.splitlines() if "github.com" in line]
-    assert clone_lines
-    assert all("$PAT@" not in line and "${PAT}@" not in line for line in clone_lines)
+    # The only URL on the box command is the config clone, and it is
+    # compared whole: a token carrying userinfo (``x-access-token:$PAT@``)
+    # cannot equal it. Whole-token equality, not substring containment.
+    urls = [token for token in cmd.split() if token.startswith("https://")]
+    assert urls == ["https://github.com/nousergon/alpha-engine-config.git"]
+    assert "$PAT@" not in cmd and "${PAT}@" not in cmd
     assert "credential.helper" in cmd
-    assert "https://github.com/nousergon/alpha-engine-config.git" in cmd
 
 
 def test_prelude_failures_shutdown_immediately(monkeypatch):
