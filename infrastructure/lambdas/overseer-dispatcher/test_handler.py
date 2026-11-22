@@ -259,3 +259,21 @@ class TestModelInjection:
                       None)
         sent = json.loads(lam.invoke.call_args.kwargs["Payload"])
         assert sent["model"] == "claude-opus-4-8"
+
+
+def test_dispatch_run_id_matches_ledger_key_and_overrides_caller(index_mod):
+    index, fake_boto3 = index_mod
+    lam = _lambda_client_returning(fake_boto3, {"launched": True, "reason": "launched"})
+    index.handler({"playbook": "sf-watch", "payload": {"dispatch_run_id": "caller"}}, None)
+    sent = json.loads(lam.invoke.call_args.kwargs["Payload"])
+    ledger_key = index._write_ledger.call_args.args[0]
+    assert sent["dispatch_run_id"] == ledger_key
+    assert ledger_key != "caller"
+
+
+def test_invoke_error_uses_payload_dispatch_run_id_for_ledger(index_mod):
+    index, fake_boto3 = index_mod
+    lam = _lambda_client_returning(fake_boto3, {}, function_error="Unhandled")
+    index.handler({"playbook": "ci-watch", "payload": {}}, None)
+    sent = json.loads(lam.invoke.call_args.kwargs["Payload"])
+    assert index._write_ledger.call_args.args[0] == sent["dispatch_run_id"]

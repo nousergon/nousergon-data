@@ -129,6 +129,27 @@ def test_alert_contains_groups_and_empty_scan_is_silent(
     assert len(sent) == 1
 
 
+def test_alert_dedup_identity_is_stable_until_degraded_rows_change(
+    collector: Any, monkeypatch: pytest.MonkeyPatch,
+) -> None:  # noqa: ANN401
+    dedup_keys: list[str] = []
+    monkeypatch.setattr(
+        collector, "notify_via_flow_doctor",
+        lambda _text, **kwargs: dedup_keys.append(kwargs["dedup_key"]) or True,
+    )
+    existing = {("2026-11-20", "alpha", "unpriced"): 1}
+
+    for _ in range(14):
+        assert collector.alert_cost_source_degradations(existing) is True
+
+    assert len(set(dedup_keys)) == 1
+    assert collector.alert_cost_source_degradations({
+        **existing,
+        ("2026-11-21", "beta", "usage_unreported"): 1,
+    }) is True
+    assert dedup_keys[-1] != dedup_keys[0]
+
+
 def test_scan_and_notification_failures_are_nonfatal_and_loud(
     collector: Any, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
 ) -> None:  # noqa: ANN401

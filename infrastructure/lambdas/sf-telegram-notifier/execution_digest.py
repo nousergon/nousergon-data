@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, cast
 
 logger = logging.getLogger(__name__)
 
@@ -193,10 +194,52 @@ class StateDuration:
     floor_sec: Optional[int]
     floor_breach: bool
     attestation_failed: bool
+    ssm_command_failed: bool = False
 
     @property
     def anomaly(self) -> bool:
-        return self.floor_breach or self.attestation_failed
+        return self.floor_breach or self.attestation_failed or self.ssm_command_failed
+
+
+_TRACKED_SSM_POLL_RESULTS: Mapping[str, str] = {
+    "PollMorningArcticAppendSpot": "arctic_append_poll",
+    "PollMorningEnrichSpot": "morning_enrich_poll",
+}
+
+
+def _failed_ssm_poll_states(events: Sequence[dict[str, object]]) -> frozenset[str]:
+    """Return tracked states whose output contains a failed SSM invocation."""
+    failed: set[str] = set()
+    for event in events:
+        if event.get("type") != "TaskStateExited":
+            continue
+        raw_details = event.get("stateExitedEventDetails")
+        if not isinstance(raw_details, dict):
+            continue
+        details = cast(dict[str, object], raw_details)
+        name = details.get("name")
+        poll_key = _TRACKED_SSM_POLL_RESULTS.get(name) if isinstance(name, str) else None
+        raw_output = details.get("output")
+        if poll_key is None or not isinstance(raw_output, str):
+            continue
+        try:
+            payload: object = json.loads(raw_output)
+        except (TypeError, ValueError):
+            continue
+        result = cast(dict[str, object], payload).get(poll_key) if isinstance(payload, dict) else None
+        if not isinstance(result, dict):
+            continue
+        typed_result = cast(dict[str, object], result)
+        status = typed_result.get("Status")
+        response_code = typed_result.get("ResponseCode")
+        status_failed = isinstance(status, str) and status.casefold() == "failed"
+        try:
+            response_failed = isinstance(response_code, (int, str)) and int(response_code) != 0
+        except (TypeError, ValueError):
+            response_failed = False
+        if status_failed or response_failed:
+            failed.add(cast(str, name))
+    return frozenset(failed)
 
 
 def format_duration_short(duration_sec: int) -> str:
@@ -394,6 +437,7 @@ def build_state_durations(
     execution_start: datetime,
     run_date: Optional[str],
     s3_client: Any | None,
+    failed_ssm_states: frozenset[str] = frozenset(),
 ) -> List[StateDuration]:
     rows: List[StateDuration] = []
     for name, secs in durations_sec.items():
@@ -429,6 +473,7 @@ def build_state_durations(
                 floor_sec=floor,
                 floor_breach=floor_breach,
                 attestation_failed=attestation_failed,
+                ssm_command_failed=name in failed_ssm_states,
             )
         )
     rows.sort(key=_sort_key)
@@ -452,6 +497,8 @@ def format_digest_lines(
                 detail = f"⚠️(floor {format_duration_short(row.floor_sec)})"
             if row.attestation_failed:
                 detail = "⚠️(no artifact)" if detail == "⚠️" else detail + "+no artifact"
+            if row.ssm_command_failed:
+                detail = "⚠️(SSM command failed)"
         else:
             detail = "✓"
         lines.append(f"{row.name} {dur} {detail}")
@@ -514,9 +561,9 @@ def fetch_execution_history(
     execution is one call instead of nine (alpha-engine-config-I11792).
     ``maxResults`` is only an upper bound: response-size constraints can
     produce smaller pages, especially when ``include_execution_data`` is
-    true, so pagination always follows ``nextToken``. The live notifier
-    keeps execution data disabled; offline calibration enables it to read
-    Task outputs used as ground-truth poll statuses.
+    true, so pagination always follows ``nextToken``. Both the live digest
+    and offline calibration enable it to read Task outputs as poll statuses
+    (alpha-engine-config-I10189 / I10591); the default stays False.
     """
     if max_pages is None:
         max_pages = _MAX_HISTORY_PAGES
@@ -631,7 +678,12 @@ def build_execution_digest(
     if not execution_arn:
         return ["_(digest unavailable: missing executionArn)_"], False, None
     try:
-        events, truncated = fetch_execution_history(sf_client, execution_arn)
+        # Poll-state outputs carry the raw GetCommandInvocation result that
+        # _failed_ssm_poll_states reads to catch a command failure even when
+        # the execution itself succeeded (alpha-engine-config-I10189).
+        events, truncated = fetch_execution_history(
+            sf_client, execution_arn, include_execution_data=True
+        )
     except Exception as exc:  # noqa: BLE001
         logger.error("get_execution_history failed for %s: %s", execution_arn, exc)
         return ["_(digest unavailable: history fetch failed)_"], False, None
@@ -645,6 +697,9 @@ def build_execution_digest(
         execution_start=execution_start,
         run_date=run_date,
         s3_client=s3_client,
+        failed_ssm_states=_failed_ssm_poll_states(
+            cast(Sequence[dict[str, object]], events)
+        ),
     )
     lines = format_digest_lines(rows, last_entered=last_workload_state_entered(events))
     hollow = any(r.anomaly for r in rows) if not is_preflight else False
