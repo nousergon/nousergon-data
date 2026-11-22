@@ -493,23 +493,25 @@ def _assert_stage_coverage(
         logger.error("stage-coverage assertion unavailable for %s: %s", stage, exc)
         return {"stage": stage, "status": "UNMEASURED", "reason": str(exc)}
     execution_name = (execution_id or "").rsplit(":", 1)[-1] or None
-    kwargs: dict = {"window_start": started, "run_date": run_date}
-    if "execution_name" in inspect.signature(assert_stage_coverage).parameters:
-        kwargs["execution_name"] = execution_name
-    elif (execution_name or "").startswith(REHEARSAL_EXECUTION_PREFIX):
+    takes_execution_name = "execution_name" in inspect.signature(assert_stage_coverage).parameters
+    if not takes_execution_name and (execution_name or "").startswith(REHEARSAL_EXECUTION_PREFIX):
         logger.info(
             "stage-coverage: %s is a rehearsal and this krepis cannot namespace "
             "its verdict; %s not recorded", execution_name, stage,
         )
         return {"stage": stage, "status": "UNMEASURED", "reason": "rehearsal; not recorded live"}
     try:
-        return assert_stage_coverage(stage, **kwargs)
+        if takes_execution_name:
+            return assert_stage_coverage(
+                stage, window_start=started, run_date=run_date, execution_name=execution_name,
+            )
+        return assert_stage_coverage(stage, window_start=started, run_date=run_date)
     except Exception as exc:  # noqa: BLE001 — observe mode: never fail the dispatch
         logger.error("stage-coverage assertion failed for %s: %s", stage, exc)
         return {"stage": stage, "status": "UNMEASURED", "reason": f"{type(exc).__name__}: {exc}"}
 
 
-def handler(event: dict, context) -> dict:
+def handler(event: dict, context: object) -> dict[str, object]:
     """EventBridge handler — launch the daily Think Tank box.
 
     ``event`` may carry ``{"force_on_demand": bool}``, ``{"mode": "daily" |
@@ -626,7 +628,7 @@ def handler(event: dict, context) -> dict:
         idempotency_key,
     )
 
-    response = {
+    response: dict[str, object] = {
         "launched": True,
         "mode": mode,
         "replayed": result.replayed,
