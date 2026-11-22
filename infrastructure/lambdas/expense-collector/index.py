@@ -174,6 +174,7 @@ LATEST_KEY = "expenses/latest.json"
 BASELINE_PREFIX = "expenses/baselines/"
 SNAPSHOT_PREFIX = "expenses/snapshots/"
 COST_RAW_PREFIX = "decision_artifacts/_cost_raw/"
+DEGRADED_COST_SOURCES = frozenset({"unpriced", "usage_unreported"})
 ALERT_STATE_PREFIX = "expenses/alert_state/"
 RECONCILIATION_PREFIX = "expenses/reconciliation/"
 
@@ -489,6 +490,84 @@ def _put_json(s3: Any, key: str, doc: dict, if_none_match: bool = False) -> bool
         if if_none_match and code in {"PreconditionFailed", "412"}:
             return False
         raise
+
+
+def scan_cost_source_degradations(
+    s3: Any, now: datetime,  # pyright: ignore[reportExplicitAny]  # untyped SDK object
+) -> dict[tuple[str, str, str], int]:
+    """Count soft cost-record degradations in the latest seven UTC partitions.
+
+    Malformed JSONL is a scan failure rather than evidence of zero degraded
+    rows; callers surface it as a warning and keep the rollup alive.
+    """
+    counts: dict[tuple[str, str, str], int] = {}
+    for days_ago in range(7):
+        partition = (now.date() - timedelta(days=days_ago)).isoformat()
+        prefix = f"{COST_RAW_PREFIX}{partition}/"
+        paginator = s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=BUCKET, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                if not key.endswith(".jsonl"):
+                    continue
+                body = s3.get_object(Bucket=BUCKET, Key=key)["Body"].read()
+                for line_number, raw_line in enumerate(body.splitlines(), start=1):
+                    if not raw_line.strip():
+                        continue
+                    try:
+                        row = json.loads(raw_line)
+                    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                        raise ValueError(
+                            f"invalid cost JSONL at s3://{BUCKET}/{key}:{line_number}"
+                        ) from exc
+                    source = row.get("cost_source")
+                    if source not in DEGRADED_COST_SOURCES:
+                        continue
+                    callsite = str(row.get("callsite_id") or "(missing callsite_id)")
+                    group = (partition, callsite, source)
+                    counts[group] = counts.get(group, 0) + 1
+    return counts
+
+
+def alert_cost_source_degradations(
+    counts: dict[tuple[str, str, str], int],
+) -> bool:
+    """Send one warning digest for degraded cost rows; never fail collection."""
+    if not counts:
+        return False
+    lines = ["⚠️ *Cost records need pricing/usage attention*"]
+    lines.extend(
+        f"• `{day}` `{callsite}` `{source}`: *{count}*"
+        for (day, callsite, source), count in sorted(counts.items())
+    )
+    try:
+        return notify_via_flow_doctor(
+            "\n".join(lines), silent=False, severity="warning",
+            dedup_key=f"{_FLOW_NAME}:cost-source-degradation",
+            flow_name=_FLOW_NAME, topics=_ALERT_TOPICS,
+            db_basename=_DB_BASENAME,
+            context={"degraded_cost_rows": sum(counts.values())},
+            source="flow-doctor:expense-collector",
+        )
+    except Exception as exc:  # noqa: BLE001 — notification surface only
+        logger.warning("cost-source degradation alert send failed (non-fatal): %s", exc)
+        return False
+
+
+def run_cost_source_degradation_alert(
+    s3: Any, now: datetime,  # pyright: ignore[reportExplicitAny]  # untyped SDK object
+) -> dict[str, object]:
+    """Run the best-effort scan and distinguish scan failure from zero rows."""
+    try:
+        counts = scan_cost_source_degradations(s3, now)
+        return {
+            "groups": len(counts),
+            "rows": sum(counts.values()),
+            "alerted": alert_cost_source_degradations(counts),
+        }
+    except Exception as exc:  # noqa: BLE001 — soft signal, rollup remains valid
+        logger.warning("cost-source degradation scan failed (non-fatal): %s", exc)
+        return {"error": str(exc)[:300]}
 
 
 # ---------------------------------------------------------------------------
@@ -2264,6 +2343,11 @@ def _collect(event: dict, context: Any) -> dict:  # noqa: ARG001 — Lambda cont
     # down by the second one while the first was green.
     balance_alert_result = run_balance_depletion_alerts(s3, mw["period"], rows)
 
+    # alpha-engine-config-I11113 — soft degradation only: both scanning and
+    # notification are best-effort and cannot fail the expense rollup. A scan
+    # error is warned, never misreported as zero degraded rows.
+    cost_source_alert = run_cost_source_degradation_alert(s3, now)
+
     if err_rows and not ok_rows:
         # Every live adapter failed — systemic (network/creds/deploy) breakage,
         # not a provider blip: raise so the Lambda error metric pages.
@@ -2273,8 +2357,9 @@ def _collect(event: dict, context: Any) -> dict:  # noqa: ARG001 — Lambda cont
     # GitHub outage can never cost the rollup or the over-budget page.
     spend_monitor_dispatch = _dispatch_spend_monitor()
 
-    return {"period": mw["period"], "providers": len(rows),
+    return {"period": mw["period"], "providers": len(rows),  # pyright: ignore[reportUnknownVariableType]
             "errors": [(r["key"], r["error"]) for r in err_rows],
             "totals": totals, "alerts": alert_result,
             "balance_alerts": balance_alert_result,
+            "cost_source_alert": cost_source_alert,
             "spend_monitor_dispatch": spend_monitor_dispatch}
