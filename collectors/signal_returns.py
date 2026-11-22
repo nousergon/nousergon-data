@@ -30,7 +30,7 @@ import logging
 import sqlite3
 from datetime import date, datetime, timedelta, timezone
 from collections.abc import Callable
-from typing import cast
+from typing import Any, cast
 
 import boto3
 import pandas as pd
@@ -227,7 +227,7 @@ def collect(
 # ── Step 1: Seed score_performance ────────────────────────────────────────────
 
 
-def _load_stance_lookup_for_date(s3, bucket: str, sig_date: str) -> dict[str, str]:
+def _load_stance_lookup_for_date(s3: Any, bucket: str, sig_date: str) -> dict[str, str]:  # pyright: ignore[reportExplicitAny]  # untyped boto3 client (no stubs)
     """Read predictions.json for ``sig_date`` and return
     {ticker: stance}. Empty dict on any failure (S3 404, JSON parse
     error, predictions.json without stance field).
@@ -281,7 +281,7 @@ def _extract_signal_context(payload: dict, ticker: str) -> dict:
 
 
 def _seed_score_performance(
-    s3, bucket: str, db_path: str, signals_prefix: str, dry_run: bool,
+    s3: Any, bucket: str, db_path: str, signals_prefix: str, dry_run: bool,  # pyright: ignore[reportExplicitAny]  # untyped boto3 client (no stubs)
 ) -> dict:
     """Insert BUY-rated signals into score_performance with entry prices
     from universe_returns. Includes the 5 calibrator-v1 context columns
@@ -403,7 +403,7 @@ def _seed_score_performance(
 
 
 def _backfill_score_context(
-    s3, bucket: str, db_path: str, signals_prefix: str, dry_run: bool,
+    s3: Any, bucket: str, db_path: str, signals_prefix: str, dry_run: bool,  # pyright: ignore[reportExplicitAny]  # untyped boto3 client (no stubs)
 ) -> dict:
     """Repair existing score_performance rows whose calibrator-v1 context
     columns are NULL (rows seeded before _seed_score_performance learned
@@ -588,7 +588,7 @@ def _backfill_score_returns(db_path: str, dry_run: bool) -> dict:
 # ── Step 2c: Long-format outcome dual-write (EPIC config#1483 Phase 2) ─────────
 
 
-def _ensure_score_performance_outcomes_schema(conn) -> None:
+def _ensure_score_performance_outcomes_schema(conn: sqlite3.Connection) -> None:
     """Create the long-format ``score_performance_outcomes`` table if absent.
 
     The config#1483 root-cause fix for the wide horizon-suffixed columns: one
@@ -630,7 +630,7 @@ def _ensure_score_performance_outcomes_schema(conn) -> None:
 
 
 def _backfill_outcome_records(
-    db_path: str, dry_run: bool, resolved_at: str | None = None, policy=None,
+    db_path: str, dry_run: bool, resolved_at: str | None = None, policy: HorizonPolicy | None = None,
 ) -> dict:
     """Dual-write the long-format ``score_performance_outcomes`` rows alongside
     the wide ``score_performance`` columns (EPIC config#1483 Phase 2).
@@ -944,7 +944,7 @@ def _check_outcome_store_coverage(db_path: str) -> dict:
 # ── Step 3: Seed predictor_outcomes ───────────────────────────────────────────
 
 
-def _seed_predictor_outcomes(s3, bucket: str, db_path: str, dry_run: bool) -> dict:
+def _seed_predictor_outcomes(s3: Any, bucket: str, db_path: str, dry_run: bool) -> dict[str, object]:  # pyright: ignore[reportExplicitAny]  # untyped boto3 client (no stubs)
     """Seed predictor_outcomes from S3 predictions/*.json files."""
     try:
         resp = s3.list_objects_v2(Bucket=bucket, Prefix="predictor/predictions/", Delimiter="/")
@@ -1007,7 +1007,7 @@ def _seed_predictor_outcomes(s3, bucket: str, db_path: str, dry_run: bool) -> di
 # ── Step 3b: Seed challenger (shadow) outcomes ────────────────────────────────
 
 
-def _ensure_shadow_outcomes_schema(conn) -> None:
+def _ensure_shadow_outcomes_schema(conn: sqlite3.Connection) -> None:
     """Create the challenger-outcomes table if absent (champion/challenger
     Phase 2, L4469).
 
@@ -1044,7 +1044,7 @@ def _ensure_shadow_outcomes_schema(conn) -> None:
     conn.commit()
 
 
-def _seed_shadow_predictor_outcomes(s3, bucket: str, db_path: str, dry_run: bool) -> dict:
+def _seed_shadow_predictor_outcomes(s3: Any, bucket: str, db_path: str, dry_run: bool) -> dict[str, object]:  # pyright: ignore[reportExplicitAny]  # untyped boto3 client (no stubs)
     """Seed predictor_outcomes_shadow from predictions_shadow/{version_id}/*.json.
 
     Champion/challenger Phase 2 (L4469): the Phase-1 shadow runner writes each
@@ -1119,7 +1119,7 @@ def _seed_shadow_predictor_outcomes(s3, bucket: str, db_path: str, dry_run: bool
 
 
 def _resolve_pending_for_table(
-    conn, table: str, h: int, log_col: str, log_spy_col: str, dry_run: bool,
+    conn: sqlite3.Connection, table: str, h: int, log_col: str, log_spy_col: str, dry_run: bool,
 ) -> tuple[int, dict]:
     """Resolve never-resolved (actual_log_alpha IS NULL) rows of ``table`` at
     horizon ``h`` via the universe_returns JOIN. Updates each row BY ID with its
@@ -1140,8 +1140,8 @@ def _resolve_pending_for_table(
         return resolved, non_binary_skipped
 
     for _, row in pending.iterrows():
-        ticker = row["symbol"]
-        pred_date = row["prediction_date"]
+        ticker = cast(str, row["symbol"])
+        pred_date = cast(str, row["prediction_date"])
         ur = conn.execute(
             f"SELECT {log_col}, {log_spy_col} "
             f"FROM universe_returns WHERE ticker = ? AND eval_date = ?",
@@ -1284,7 +1284,7 @@ def _backfill_predictor_returns(
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
-def _ensure_score_performance_schema(conn) -> None:
+def _ensure_score_performance_schema(conn: sqlite3.Connection) -> None:
     """Add forward-return + calibrator-v1 context columns to
     score_performance if they don't exist yet.
 
@@ -1329,7 +1329,7 @@ def _ensure_score_performance_schema(conn) -> None:
     conn.commit()
 
 
-def _ensure_predictor_outcomes_schema(conn) -> None:
+def _ensure_predictor_outcomes_schema(conn: sqlite3.Connection) -> None:
     """Add horizon-agnostic columns to predictor_outcomes if not present.
 
     Defensive idempotent migration that mirrors alpha-engine-research's
@@ -1751,7 +1751,7 @@ def _emit_horizon_grading_lag_metric(db_path: str, forward_days: int) -> dict:
     return summary
 
 
-def _list_signal_dates(s3, bucket: str, prefix: str) -> list[str]:
+def _list_signal_dates(s3: Any, bucket: str, prefix: str) -> list[str]:  # pyright: ignore[reportExplicitAny]  # untyped boto3 client (no stubs)
     """List all signal dates from S3."""
     dates = []
     paginator = s3.get_paginator("list_objects_v2")
