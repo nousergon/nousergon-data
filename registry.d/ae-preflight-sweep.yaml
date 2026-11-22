@@ -17,11 +17,14 @@
 # itself and a stage with no verdict is counted as UNOBSERVED by the roll-up
 # below rather than omitted from the denominator.
 component_id: ae-preflight-sweep
-# Stage rows are generated from the live Step Function definition.  Declare
-# their shared literal prefix so the console associates every generated facet
-# with this component without a second, hand-maintained stage list.
+# Stage rows are derived from the Step Function definition. Declare their
+# shared literal prefix so the console attributes every generated stage row to
+# this component without a second, hand-maintained stage list. The console
+# contract (nousergon-console `component_descriptor.schema.json`, I13929) is a
+# list of nonempty prefix STRINGS matched with startswith; a mapping entry is
+# rejected by its descriptor parser.
 facet_families:
-  - prefix: ae-preflight-stage-
+  - ae-preflight-stage-
 owning_repo: nousergon-data
 # `eventbridge`, not `eventbridge+ec2-spot`. `substrate` is a CLOSED set in
 # `nous-ergon-ops/scripts/observability_registry.py` (a substrate with no

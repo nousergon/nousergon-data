@@ -23,7 +23,7 @@ import pathlib
 import pytest
 import yaml
 
-from infrastructure.preflight_sweep_console import stage_check_id
+from infrastructure.preflight_sweep_console import STAGE_CHECK_ID_PREFIX, stage_check_id
 from infrastructure.preflight_sweep_stages import (
     BOX_DIR_TO_REPO,
     LAUNCHER_BOX_INSTANCE_REF,
@@ -127,10 +127,16 @@ def test_the_derivation_finds_the_pipeline_s_send_command_stages(stages):
 
 
 def test_the_descriptor_declares_the_generated_stage_id_family(stages):
+    """The console reads `facet_families` as a list of nonempty literal prefix
+    strings (nousergon-console `console/model/descriptor.py::_facet_families`,
+    alpha-engine-config-I13929) and raises DescriptorError on anything else."""
     descriptor = yaml.safe_load(DESCRIPTOR_PATH.read_text())
-    assert descriptor["facet_families"] == [{"prefix": "ae-preflight-stage-"}]
+    families = descriptor["facet_families"]
+    assert isinstance(families, list)
+    assert all(isinstance(prefix, str) and prefix.strip() for prefix in families)
+    assert families == [f"{STAGE_CHECK_ID_PREFIX}-"]
 
-    prefix = descriptor["facet_families"][0]["prefix"]
+    prefix = families[0]
     generated_ids = {stage_check_id(stage.name) for stage in stages}
     assert generated_ids
     assert all(component_id.startswith(prefix) for component_id in generated_ids)
