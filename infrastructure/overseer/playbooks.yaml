@@ -2414,6 +2414,27 @@ alert_classes:
     # for the row (alpha-engine-config-PR10549 is exactly that fix).
     tier: tracked-only
     chat: none
+  - class: krepis_llm_fallback_engaged
+    # alpha-engine-config-I13940 (krepis-PR328): krepis/llm.py publishes ONE
+    # alert through krepis.alerts.publish, severity warning, source
+    # FALLBACK_ALERT_SOURCE ("krepis.llm.fallback"), when a router-edge group
+    # ENTERS a fallback episode -- the configured primary failed and a
+    # substitute deployment served the call. Calls inside the episode do not
+    # re-alert, recovery re-arms, and a 60-minute dedup key covers
+    # short-lived processes. Without this row the source resolves to PAGE as
+    # registry drift (krepis.alert_tiers.resolve_tier's no-row branch).
+    source: "krepis.llm.fallback"
+    severities: [warning]
+    intake: bus
+    response: drain-queue
+    # DECLARED: the call SUCCEEDED on the substitute, so the condition is
+    # degraded, not down -- the same disposition as llm_egress_proxy_sli and
+    # litellm_proxy_degraded_start above, and as data_spot_quota_fallback
+    # ("succeeded on fallback"). A primary that is actually unreachable with
+    # no working substitute fails the call, which surfaces on the consumer's
+    # own class; drain-queue owns triage of why the primary dropped out.
+    tier: tracked-only
+    chat: none
 
   # ── DRAIN-BLIND rows (every one carries its migration or declaration) ──
   - class: executor_emergency_shutdown
