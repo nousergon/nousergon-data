@@ -193,6 +193,12 @@ def test_digest_flags_tracked_failed_ssm_status(state_name: str, poll_key: str) 
     )
     assert hollow is True
     assert any(state_name in line and "SSM command failed" in line for line in lines)
+    # The poll result lives in the Task output, so the live digest must ask
+    # for execution data on every page (the fetch default stays False).
+    assert all(
+        call.kwargs["includeExecutionData"] is True
+        for call in sf.get_execution_history.call_args_list
+    )
 
 
 def test_digest_flags_nonzero_ssm_response_code() -> None:
@@ -308,7 +314,25 @@ def test_fetch_execution_history_paginates_past_the_old_twenty_page_cap() -> Non
     assert len(events) == 25 * 3
     assert truncated is False
     assert sf.get_execution_history.call_count == 25
-    assert sf.get_execution_history.call_args_list[0].kwargs["includeExecutionData"] is True
+    assert all(
+        call.kwargs["includeExecutionData"] is False
+        for call in sf.get_execution_history.call_args_list
+    )
+
+
+def test_fetch_execution_history_includes_execution_data_on_every_page_when_requested():
+    sf = _paged_history_client(total_pages=3)
+    events, truncated = fetch_execution_history(
+        sf, "arn:exec", include_execution_data=True
+    )
+
+    assert len(events) == 9
+    assert truncated is False
+    assert [call.kwargs["includeExecutionData"] for call in sf.get_execution_history.call_args_list] == [
+        True,
+        True,
+        True,
+    ]
 
 
 def test_fetch_execution_history_reports_truncation_when_pages_exhausted() -> None:

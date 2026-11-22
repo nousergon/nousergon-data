@@ -91,6 +91,12 @@ def test_sql_aggregates_server_side():
     assert "DENSE_RANK()" in fcd._CENTROID_SQL
 
 
+def test_foreign_filer_forms_are_included_in_centroid_queries():
+    for form_type in ("20-F", "40-F"):
+        assert f"'{form_type}'" in fcd._CENTROID_SQL
+        assert f"'{form_type}'" in fcd._TICKER_SAMPLE_FILTER
+
+
 def test_no_bulk_raw_embedding_select_anywhere_in_module():
     # The exact legacy egress-whale projection must never reappear. Strip the
     # module docstring/comments risk by checking the one aggregated read is

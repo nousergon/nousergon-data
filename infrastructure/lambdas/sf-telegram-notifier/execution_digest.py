@@ -543,6 +543,7 @@ def fetch_execution_history(
     *,
     max_pages: Optional[int] = None,
     page_size: Optional[int] = None,
+    include_execution_data: bool = False,
 ) -> Tuple[List[dict], bool]:
     """Returns ``(events, truncated)``. ``truncated`` is True only when
     ``max_pages`` was exhausted with a ``nextToken`` still outstanding —
@@ -558,6 +559,11 @@ def fetch_execution_history(
     leaves the service default (100), which is what the live notifier has
     always used; the batch floor calibration passes 1000 so a ~900-event
     execution is one call instead of nine (alpha-engine-config-I11792).
+    ``maxResults`` is only an upper bound: response-size constraints can
+    produce smaller pages, especially when ``include_execution_data`` is
+    true, so pagination always follows ``nextToken``. Both the live digest
+    and offline calibration enable it to read Task outputs as poll statuses
+    (alpha-engine-config-I10189 / I10591); the default stays False.
     """
     if max_pages is None:
         max_pages = _MAX_HISTORY_PAGES
@@ -567,9 +573,7 @@ def fetch_execution_history(
     for _ in range(max_pages):
         kwargs: dict[str, Any] = {
             "executionArn": execution_arn,
-            # Poll-state outputs carry the raw GetCommandInvocation result used
-            # to detect a command failure even when the execution succeeds.
-            "includeExecutionData": True,
+            "includeExecutionData": include_execution_data,
         }
         if page_size:
             kwargs["maxResults"] = page_size
@@ -674,7 +678,12 @@ def build_execution_digest(
     if not execution_arn:
         return ["_(digest unavailable: missing executionArn)_"], False, None
     try:
-        events, truncated = fetch_execution_history(sf_client, execution_arn)
+        # Poll-state outputs carry the raw GetCommandInvocation result that
+        # _failed_ssm_poll_states reads to catch a command failure even when
+        # the execution itself succeeded (alpha-engine-config-I10189).
+        events, truncated = fetch_execution_history(
+            sf_client, execution_arn, include_execution_data=True
+        )
     except Exception as exc:  # noqa: BLE001
         logger.error("get_execution_history failed for %s: %s", execution_arn, exc)
         return ["_(digest unavailable: history fetch failed)_"], False, None
