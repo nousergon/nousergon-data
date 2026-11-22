@@ -786,3 +786,11 @@ def test_drill_skips_signature_probe_entirely(monkeypatch):
     idx._test_s3.list_objects_v2 = _boom_list
     out = idx.handler({"is_drill": "true"}, None)
     assert out["launched"] is True
+
+
+def test_dispatch_run_id_export_is_shell_safe_and_optional(monkeypatch):
+    index = _load(monkeypatch)
+    args = ("repo/name", "a" * 40, "1", "https://example.test/run", "ci", "main", "token")
+    command = index._bootstrap_command(*args, dispatch_run_id="ledger/it's-safe.json")
+    assert "export OVERSEER_DISPATCH_RUN_ID='ledger/it'\"'\"'s-safe.json'" in command
+    assert "export OVERSEER_DISPATCH_RUN_ID=''" in index._bootstrap_command(*args)
