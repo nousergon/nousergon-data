@@ -215,6 +215,18 @@ _NO_IMMEDIATE_PAGE: dict[tuple[str, str], str] = {
         "before the heal has run would page on a condition the pipeline is "
         "actively repairing."
     ),
+    (
+        # aec#7764
+        "step_function_eod_reconcile.json",
+        "HealSetSignatureDegradedFlag",
+    ): (
+        "Inside the closed heal loop, after SetDegradedFlag has already set the "
+        "flag. An unreadable workload failure signature only means the "
+        "deterministic-failure short-circuit cannot fire: the bounded retry "
+        "continues and the loop's own outcome (HealConvergedNotify, "
+        "HealReplayDispatchFailed or HealNonConvergent) still notifies. Paging "
+        "here would page on a condition the loop is still repairing."
+    ),
 }
 
 #: alpha-engine-config-I11073 brought the ten ResearchPredictorParallel fail-open

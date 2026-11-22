@@ -1264,7 +1264,7 @@
         "attempts": 0
       },
       "ResultPath": "$.heal_loop",
-      "Next": "HealLoopGate"
+      "Next": "HealInitialSignatureAvailable"
     },
     "HealLoopGate": {
       "Type": "Choice",
@@ -1293,7 +1293,7 @@
           "Next": "HealNonConvergent"
         }
       ],
-      "Default": "HealStartCollection"
+      "Default": "HealMarkAttemptStarted"
     },
     "HealReProbe": {
       "Type": "Task",
@@ -1349,7 +1349,7 @@
           "Next": "HealDispatchReplay"
         }
       ],
-      "Default": "HealLoopIncrement"
+      "Default": "HealCheckRepeatedFailure"
     },
     "HealLoopIncrement": {
       "Type": "Pass",
@@ -1437,7 +1437,7 @@
     },
     "HealNonConvergent": {
       "Type": "Task",
-      "Comment": "config-I2702 deliverable #3(d): THE loud page. Fires only when the heal loop exhausted its 2-attempt budget, passed the probe-computed 09:00 UTC deadline, or this is a replay execution that still can't converge (CheckHealLoopEligible). Genuinely requires operator attention \u2014 the automatic path has been exhausted.",
+      "Comment": "config-I2702 deliverable #3(d): THE loud page. Fires only when the heal loop exhausted its 2-attempt budget, passed the probe-computed 09:00 UTC deadline, or this is a replay execution that still can't converge (CheckHealLoopEligible). Genuinely requires operator attention \u2014 the automatic path has been exhausted. aec#7764: also reached from HealCheckRepeatedFailure when the heal collection's fresh workload failure signature equals the initial one (a deterministic failure) \u2014 the same page and cleanup, one wasted relaunch instead of two.",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
@@ -1960,7 +1960,8 @@
         "failed.$": "$.Payload.readiness.failed",
         "failure_mode.$": "$.Payload.readiness.failure_mode",
         "baseline.$": "$.Payload.readiness.baseline",
-        "summary.$": "$.Payload.readiness.summary"
+        "summary.$": "$.Payload.readiness.summary",
+        "failure_signature.$": "$.Payload.readiness.failure_signature"
       },
       "ResultPath": "$.collection_readiness",
       "Next": "CheckCollectionReadiness"
@@ -2084,10 +2085,10 @@
           ],
           "Comment": "A FAILED/TIMED_OUT collection is not a convergence verdict \u2014 the collection fails loud on ANY unit, while the precondition is the SPY close + macro sentinel. HealReProbe decides, exactly as it did after a failed spot.",
           "ResultPath": "$.heal_error",
-          "Next": "HealReProbe"
+          "Next": "HealReadFailureSignature"
         }
       ],
-      "Next": "HealReProbe"
+      "Next": "HealReadFailureSignature"
     },
     "DrainTraderReconcile": {
       "Type": "Task",
@@ -2306,6 +2307,154 @@
       },
       "ResultPath": "$.degraded_summary",
       "Next": "PublishTraderReconcileDrainUnsettled"
+    },
+    "HealInitialSignatureAvailable": {
+      "Type": "Choice",
+      "Comment": "aec#7764: only a measured, nonempty workload failure signature can participate in deterministic-failure comparison.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.collection_readiness.failure_signature",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.collection_readiness.failure_signature",
+              "StringGreaterThan": ""
+            }
+          ],
+          "Next": "HealCaptureInitialFailureSignature"
+        }
+      ],
+      "Default": "HealClearInitialFailureSignature"
+    },
+    "HealCaptureInitialFailureSignature": {
+      "Type": "Pass",
+      "Parameters": {
+        "value.$": "$.collection_readiness.failure_signature"
+      },
+      "ResultPath": "$.heal_initial_signature",
+      "Next": "HealLoopGate"
+    },
+    "HealClearInitialFailureSignature": {
+      "Type": "Pass",
+      "Result": {
+        "value": ""
+      },
+      "ResultPath": "$.heal_initial_signature",
+      "Next": "HealLoopGate"
+    },
+    "HealMarkAttemptStarted": {
+      "Type": "Pass",
+      "Comment": "aec#7764: opens a fresh per-attempt record, so nothing from a previous attempt (including its fresh failure-signature read) can be compared against. not_before is this state's entry time; the manifest read after the heal collection grades only manifests finished after it, so an old failure cannot short-circuit a retry. payload is the collection-readiness probe event, built here because the SDK Lambda integration takes its Payload as a string.",
+      "Parameters": {
+        "not_before.$": "$$.State.EnteredTime",
+        "payload": {
+          "collection": "eod",
+          "units": [
+            "D03",
+            "D19",
+            "D20",
+            "D21",
+            "D22",
+            "D23",
+            "D24",
+            "D25",
+            "D26",
+            "D27",
+            "D28",
+            "D29",
+            "D30",
+            "D31",
+            "D32"
+          ],
+          "not_before.$": "$$.State.EnteredTime",
+          "lookback_seconds": 0
+        }
+      },
+      "ResultPath": "$.heal_attempt",
+      "Next": "HealStartCollection"
+    },
+    "HealReadFailureSignature": {
+      "Type": "Task",
+      "Comment": "aec#7764: reads the workload's own failure signature (fresh failed unit manifests, via the collection-readiness probe) after the heal collection finishes. Deliberately the AWS SDK Lambda integration, not the optimized lambda:invoke form: this is a bookkeeping read feeding HealCheckRepeatedFailure, not a substantive pipeline stage, so it does not need a console archive-page registry row (nousergon_lib.pipeline_status.registry.STATE_TO_ARCHIVE_PAGE keys substantive states by lambda:invoke Resource). A raise, a Lambda function error or an unparseable payload never counts as a matching failure: Catch writes the degraded flag and the bounded retry continues. The SDK integration does not raise on a Lambda function error; the response then lacks readiness.failure_signature and HealCheckRepeatedFailure's IsPresent guard falls to its Default.",
+      "Resource": "arn:aws:states:::aws-sdk:lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-collection-readiness-probe",
+        "Payload.$": "States.JsonToString($.heal_attempt.payload)"
+      },
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "ResultSelector": {
+        "parsed.$": "States.StringToJson($.Payload)"
+      },
+      "ResultPath": "$.heal_attempt.fresh",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "An unreadable signature is a degraded read, never evidence that failures match.",
+          "ResultPath": "$.heal_signature_error",
+          "Next": "HealSetSignatureDegradedFlag"
+        }
+      ],
+      "Next": "HealReProbe"
+    },
+    "HealCheckRepeatedFailure": {
+      "Type": "Choice",
+      "Comment": "aec#7764: after one wasted relaunch, identical nonempty workload failures are non-convergent and use the existing loud page/cleanup route.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.heal_initial_signature.value",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.heal_initial_signature.value",
+              "StringGreaterThan": ""
+            },
+            {
+              "Variable": "$.heal_attempt.fresh.parsed.readiness.failure_signature",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.heal_attempt.fresh.parsed.readiness.failure_signature",
+              "StringGreaterThan": ""
+            },
+            {
+              "Variable": "$.heal_attempt.fresh.parsed.readiness.failure_signature",
+              "StringEqualsPath": "$.heal_initial_signature.value"
+            }
+          ],
+          "Next": "HealNonConvergent"
+        }
+      ],
+      "Default": "HealLoopIncrement"
+    },
+    "HealSetSignatureDegradedFlag": {
+      "Type": "Pass",
+      "Comment": "aec#7764 (Option-A parity with SetDegradedFlag): threads $.degraded_summary onto the unreadable-signature fail-open path WITHOUT changing its continuation (HealReProbe, then the bounded retry). Last write wins; degraded=true is preserved either way. The failed read leaves no $.heal_attempt.fresh, so nothing stale can compare equal.",
+      "Parameters": {
+        "degraded": true,
+        "reason": "heal_failure_signature_unreadable",
+        "run_date.$": "$.run_date"
+      },
+      "ResultPath": "$.degraded_summary",
+      "Next": "HealReProbe"
     }
   }
 }
