@@ -44,6 +44,7 @@ assertion from it.
 from __future__ import annotations
 
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -243,3 +244,54 @@ def test_semantic_exemptions_self_retire_when_assertion_is_added() -> None:
         if any(call in by_name[name].read_text() for call in _SEMANTIC_ASSERT_CALLS)
     }
     assert not fixed, f"remove fixed semantic exemption(s): {sorted(fixed)}"
+
+
+_SMOKE_HELPER = REPO / "infrastructure" / "lambdas" / "_shared" / "smoke.sh"
+
+
+def _run_semantic_helper(
+    tmp_path: Path, response: str, *call: str
+) -> subprocess.CompletedProcess[str]:
+    """Source the shared helper and run one semantic assertion against a
+    local response file, exactly as a deploy.sh --smoke path does. No AWS."""
+    resp = tmp_path / "response.json"
+    resp.write_text(response, encoding="utf-8")
+    return subprocess.run(
+        ["bash", "-c", 'source "$1"; shift; "$@"', "smoke-test", str(_SMOKE_HELPER),
+         call[0], str(resp), *call[1:]],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("response", "call", "ok"),
+    [
+        ('{"launched": true}', ("assert_json_response_field_equals", "launched", "true"), True),
+        # The broken-handler shape: a quiet ``launched: false`` is not success.
+        ('{"launched": false, "reason": "disabled"}', ("assert_json_response_field_equals", "launched", "true"), False),
+        # JSON-typed comparison: the string "true" is not the boolean true.
+        ('{"launched": "true"}', ("assert_json_response_field_equals", "launched", "true"), False),
+        ('{"status": "Registering"}', ("assert_json_response_field_equals", "status", '"Registering"'), True),
+        ('{"sent": 0}', ("assert_json_response_field_equals", "sent", "1"), False),
+        ('null', ("assert_json_response_field_equals", "sent", "1"), False),
+        ('not json', ("assert_json_response_field_equals", "sent", "1"), False),
+        ('{"checked_at": "2026-11-21T00:00:00+00:00"}', ("assert_json_response_field_present", "checked_at"), True),
+        ('{"checked_at": ""}', ("assert_json_response_field_present", "checked_at"), False),
+        ('{"checked_at": null}', ("assert_json_response_field_present", "checked_at"), False),
+        ('{}', ("assert_json_response_field_present", "checked_at"), False),
+    ],
+)
+def test_semantic_helpers_execute_against_handler_responses(
+    tmp_path: Path, response: str, call: tuple[str, ...], ok: bool
+) -> None:
+    """Executes the shared helpers (the acceptance's local broken-handler
+    demonstration): a contract response passes, every broken one exits
+    non-zero with a SMOKE FAILED diagnostic."""
+    result = _run_semantic_helper(tmp_path, response, *call)
+    if ok:
+        assert result.returncode == 0, result.stderr
+    else:
+        assert result.returncode != 0
+        assert "SMOKE FAILED" in result.stderr
