@@ -28,8 +28,9 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
-from datetime import date, datetime, timezone
-from typing import Any
+from datetime import date, datetime, timedelta, timezone
+from collections.abc import Callable
+from typing import Any, cast
 
 import boto3
 import pandas as pd
@@ -226,7 +227,7 @@ def collect(
 # ── Step 1: Seed score_performance ────────────────────────────────────────────
 
 
-def _load_stance_lookup_for_date(s3: Any, bucket: str, sig_date: str) -> dict[str, str]:  # pyright: ignore[reportExplicitAny] -- boto3 S3 client (untyped SDK object)
+def _load_stance_lookup_for_date(s3: Any, bucket: str, sig_date: str) -> dict[str, str]:  # pyright: ignore[reportExplicitAny]  # untyped boto3 client (no stubs)
     """Read predictions.json for ``sig_date`` and return
     {ticker: stance}. Empty dict on any failure (S3 404, JSON parse
     error, predictions.json without stance field).
@@ -280,7 +281,7 @@ def _extract_signal_context(payload: dict, ticker: str) -> dict:
 
 
 def _seed_score_performance(
-    s3: Any, bucket: str, db_path: str, signals_prefix: str, dry_run: bool,  # pyright: ignore[reportExplicitAny] -- boto3 S3 client (untyped SDK object)
+    s3: Any, bucket: str, db_path: str, signals_prefix: str, dry_run: bool,  # pyright: ignore[reportExplicitAny]  # untyped boto3 client (no stubs)
 ) -> dict:
     """Insert BUY-rated signals into score_performance with entry prices
     from universe_returns. Includes the 5 calibrator-v1 context columns
@@ -402,7 +403,7 @@ def _seed_score_performance(
 
 
 def _backfill_score_context(
-    s3: Any, bucket: str, db_path: str, signals_prefix: str, dry_run: bool,  # pyright: ignore[reportExplicitAny] -- boto3 S3 client (untyped SDK object)
+    s3: Any, bucket: str, db_path: str, signals_prefix: str, dry_run: bool,  # pyright: ignore[reportExplicitAny]  # untyped boto3 client (no stubs)
 ) -> dict:
     """Repair existing score_performance rows whose calibrator-v1 context
     columns are NULL (rows seeded before _seed_score_performance learned
@@ -724,7 +725,7 @@ def _backfill_outcome_records(
                 # fabricate.
                 beat = bool(beat_spy) if beat_spy is not None else (stock_return > spy_return)
 
-                record: dict[str, object] = {
+                record = {
                     "schema_version": 1,
                     "signal_id": f"{symbol}:{score_date}",
                     "score_date": score_date,
@@ -943,7 +944,7 @@ def _check_outcome_store_coverage(db_path: str) -> dict:
 # ── Step 3: Seed predictor_outcomes ───────────────────────────────────────────
 
 
-def _seed_predictor_outcomes(s3: Any, bucket: str, db_path: str, dry_run: bool) -> dict[str, Any]:  # pyright: ignore[reportExplicitAny] -- boto3 S3 client (untyped SDK object)
+def _seed_predictor_outcomes(s3: Any, bucket: str, db_path: str, dry_run: bool) -> dict[str, object]:  # pyright: ignore[reportExplicitAny]  # untyped boto3 client (no stubs)
     """Seed predictor_outcomes from S3 predictions/*.json files."""
     try:
         resp = s3.list_objects_v2(Bucket=bucket, Prefix="predictor/predictions/", Delimiter="/")
@@ -1043,7 +1044,7 @@ def _ensure_shadow_outcomes_schema(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def _seed_shadow_predictor_outcomes(s3: Any, bucket: str, db_path: str, dry_run: bool) -> dict[str, Any]:  # pyright: ignore[reportExplicitAny] -- boto3 S3 client (untyped SDK object)
+def _seed_shadow_predictor_outcomes(s3: Any, bucket: str, db_path: str, dry_run: bool) -> dict[str, object]:  # pyright: ignore[reportExplicitAny]  # untyped boto3 client (no stubs)
     """Seed predictor_outcomes_shadow from predictions_shadow/{version_id}/*.json.
 
     Champion/challenger Phase 2 (L4469): the Phase-1 shadow runner writes each
@@ -1118,7 +1119,7 @@ def _seed_shadow_predictor_outcomes(s3: Any, bucket: str, db_path: str, dry_run:
 
 
 def _resolve_pending_for_table(
-    conn: Any, table: str, h: int, log_col: str, log_spy_col: str, dry_run: bool,  # pyright: ignore[reportExplicitAny] -- rows read back through pandas are untyped
+    conn: sqlite3.Connection, table: str, h: int, log_col: str, log_spy_col: str, dry_run: bool,
 ) -> tuple[int, dict]:
     """Resolve never-resolved (actual_log_alpha IS NULL) rows of ``table`` at
     horizon ``h`` via the universe_returns JOIN. Updates each row BY ID with its
@@ -1139,8 +1140,8 @@ def _resolve_pending_for_table(
         return resolved, non_binary_skipped
 
     for _, row in pending.iterrows():
-        ticker = row["symbol"]
-        pred_date = row["prediction_date"]
+        ticker = cast(str, row["symbol"])
+        pred_date = cast(str, row["prediction_date"])
         ur = conn.execute(
             f"SELECT {log_col}, {log_spy_col} "
             f"FROM universe_returns WHERE ticker = ? AND eval_date = ?",
@@ -1576,7 +1577,7 @@ def _emit_horizon_grading_lag_metric(db_path: str, forward_days: int) -> dict:
     # between 00:37 and 03:20 UTC, and every run outside that gap read 0.
     today = _market_today()
 
-    summary: dict = {"status": "ok", "forward_days": h}
+    summary: dict[str, object] = {"status": "ok", "forward_days": h}
     try:
         conn = sqlite3.connect(db_path)
         try:
@@ -1613,12 +1614,12 @@ def _emit_horizon_grading_lag_metric(db_path: str, forward_days: int) -> dict:
     # the newest closed date is already graded — count_trading_days is a
     # half-open (start, end] count so it's 0 when start == end and never
     # negative for a healthy monotonic backfill).
-    lag_returns = (
+    lag_returns = cast(int,
         count_trading_days(date.fromisoformat(max_graded_returns), date.fromisoformat(newest_closed_returns))
         if newest_closed_returns and max_graded_returns
         else 0
     )
-    lag_outcomes = (
+    lag_outcomes = cast(int,
         count_trading_days(date.fromisoformat(max_graded_outcome), date.fromisoformat(newest_closed_outcomes))
         if newest_closed_outcomes and max_graded_outcome
         else 0
@@ -1637,6 +1638,64 @@ def _emit_horizon_grading_lag_metric(db_path: str, forward_days: int) -> dict:
 
     try:
         cw = boto3.client("cloudwatch")
+        dimensions = [{"Name": "HorizonDays", "Value": str(h)}]
+
+        def consecutive_weeks(metric_name: str, lag: int) -> int:
+            if lag == 0:
+                return 0
+            try:
+                # Count only datapoints from COMPLETED UTC days: a same-day
+                # rerun must not see (and increment on) its own earlier
+                # datapoint, so the count advances once per run date.
+                end = datetime.now(timezone.utc).replace(
+                    hour=0, minute=0, second=0, microsecond=0,
+                )
+                get_statistics = cast(Callable[..., object], cw.get_metric_statistics)
+                response = get_statistics(
+                    Namespace="AlphaEngine/Data",
+                    MetricName=metric_name,
+                    Dimensions=dimensions,
+                    StartTime=end - timedelta(days=35),
+                    EndTime=end,
+                    Period=86400,
+                    Statistics=["Maximum"],
+                )
+                if not isinstance(response, dict):
+                    return 1
+                typed_response = cast(dict[object, object], response)
+                prior = typed_response.get("Datapoints")
+                if not isinstance(prior, list) or not prior:
+                    return 1
+                points = [
+                    cast(dict[object, object], point)
+                    for point in cast(list[object], prior)
+                    if isinstance(point, dict)
+                ]
+                points = [
+                    point for point in points
+                    if not (
+                        isinstance(point.get("Timestamp"), datetime)
+                        and cast(datetime, point["Timestamp"]) >= end
+                    )
+                ]
+                if not points:
+                    return 1
+                latest = max(points, key=lambda point: str(point.get("Timestamp")))
+                previous = latest.get("Maximum", 0)
+                return int(previous) + 1 if isinstance(previous, (int, float)) else 1
+            except Exception as exc:
+                logger.warning(
+                    "horizon_grading_lag consecutive metric read failed for %s; "
+                    "starting a new consecutive run. %s", metric_name, exc,
+                )
+                return 1
+
+        consecutive_returns = consecutive_weeks(
+            "universe_returns_horizon_grading_lag_consecutive_weeks", lag_returns,
+        )
+        consecutive_outcomes = consecutive_weeks(
+            "predictor_outcomes_grading_lag_consecutive_weeks", lag_outcomes,
+        )
         cw.put_metric_data(
             Namespace="AlphaEngine/Data",
             MetricData=[
@@ -1644,15 +1703,31 @@ def _emit_horizon_grading_lag_metric(db_path: str, forward_days: int) -> dict:
                     "MetricName": "universe_returns_horizon_grading_lag_trading_days",
                     "Value": float(lag_returns),
                     "Unit": "Count",
-                    "Dimensions": [{"Name": "HorizonDays", "Value": str(h)}],
+                    "Dimensions": dimensions,
                 },
                 {
                     "MetricName": "predictor_outcomes_grading_lag_trading_days",
                     "Value": float(lag_outcomes),
                     "Unit": "Count",
-                    "Dimensions": [{"Name": "HorizonDays", "Value": str(h)}],
+                    "Dimensions": dimensions,
+                },
+                {
+                    "MetricName": "universe_returns_horizon_grading_lag_consecutive_weeks",
+                    "Value": float(consecutive_returns),
+                    "Unit": "Count",
+                    "Dimensions": dimensions,
+                },
+                {
+                    "MetricName": "predictor_outcomes_grading_lag_consecutive_weeks",
+                    "Value": float(consecutive_outcomes),
+                    "Unit": "Count",
+                    "Dimensions": dimensions,
                 },
             ],
+        )
+        summary.update(
+            universe_returns_lag_consecutive_weeks=consecutive_returns,
+            predictor_outcomes_lag_consecutive_weeks=consecutive_outcomes,
         )
     except Exception as exc:
         logger.warning(
@@ -1676,7 +1751,7 @@ def _emit_horizon_grading_lag_metric(db_path: str, forward_days: int) -> dict:
     return summary
 
 
-def _list_signal_dates(s3: Any, bucket: str, prefix: str) -> list[str]:  # pyright: ignore[reportExplicitAny] -- boto3 S3 client (untyped SDK object)
+def _list_signal_dates(s3: Any, bucket: str, prefix: str) -> list[str]:  # pyright: ignore[reportExplicitAny]  # untyped boto3 client (no stubs)
     """List all signal dates from S3."""
     dates = []
     paginator = s3.get_paginator("list_objects_v2")
