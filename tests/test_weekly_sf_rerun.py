@@ -30,6 +30,8 @@ Plus the config#2280 mutex-steal decision matrix and the role-gating
 verification (config#2277 deliverable 2).
 """
 
+# ruff: noqa: ANN001, ANN003, ANN201, ANN202, ANN204, ANN205
+
 from __future__ import annotations
 
 # Existing modules predate the repository-wide ANN gate.
@@ -87,16 +89,7 @@ class TestDerivePlan:
             "skip_scanner",
             "skip_regime_substrate",
             "skip_signals_envelope",
-            # alpha-engine-config-I7726 — new stage between
-            # SignalsEnvelope and ChallengerShadow.
-            "skip_research_self_test",
             "skip_challenger_shadow",
-            # alpha-engine-config-I11378: in this pre-2026-08-10 history the
-            # old ThinkTankCoverage chain sat AFTER RAG, so the restored
-            # stage's current-graph witness (CheckSkipRAGIngestion) reads as
-            # passed. Harmless: the stage is an observe-only gap fill, and a
-            # history this old is never the one being rerun.
-            "skip_thinktank_coverage",
             "skip_predictor_training",
         }
         assert plan.failed == ["rag_ingestion"]
@@ -137,9 +130,6 @@ class TestDerivePlan:
             "skip_scanner",
             "skip_regime_substrate",
             "skip_signals_envelope",
-            # alpha-engine-config-I7726 — new stage between
-            # SignalsEnvelope and ChallengerShadow.
-            "skip_research_self_test",
             "skip_challenger_shadow",
             # alpha-engine-config-I11378: this history ran the old
             # ThinkTankCoverage chain to completion, so a rerun must not
@@ -1720,6 +1710,35 @@ class TestChainedRecoveryKeepsTheOriginalRunsProgress:
         assert "skip_rationale_clustering" not in plan.skip_flags
         assert "rationale_clustering" not in plan.completed
 
+    def test_eval_judge_skip_route_does_not_perpetuate_across_chain(self, mod):
+        """The eval-judge skip route enters its completion witness without
+        entering its work state. That is evidence of a skip, not completion,
+        so the next recovery must get another opportunity to run the judge."""
+        skipped_eval_judge = [
+            "InitializeInput",
+            "CheckSkipEvalJudge",
+            "CheckSkipRationaleClustering",
+        ]
+        plan = mod.derive_plan(
+            _chain_history(skipped_eval_judge),
+            prior_histories=[(
+                "scheduled-run",
+                _chain_history(skipped_eval_judge),
+            )],
+            source_label="watch-rerun-2026-08-22-1",
+        )
+
+        assert "eval_judge" not in plan.completed
+        assert "skip_eval_judge" not in plan.rerun_input()
+
+    def test_work_without_completion_witness_is_failed(self, mod):
+        verdicts = mod.classify_stages({
+            "CheckSkipEvalJudge",
+            "ComputeEvalCadence",
+        })
+
+        assert verdicts["eval_judge"] == "failed"
+
 
 class TestDirectorReportCardFreshnessCoupling:
     """alpha-engine-config-I8382, measured 2026-08-22 watch-rerun-2026-08-22-3.
@@ -1780,7 +1799,7 @@ class TestDirectorReportCardFreshnessCoupling:
         """Regression: the ordinary case (both witnessed complete) is
         unaffected — nothing here should force an unnecessary ReportCard
         re-run when Director genuinely does not need to run."""
-        entered = self._REPORT_CARD_COMPLETED_DIRECTOR_FAILED[:-1] + [
+        entered = self._REPORT_CARD_COMPLETED_DIRECTOR_FAILED + [
             "DirectorComplete",
         ]
         plan = mod.derive_plan(_chain_history(entered))
@@ -2036,11 +2055,17 @@ class TestSpotDispatchOnlyWhenABoxStageSurvives:
                     # data_phase1 witnesses folded into collection_readiness,
                     # which is not a box conjunct (the wait runs on no box).
                     "ResearchPredictorParallel",          # collection_readiness witness
+                    "RAGIngestion",
                     "CheckSkipRegimeRetrospectiveEval",   # rag_ingestion witness
+                    "DataPhase2",
                     "CheckSkipEvalJudge",                 # data_phase2 witness
+                    "PredictorTraining",
                     "ResolveZooSpecs",                    # predictor_training witness
+                    "Backtester",
                     "CheckSkipPredictorBacktest",         # backtester witness
+                    "EvaluatorDiagnostics",
                     "CheckSkipPostEval",                  # evaluator witness
+                    "SaturdayHealthCheck",
                     "RunScope",                           # saturday_health_check witness (I8167)
                     "Director",                           # director's WORK state: entered, unfinished
                 ]
