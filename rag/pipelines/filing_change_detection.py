@@ -1,8 +1,8 @@
 """Filing change detection — "Lazy Prices" signal.
 
-Compares consecutive 10-K filings per ticker using embedding centroid similarity
-and section-level text diffs. Low change scores indicate "lazy" management that
-may underperform (Cohen, Malloy & Nguyen 2020).
+Compares consecutive annual and quarterly filings per ticker and form type using
+embedding centroid similarity and section-level text diffs. Low change scores
+indicate "lazy" management that may underperform (Cohen, Malloy & Nguyen 2020).
 
 Outputs filing_changes.json to S3 for downstream consumption by the research
 scoring pipeline.
@@ -67,7 +67,7 @@ _CENTROID_SQL = """
                    PARTITION BY ticker, doc_type ORDER BY filed_date DESC
                ) AS date_rank
         FROM rag.documents
-        WHERE doc_type IN ('10-K', '10-Q'){ticker_filter}
+        WHERE doc_type IN ('10-K', '10-Q', '20-F', '40-F'){ticker_filter}
     )
     SELECT f.ticker,
            f.doc_type,
@@ -92,7 +92,7 @@ _CENTROID_SQL = """
 _TICKER_SAMPLE_FILTER = """
           AND ticker IN (
               SELECT DISTINCT ticker FROM rag.documents
-              WHERE doc_type IN ('10-K', '10-Q')
+              WHERE doc_type IN ('10-K', '10-Q', '20-F', '40-F')
               ORDER BY ticker
               LIMIT %s
           )"""
@@ -211,7 +211,7 @@ def _load_filing_centroids_from_parquet(
     """
     from nousergon_lib.rag.local_ann import list_parquet_keys, load_corpus_dataframe
 
-    doc_types = ["10-K", "10-Q"]
+    doc_types = ["10-K", "10-Q", "20-F", "40-F"]
     all_keys: list[str] = []
     for dt in doc_types:
         keys = list_parquet_keys(doc_type=dt, bucket=bucket)
@@ -223,7 +223,7 @@ def _load_filing_centroids_from_parquet(
 
     if not all_keys:
         logger.warning(
-            "parquet tier: no parquet objects found for 10-K/10-Q — "
+            "parquet tier: no parquet objects found for 10-K/10-Q/20-F/40-F — "
             "is the mirror populated? (config#2958 deliverable 1)"
         )
         return {}
@@ -313,7 +313,7 @@ def compute_filing_changes(
     results = []
 
     for ticker, filings in by_ticker.items():
-        # Group by doc_type (compare 10-K to 10-K, 10-Q to 10-Q)
+        # Group by doc_type so filings are compared only with the same form.
         by_type: dict[str, list[dict]] = defaultdict(list)
         for f in filings:
             by_type[f["doc_type"]].append(f)
@@ -388,7 +388,7 @@ def compute_filing_changes(
     return results
 
 
-def main():
+def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     parser = argparse.ArgumentParser(description="Detect filing changes (Lazy Prices signal)")
