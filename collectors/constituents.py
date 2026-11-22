@@ -293,6 +293,15 @@ _YF_PLACEHOLDER_INDUSTRIES: frozenset[str] = frozenset({"Shell Companies"})
 # — VYLR joined the S&P 500 on 2026-10-01 in Corteva's (Materials) slot and
 # "will have a GICS change to Consumer Staples effective on October 6"
 # (prior to the open).
+#
+# TXCP source: Texas Capital Bancshares, Inc., "Texas Capital Bancshares, Inc.
+# Begins Trading on TXSE Under New TXCP Ticker", GlobeNewswire, 2026-11-09,
+# https://www.globenewswire.com/news-release/2026/11/09/3398584/25908/en/texas-capital-bancshares-inc-begins-trading-on-txse-under-new-txcp-ticker.html
+# — not a new index member: the existing S&P MidCap 400 constituent TCBI
+# (Financials, Banks) moved its primary listing to the Texas Stock Exchange and
+# changed its ticker to TXCP at the open on 2026-11-09. The rename arrived in
+# the 2026-11-06 snapshot (run 2026-11-09) and yfinance has no profile under the
+# new symbol yet (alpha-engine-config-I13417).
 _SECTOR_OVERRIDES: dict[str, tuple[tuple[str, str, str, str], ...]] = {
     "VYLR": (
         (
@@ -308,6 +317,15 @@ _SECTOR_OVERRIDES: dict[str, tuple[tuple[str, str, str, str], ...]] = {
             "2026-10-31",
             "S&P DJI 2026-10-01 release: GICS change to Consumer Staples "
             "effective 2026-10-06",
+        ),
+    ),
+    "TXCP": (
+        (
+            "Financials",
+            "2026-11-09",
+            "2026-12-11",
+            "ticker change from TCBI (Texas Capital Bancshares, Financials) on "
+            "the move to TXSE, effective 2026-11-09 per the company's release",
         ),
     ),
 }

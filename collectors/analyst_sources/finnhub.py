@@ -28,11 +28,15 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Any
+from collections.abc import Callable
+from typing import cast
 
 from nousergon_lib.sources import AnalystSnapshot
 
 logger = logging.getLogger(__name__)
+
+FinnhubFetcher = Callable[[str, dict[str, str] | None], object]
+_Recommendation = dict[str, str | int | float | bool | None]
 
 
 class FinnhubAnalystAdapter:
@@ -40,10 +44,10 @@ class FinnhubAnalystAdapter:
 
     name = "finnhub"
 
-    def __init__(self, finnhub_get_fn: Any = None) -> None:
+    def __init__(self, finnhub_get_fn: FinnhubFetcher | None = None) -> None:
         self._finnhub_get = finnhub_get_fn
 
-    def _get_fetcher(self):
+    def _get_fetcher(self) -> FinnhubFetcher:
         if self._finnhub_get is None:
             from collectors.finnhub_client import finnhub_get
             self._finnhub_get = finnhub_get
@@ -60,7 +64,7 @@ class FinnhubAnalystAdapter:
         if not isinstance(data, list) or not data:
             return None
 
-        latest = data[0]
+        latest = cast(_Recommendation, data[0])  # Finnhub JSON boundary
         totals = {
             k: int(latest.get(k, 0) or 0)
             for k in ("strongBuy", "buy", "hold", "sell", "strongSell")

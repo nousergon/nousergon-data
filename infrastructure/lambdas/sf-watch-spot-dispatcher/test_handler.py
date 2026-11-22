@@ -1180,3 +1180,100 @@ def test_only_one_extra_api_call_and_only_on_a_succeeded_latest(monkeypatch):
     )
     idx.handler(_event(defer_generation=1), _FakeContext())
     assert idx._test_sfn.history_calls == []
+
+
+# ── alpha-engine-config-I13712: a crucible v2 weekly arc is not a Step Function ──
+
+
+_V2_DISPATCH_ID = "0123456789abcdef0123456789abcdef"
+
+
+def _v2_event(**overrides):
+    base = {
+        "pipeline_name": "crucible-v2-weekly",
+        "cadence_slug": "crucible_weekly",
+        "dispatch_id": _V2_DISPATCH_ID,
+        "run_date": "2026-11-13",
+        # The crucible-v2 dispatcher names the failed JOB; the failing stage
+        # (e.g. `experiment.grade[s]`) is read from the store by the charter.
+        "failed_state": "weekly",
+        "cause": "failed: exit 1",
+        "failed_state_detail": "TurnoverBudgetError: [s] turnover 0.42 > budget 0.30",
+        "watch_log_key": "consolidated/crucible_weekly_sf_watch/2026-11-13.json",
+    }
+    base.update(overrides)
+    return base
+
+
+def test_a_v2_weekly_failure_launches_named_by_its_dispatch_id(monkeypatch):
+    calls = {}
+
+    def _launch(types_, subnets, **kw):
+        calls["extra_tags"] = kw.get("extra_tags")
+        return "i-v2"
+
+    idx = _load(monkeypatch, launch_impl=_launch, env={"SF_WATCH_DISPATCH_ENABLED": "true"})
+    out = idx.handler(_v2_event(), None)
+    assert out["launched"] is True, out
+    assert out["pipeline_name"] == "crucible-v2-weekly"
+    cmd = idx._test_ssm.sent[0]["Parameters"]["commands"][0]
+    assert 'export SF_PIPELINE="crucible-v2-weekly"' in cmd
+    assert f'export SF_DISPATCH_ID="{_V2_DISPATCH_ID}"' in cmd
+    # No Step Function exists, so neither ARN is exported with a value.
+    assert 'export SF_EXECUTION_ARN=""' in cmd
+    assert 'export SF_STATE_MACHINE_ARN=""' in cmd
+    assert 'export SF_RUN_DATE="2026-11-13"' in cmd
+    # The dispatch id is the run's cost-attribution identity.
+    assert calls["extra_tags"]["execution-id"] == _V2_DISPATCH_ID
+    assert calls["extra_tags"]["sf-watch-pipeline"] == "crucible-v2-weekly"
+
+
+def test_a_redispatched_v2_box_is_named_by_its_suffixed_dispatch_id(monkeypatch):
+    idx = _load(monkeypatch, env={"SF_WATCH_DISPATCH_ENABLED": "true"})
+    out = idx.handler(_v2_event(dispatch_id=_V2_DISPATCH_ID + "-r2"), None)
+    assert out["launched"] is True, out
+
+
+@pytest.mark.parametrize("bad", ["", "not-hex", _V2_DISPATCH_ID + "; reboot", "$(id)"])
+def test_a_v2_weekly_event_without_a_clean_dispatch_id_is_refused(monkeypatch, bad):
+    idx = _load(monkeypatch, env={"SF_WATCH_DISPATCH_ENABLED": "true"})
+    out = idx.handler(_v2_event(dispatch_id=bad), None)
+    assert out == {"launched": False, "reason": "invalid_event", "error": out["error"]}
+    assert idx._test_ssm.sent == []
+
+
+@pytest.mark.parametrize("field", ["execution_arn", "state_machine_arn"])
+def test_a_v2_weekly_event_carrying_an_arn_is_refused(monkeypatch, field):
+    """A v2 arc has no state machine; an ARN in its event is a wiring bug and
+    must not reach the charter as something to read."""
+    idx = _load(monkeypatch, env={"SF_WATCH_DISPATCH_ENABLED": "true"})
+    out = idx.handler(_v2_event(**{field: "any-value-at-all"}), None)
+    assert out["launched"] is False and out["reason"] == "invalid_event"
+
+
+def test_an_sf_pipeline_still_requires_its_execution_arn(monkeypatch):
+    idx = _load(monkeypatch, env={"SF_WATCH_DISPATCH_ENABLED": "true"})
+    out = idx.handler(_event(execution_arn="", dispatch_id=_V2_DISPATCH_ID), None)
+    assert out["launched"] is False and out["reason"] == "invalid_event"
+
+
+def test_a_deferred_v2_weekly_relaunch_never_asks_step_functions(monkeypatch):
+    """No state machine to re-check: a deferred v2 dispatch proceeds, and the
+    charter stands down itself if the arc already reads ok."""
+    idx = _load(monkeypatch, env={"SF_WATCH_DISPATCH_ENABLED": "true"})
+    out = idx.handler(_v2_event(defer_generation=1), _FakeContext())
+    assert out["launched"] is True, out
+    assert idx._test_sfn.calls == []
+
+
+def test_a_v2_weekly_defer_carries_the_dispatch_id_forward(monkeypatch):
+    idx = _load(
+        monkeypatch, env={"SF_WATCH_DISPATCH_ENABLED": "true"},
+        running_instances={("crucible_weekly", "crucible-v2-weekly", "2026-11-13"): ["i-live"]},
+    )
+    out = idx.handler(_v2_event(), _FakeContext())
+    assert out["reason"] == "deferred"
+    (sched,) = idx._test_scheduler.created
+    payload = json.loads(sched["Target"]["Input"])
+    assert payload["dispatch_id"] == _V2_DISPATCH_ID
+    assert payload["execution_arn"] == ""

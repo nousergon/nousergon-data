@@ -42,10 +42,11 @@ shared/ambiguous write site) is reported UNVERIFIABLE, never silently passed.
 from __future__ import annotations
 
 import ast
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from pathlib import Path
 
 from data_gate.descriptors import REPO_ROOT, Unit, load_units
-from data_gate.inventory import _declared_code_files, load_inventory_scope
+from data_gate.inventory import declared_code_files, load_inventory_scope
 
 __all__ = [
     "Finding",
@@ -145,14 +146,12 @@ def _return_literals(fn: ast.FunctionDef | ast.AsyncFunctionDef, module_consts: 
     return out
 
 
-def _local_module_path(module: str) -> "object | None":
-    from pathlib import Path
-
+def _local_module_path(module: str) -> Path | None:
     candidate = REPO_ROOT / (module.replace(".", "/") + ".py")
     return candidate if candidate.is_file() else None
 
 
-def _candidate_pool(py_file) -> set[str]:
+def _candidate_pool(py_file: Path) -> set[str]:
     """Every reachable literal for one file: its own, plus one hop into
     same-repo functions it imports from."""
     source = py_file.read_text(encoding="utf-8")
@@ -193,7 +192,7 @@ def _prefix_of(template: str) -> str:
     return template.split("{", 1)[0].split("*", 1)[0].rstrip("/")
 
 
-def _count_s3_write_calls(py_file) -> int:
+def _count_s3_write_calls(py_file: Path) -> int:
     source = py_file.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(py_file))
     count = 0
@@ -211,7 +210,7 @@ def check_unit(unit: Unit, *, sole_owner: bool) -> Finding:
     if unit.retired:
         return Finding(unit.unit_id, "ok", "retired — not graded")
 
-    files = _declared_code_files(unit)
+    files = declared_code_files(unit)
     py_files = [REPO_ROOT / f for f in files if (REPO_ROOT / f).is_file()]
     if not py_files:
         return Finding(unit.unit_id, "unverifiable", "code_path names no in-repo Python file")
@@ -224,7 +223,7 @@ def check_unit(unit: Unit, *, sole_owner: bool) -> Finding:
     for py_file in py_files:
         pool |= _candidate_pool(py_file)
 
-    unmatched = []
+    unmatched: list[str] = []
     for template in s3_templates:
         prefix = _prefix_of(template)
         if not prefix:
@@ -259,12 +258,12 @@ def run_all(units: list[Unit] | None = None) -> list[Finding]:
     shared_files = set(scope.shared_writers) | set(scope.extra_paths)
     code_path_owners: dict[str, list[str]] = {}
     for unit in units:
-        for f in _declared_code_files(unit):
+        for f in declared_code_files(unit):
             code_path_owners.setdefault(f, []).append(unit.unit_id)
 
-    findings = []
+    findings: list[Finding] = []
     for unit in units:
-        files = _declared_code_files(unit)
+        files = declared_code_files(unit)
         sole_owner = bool(files) and all(
             f not in shared_files and len(code_path_owners.get(f, [])) == 1 for f in files
         )

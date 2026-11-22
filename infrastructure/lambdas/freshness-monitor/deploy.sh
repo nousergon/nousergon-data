@@ -294,7 +294,7 @@ if $BOOTSTRAP; then
       --role "${ROLE_ARN}" \
       --handler index.handler \
       --zip-file "fileb://${ZIP}" \
-      --timeout 120 \
+      --timeout 300 \
       --memory-size 256 \
       --environment 'Variables={LOG_LEVEL=INFO,FRESHNESS_MONITOR_ENABLED=true,FRESHNESS_MONITOR_RECOVERY_ENABLED=false}' \
       --region "${REGION}" \
@@ -448,8 +448,11 @@ live.update(deploy_owned)
 print(json.dumps({"Variables": live}))
 PYEOF
 )
+# Timeout is enforced on every deploy, not only at create (alpha-engine-config#13770):
+# the daily sweep ran 110-119 s against the old 120 s limit and timed out 2026-11-16.
 run aws lambda update-function-configuration \
   --function-name "${FUNCTION_NAME}" \
+  --timeout 300 \
   --environment "${MERGED_ENV}" \
   --region "${REGION}" \
   --query 'LastUpdateStatus' --output text

@@ -27,13 +27,13 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date as Date
 from datetime import datetime, timezone
 from typing import Any, Sequence
 
+from krepis.yfinance_quiet import quiet_yfinance
 from nousergon_lib.sources import AnalystSnapshot, AnalystSource
-from nousergon_lib.yfinance_quiet import quiet_yfinance
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +59,7 @@ class AnalystSnapshotDocument:
     ticker: str
     snapshot_date: Date
     schema_version: int
-    snapshots_by_source: dict[str, dict]
+    snapshots_by_source: dict[str, dict[str, object]]
     fetched_at: datetime
 
 
@@ -96,7 +96,7 @@ def write_snapshot_document(
     ticker: str,
     snapshot_date: Date,
     snapshots: dict[str, AnalystSnapshot],
-    s3_client: Any,
+    s3_client: Any,  # pyright: ignore[reportExplicitAny]  # untyped boto3 S3 client (no stubs); a Protocol rejects the caller's client
     bucket: str = DEFAULT_S3_BUCKET,
     prefix: str = DEFAULT_S3_PREFIX,
     run_id: str | None = None,
@@ -163,7 +163,7 @@ def snapshot_universe(
     sources: Sequence[AnalystSource],
     *,
     snapshot_date: Date,
-    s3_client: Any,
+    s3_client: Any,  # pyright: ignore[reportExplicitAny]  # untyped boto3 S3 client (no stubs); a Protocol rejects the caller's client
     bucket: str = DEFAULT_S3_BUCKET,
     prefix: str = DEFAULT_S3_PREFIX,
     dry_run: bool = False,
@@ -214,7 +214,7 @@ def snapshot_universe(
 # ── S3 key + serialization helpers ────────────────────────────────────
 
 
-def _serialize_snapshot(snap: AnalystSnapshot) -> dict:
+def _serialize_snapshot(snap: AnalystSnapshot) -> dict[str, object]:
     """Pydantic AnalystSnapshot → JSON-safe dict.
 
     Uses model_dump(mode='json') so datetime/date/tuple fields encode
@@ -228,10 +228,10 @@ def read_snapshot_document(
     ticker: str,
     snapshot_date: Date,
     *,
-    s3_client: Any,
+    s3_client: Any,  # pyright: ignore[reportExplicitAny]  # untyped boto3 S3 client (no stubs); a Protocol rejects the caller's client
     bucket: str = DEFAULT_S3_BUCKET,
     prefix: str = DEFAULT_S3_PREFIX,
-) -> dict | None:
+) -> dict[str, object] | None:
     """Read one snapshot document for (ticker, date).
 
     Canonical shape: lists ``{prefix}/{ticker}/`` and finds artifacts
@@ -250,7 +250,7 @@ def read_snapshot_document(
             Bucket=bucket, Prefix=f"{per_ticker_prefix}/{yymmdd}",
         )
         candidates = sorted(
-            obj["Key"] for obj in (resp.get("Contents") or [])
+            obj["Key"] for obj in (resp.get("Contents") or ())
             if obj["Key"].endswith(".json")
             and not obj["Key"].endswith("/latest.json")
         )

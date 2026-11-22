@@ -21,7 +21,9 @@ import json
 import pathlib
 
 import pytest
+import yaml
 
+from infrastructure.preflight_sweep_console import STAGE_CHECK_ID_PREFIX, stage_check_id
 from infrastructure.preflight_sweep_stages import (
     BOX_DIR_TO_REPO,
     LAUNCHER_BOX_INSTANCE_REF,
@@ -48,6 +50,7 @@ from infrastructure.preflight_sweep_stages import (  # noqa: E402 — private he
 REPO = pathlib.Path(__file__).resolve().parent.parent
 SF_PATH = REPO / "infrastructure" / "step_function.json"
 MANIFEST_PATH = REPO / "infrastructure" / "preflight_sweep_manifest.json"
+DESCRIPTOR_PATH = REPO / "registry.d" / "ae-preflight-sweep.yaml"
 CONTEXT = {"Execution": {"Name": "preflight-sweep-test", "Id": "arn:test"}}
 
 
@@ -121,6 +124,22 @@ def test_the_derivation_finds_the_pipeline_s_send_command_stages(stages):
     assert "Backtester" in names
     assert "ResearchPredictorParallel.PredictorTraining" in names
     assert "ParityParallel.ParityReplay" in names
+
+
+def test_the_descriptor_declares_the_generated_stage_id_family(stages):
+    """The console reads `facet_families` as a list of nonempty literal prefix
+    strings (nousergon-console `console/model/descriptor.py::_facet_families`,
+    alpha-engine-config-I13929) and raises DescriptorError on anything else."""
+    descriptor = yaml.safe_load(DESCRIPTOR_PATH.read_text())
+    families = descriptor["facet_families"]
+    assert isinstance(families, list)
+    assert all(isinstance(prefix, str) and prefix.strip() for prefix in families)
+    assert families == [f"{STAGE_CHECK_ID_PREFIX}-"]
+
+    prefix = families[0]
+    generated_ids = {stage_check_id(stage.name) for stage in stages}
+    assert generated_ids
+    assert all(component_id.startswith(prefix) for component_id in generated_ids)
 
 
 def test_every_stage_lands_in_exactly_one_classification(stages):
@@ -540,14 +559,27 @@ def _retired(stage: str, **overrides) -> dict:
 def test_the_live_manifest_retires_the_v1_backtester_with_every_field(stages, manifest):
     """The exclusion lives in the manifest, with all four fields, and the
     definition still carries the stage -- it is retired, not removed."""
+    expected = {
+        "Backtester",
+        # Brian 2026-11-10, Director card "Retire all 8".
+        "ParityParallel.PitParityLookahead",
+        "ParityParallel.PitParityWalkforward",
+        "PitParityCompare",
+        "ParityParallel.ParityReplay",
+        "EvaluatorDiagnostics",
+        "EvaluatorOptimize",
+        "PredictorBacktest",
+        "PortfolioOptimizerBacktest",
+    }
     declared = manifest["retired_stages"]
-    assert set(declared) == {"Backtester"}
-    entry = declared["Backtester"]
-    for f in _RETIRED_FIELDS:
-        assert entry.get(f), f"retired_stages.Backtester.{f} is required"
-    assert entry["tracker"] == "alpha-engine-config-I13374"
-    assert "Backtester" in {s.name for s in stages}
-    assert retired_stages(manifest).keys() == {"Backtester"}
+    assert set(declared) == expected
+    names = {s.name for s in stages}
+    for stage, entry in declared.items():
+        for f in _RETIRED_FIELDS:
+            assert entry.get(f), f"retired_stages.{stage}.{f} is required"
+        assert entry["tracker"] == "alpha-engine-config-I13374"
+        assert stage in names, f"{stage} must still be in the definition (retired, not removed)"
+    assert retired_stages(manifest).keys() == expected
 
 
 def test_the_live_retirement_has_not_outlived_its_re_exam_date(stages, manifest):

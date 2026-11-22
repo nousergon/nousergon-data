@@ -24,6 +24,9 @@ never rewrite its status or artifact list.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import cast
+
 from nousergon_lib.phase_registry import PhaseRegistry
 
 from shadow.interceptor import own_state_reads
@@ -34,21 +37,30 @@ __all__ = ["RunStatePhaseRegistry"]
 class RunStatePhaseRegistry(PhaseRegistry):
     """``PhaseRegistry`` whose marker and artifact-probe reads are run state."""
 
-    def annotate_marker(self, phase_name: str, **fields) -> None:
+    _marker_annotations: dict[object, dict[str, object]]
+
+    def annotate_marker(self, phase_name: str, **fields: object) -> None:
         """Add ``fields`` to the next END marker written for ``phase_name``."""
-        annotations = self.__dict__.setdefault("_marker_annotations", {})
+        annotations = getattr(self, "_marker_annotations", None)
+        if annotations is None:
+            annotations = self._marker_annotations = {}
         annotations.setdefault(phase_name, {}).update(fields)
 
-    def _write_marker(self, marker: dict) -> None:
-        extra = self.__dict__.get("_marker_annotations", {}).pop(marker.get("phase"), None)
+    def _write_marker(self, marker: dict[str, object]) -> None:
+        extra = getattr(self, "_marker_annotations", {}).pop(marker.get("phase"), None)
         if extra:
             marker = {**extra, **marker}
-        super()._write_marker(marker)
+        # The library base class leaves its marker mapping unparameterized.
+        cast(Callable[[dict[str, object]], None], super()._write_marker)(marker)
 
     def should_run(self, phase_name: str, supports_auto_skip: bool = False) -> tuple[bool, str]:
         with own_state_reads():
             return super().should_run(phase_name, supports_auto_skip=supports_auto_skip)
 
-    def load_marker(self, phase_name: str) -> dict | None:
+    def load_marker(self, phase_name: str) -> dict[str, object] | None:
         with own_state_reads():
-            return super().load_marker(phase_name)
+            # The library base class leaves its marker mapping unparameterized.
+            load_marker = cast(
+                Callable[[str], dict[str, object] | None], super().load_marker
+            )
+            return load_marker(phase_name)

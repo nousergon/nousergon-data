@@ -34,56 +34,22 @@ component_id: "data-collector-d48-index-contributions"
 owning_repo: "nousergon-data"
 title: "per-constituent index contribution"
 component: 1
-lifecycle: pending
+lifecycle: in-service
 owner: brian
 code_path: "collectors/index_contributions.py:1"
-# RE-EXAMINED 2026-10-29 on a CHANGED reason (alpha-engine-config-I11306).
-# History: declared pending 2026-09-21 (re-exam 2026-10-05); re-declared
-# 2026-10-06 (re-exam 2026-10-20) because nothing scheduled it; re-declared
-# 2026-10-14 (re-exam 2026-10-28) when the trigger landed, to wait on the
-# first scheduled run. That wait is OVER: promotes_when is met (see
-# lifecycle_reason). This window waits only on the coordinated promotion,
-# whose alpha-engine-config half has to land first or with it.
-# pending_since + 14 days is the ops ceiling (PENDING_MAX_DAYS).
-pending_since: "2026-10-29"
-lifecycle_reexam: "2026-11-12"
-lifecycle_reason: >-
-    SCHEDULED by alpha-engine-config-I11306 and PRODUCING: `weekly_collector.py
-    --index-contributions` runs on ne-data-collection-panel, started by the
-    rule ne-data-collection-index-contributions-on-eod when
-    ne-data-collection-eod SUCCEEDS. Measured read-only 2026-10-29: status-ok
-    scheduled D48 run manifests for trading days 2026-10-22, 23, 26, 27 and 28
-    under data_collection/runs/D48/, and
-    market_data/index_contributions/{SPX,NDX}/latest.json both at trading_day
-    2026-10-28. So promotes_when is met. The unit stays pending only because
-    the promotion is cross-repo and is not yet ready on the
-    alpha-engine-config side (blocker, tracked on alpha-engine-config-I11306):
-    its two ARTIFACT_REGISTRY rows are still declared_off against I11306 with
-    `produced_by: manual`, and their eod_sf cadence and 120-minute SLA predate
-    the trigger, while the run lands about 20:30-20:40 ET; and
-    cross-repo-checks/test_producer_registry_contract.py does not match the
-    registry's `*` segment against this descriptor's `{index}` placeholder the
-    way data_gate/unit_readers.py does. Flipping this unit to in-service before
-    those land reads artifact_registry as parked here and turns that check red
-    there. The NDX leg is live: D49 has published, so a missing or stale NDX.json
-    makes the run partial and pages.
-lifecycle_owner: brian
+# PROMOTED 2026-11-13 (alpha-engine-config-I13635: the pending row expired on its
+# 2026-11-12 re-exam and turned the ops registry publish red). The promotes_when
+# condition is met, read-only, on 2026-11-13:
+# scheduled D48 run manifests with status ok exist under data_collection/runs/D48/ for
+# trading days through 2026-11-12, and
+# market_data/index_contributions/{SPX,NDX}/latest.json carry trading_day 2026-11-12.
+# The ARTIFACT_REGISTRY rows' declared_off blocks were cleared on 2026-10-31
+# (alpha-engine-config-I11306), so the promotion no longer reads artifact_registry
+# as parked. Per promotes_when, the pending dates are dropped.
 promotes_when: >-
-    A scheduled ne-data-collection-panel execution has filed an ok D48 run
-    manifest, and market_data/index_contributions/{SPX,NDX}/latest.json exists
-    with that session's trading_day. The cadence is already declared (trigger
-    below), so the promotion PR flips lifecycle to in-service, drops the pending
-    dates, and clears the two registry rows' declared-off block (see
-    registry_rows below).
-    Measured MET on 2026-10-29 (see lifecycle_reason). What is still
-    outstanding is the alpha-engine-config half (alpha-engine-config-I11306):
-    the two ARTIFACT_REGISTRY rows lose `declared_off`, name
-    ne-data-collection-panel as producer, and carry a cadence and SLA
-    re-checked against the landed trigger; and
-    cross-repo-checks/test_producer_registry_contract.py matches a registry
-    `*` segment against a descriptor placeholder the way
-    data_gate/unit_readers.py does. The promotion PR here lands with or after
-    that change.
+    MET (promoted 2026-11-13, see the comment above). Original condition: a
+    scheduled ne-data-collection-panel execution has filed an ok run manifest
+    and the unit's latest artifact carries a current date.
 trigger:
   kind: "step-functions"
   # Its own execution on ne-data-collection-panel, started by the EventBridge
@@ -154,8 +120,8 @@ detectors:
     note: "verify_units D48: a missing, failed or output-less D48 manifest fails its execution, which pages"
   - kind: "freshness-monitor"
     via: "artifact-registry-row"
-    state: ABSENT
-    note: "row registered but declared off until alpha-engine-config-I11306 schedules the producer; the monitor grades nothing before then"
+    state: PRESENT
+    note: "ARTIFACT_REGISTRY rows are live (declared_off cleared 2026-10-31, alpha-engine-config-I11306); the monitor grades them"
 freshness:
   family: "eod-spine"
   status: proposed

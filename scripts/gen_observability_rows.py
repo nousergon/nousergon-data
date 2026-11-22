@@ -73,16 +73,20 @@ import io
 import re
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from data_gate.descriptors import (  # noqa: E402
     EXTERNALLY_OWNED_OBSERVABILITY_ROWS,
-    UNITS_DIR,
+    Unit,
     load_units,
 )
+
+# A unit descriptor's raw YAML block, or an emitted observability row: both are
+# open-ended mappings whose value types vary per key.
+JsonDict = dict[str, Any]  # pyright: ignore[reportExplicitAny]  # raw descriptor YAML / emitted row, open-ended shape
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 OUT_DIR = REPO_ROOT / "registry.d"
@@ -136,7 +140,7 @@ LIFECYCLE_NEEDS_REASON = {"pending", "disabled", "deprecated", "retired"}
 REEXAM_DATE = "2026-09-28"  # 14 days out, matching PENDING_MAX_DAYS at generation time
 
 
-def _substrate(unit_id: str, trigger: dict[str, Any]) -> str:
+def _substrate(unit_id: str, trigger: JsonDict) -> str:
     kind = str(trigger.get("kind") or "")
     try:
         return SUBSTRATE_BY_TRIGGER_KIND[kind]
@@ -153,7 +157,7 @@ def _substrate(unit_id: str, trigger: dict[str, Any]) -> str:
 _SYSTEMD_UNIT_RE = re.compile(r"^\s*([A-Za-z0-9_.@-]+\.(?:timer|service))\b")
 
 
-def _origin(unit_id: str, trigger: dict[str, Any]) -> str:
+def _origin(unit_id: str, trigger: JsonDict) -> str:
     """The row's `origin`, in the form the ops reconciler routes on.
 
     `observability_registry.py::discoverer_for_origin` decides which discoverer
@@ -186,7 +190,7 @@ def _origin(unit_id: str, trigger: dict[str, Any]) -> str:
     return owner or detail or "undeclared"
 
 
-def _parent_component(unit_id: str, trigger: dict[str, Any]) -> tuple[str | None, str]:
+def _parent_component(unit_id: str, trigger: JsonDict) -> tuple[str | None, str]:
     """(the component this unit runs inside, or None; the reason).
 
     A `step-functions` unit's parent is DERIVED: `trigger.owner` names the
@@ -256,7 +260,7 @@ def _signal_from_audit(unit_id: str, column: str, cells: dict[str, str]) -> dict
     }
 
 
-def _log_location(unit_id: str, trigger: dict[str, Any]) -> tuple[str, str]:
+def _log_location(unit_id: str, trigger: JsonDict) -> tuple[str, str]:
     kind = trigger.get("kind")
     owner = trigger.get("owner") or ""
     if kind == "github-actions":
@@ -286,7 +290,7 @@ def _log_location(unit_id: str, trigger: dict[str, Any]) -> tuple[str, str]:
     )
 
 
-def _alert_channel(trigger: dict[str, Any]) -> tuple[str, str]:
+def _alert_channel(trigger: JsonDict) -> tuple[str, str]:
     kind = trigger.get("kind")
     if kind == "github-actions":
         return (
@@ -310,16 +314,17 @@ def _alert_channel(trigger: dict[str, Any]) -> tuple[str, str]:
     )
 
 
-def build_row(unit) -> dict[str, Any]:
+def build_row(unit: Unit) -> JsonDict:
     data = unit.raw
-    trigger = data.get("trigger") or {}
-    cells = (data.get("audit") or {}).get("cells") or {}
+    trigger = cast(JsonDict, data.get("trigger") or {})
+    audit = cast(JsonDict, data.get("audit") or {})
+    cells = cast(dict[str, str], audit.get("cells") or {})
     unit_lifecycle = str(data.get("lifecycle") or "")
     lifecycle = _lifecycle(unit.unit_id, unit_lifecycle)
     log_location, log_reason = _log_location(unit.unit_id, trigger)
     alert_channel, alert_reason = _alert_channel(trigger)
 
-    row: dict[str, Any] = {
+    row: JsonDict = {
         "component_id": data["component_id"],
         "owning_repo": "nousergon-data",
         "substrate": _substrate(unit.unit_id, trigger),
@@ -353,7 +358,7 @@ def build_row(unit) -> dict[str, Any]:
                 "descriptor itself declares lifecycle: pending."
             )
         elif lifecycle == "retired":
-            retirement = data.get("retirement") or {}
+            retirement = cast(JsonDict, data.get("retirement") or {})
             if not retirement.get("ruling") or not retirement.get("reason"):
                 raise ValueError(
                     f"{unit.unit_id}: lifecycle 'retired' needs a retirement block with "
@@ -442,7 +447,7 @@ HEADER = """\
 """
 
 
-def _yaml_dump(row: dict[str, Any]) -> str:
+def _yaml_dump(row: JsonDict) -> str:
     buf = io.StringIO()
     yaml.safe_dump(row, buf, sort_keys=False, default_flow_style=False, width=100, allow_unicode=True)
     return buf.getvalue()

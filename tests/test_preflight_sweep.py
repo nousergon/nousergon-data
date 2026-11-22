@@ -8,6 +8,7 @@ detectors in this fleet have shipped unable to fail, and the specific way this
 one could fail silently is by folding an unmeasured stage into green.
 """
 
+
 from __future__ import annotations
 
 import datetime as dt
@@ -16,6 +17,7 @@ import os
 import pathlib
 import subprocess
 import sys
+from typing import Any
 
 import pytest
 
@@ -32,6 +34,7 @@ from infrastructure.preflight_sweep_console import (
 )
 from infrastructure.preflight_sweep import update_streaks
 from infrastructure.preflight_sweep_stages import Stage
+from typing import Never
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 SF_PATH = REPO / "infrastructure" / "step_function.json"
@@ -40,35 +43,35 @@ CADENCE_PATH = REPO / "infrastructure" / "preflight_sweep_cadence.json"
 
 
 class FakeAws:
-    def __init__(self, listing: dict[str, list[dict]] | None = None):
+    def __init__(self: Any, listing: dict[str, list[dict]] | None = None) -> None:
         self.objects: dict[str, dict] = {}
         self.metrics: list[tuple[str, float]] = []
         self.notifications: list[tuple[str, str]] = []
         self.listing = listing or {}
         self.list_calls: list[str] = []
 
-    def put_json(self, key, payload):
+    def put_json(self: Any, key: Any, payload: Any) -> None:
         self.objects[key] = payload
 
-    def get_json(self, key):
+    def get_json(self: Any, key: Any) -> Any:
         return self.objects.get(key)
 
-    def list_objects(self, prefix, max_keys=1000):
+    def list_objects(self: Any, prefix: Any, max_keys: Any=1000) -> Any:
         self.list_calls.append(prefix)
         return self.listing.get(prefix, [])
 
-    def put_text(self, key, body):
+    def put_text(self: Any, key: Any, body: Any) -> None:
         self.objects[key] = body
 
-    def put_metrics(self, metrics):
+    def put_metrics(self: Any, metrics: Any) -> None:
         self.metrics.extend(metrics)
 
-    def publish(self, topic_arn, subject, message):
+    def publish(self: Any, topic_arn: Any, subject: Any, message: Any) -> None:
         self.notifications.append((subject, message))
 
 
-def _completed(returncode: int, stderr: str = ""):
-    def runner(*_args, **_kwargs):
+def _completed(returncode: int, stderr: str = "") -> Any:
+    def runner(*_args: Any, **_kwargs: Any) -> Any:
         return subprocess.CompletedProcess(
             args=["bash"], returncode=returncode, stdout="", stderr=stderr
         )
@@ -76,7 +79,7 @@ def _completed(returncode: int, stderr: str = ""):
     return runner
 
 
-def _stage(name="DataPhase1"):
+def _stage(name: Any="DataPhase1") -> Any:
     return Stage(
         name=name,
         classification="sweepable",
@@ -94,7 +97,7 @@ def _stage(name="DataPhase1"):
 # into the run, before the report, metric or log upload, for five days.
 
 
-def _rendered_stages():
+def _rendered_stages() -> Any:
     definition = json.loads(SF_PATH.read_text())
     manifest = json.loads(MANIFEST_PATH.read_text())
     from infrastructure.preflight_sweep_stages import (
@@ -111,7 +114,7 @@ def _rendered_stages():
     return derive_stages(definition, bindings, context, "/home/ec2-user/")
 
 
-def test_a_stage_teardown_trap_is_suppressed_not_run():
+def test_a_stage_teardown_trap_is_suppressed_not_run() -> None:
     stage = _stage()
     stage.commands = [
         "set -eo pipefail",
@@ -125,7 +128,7 @@ def test_a_stage_teardown_trap_is_suppressed_not_run():
     assert "echo hi" in script
 
 
-def test_ordinary_commands_are_not_mistaken_for_teardown():
+def test_ordinary_commands_are_not_mistaken_for_teardown() -> None:
     for line in (
         "cd /home/ec2-user/alpha-engine-data",
         "bash infrastructure/spot_data_phase1.sh --preflight-only",
@@ -134,7 +137,7 @@ def test_ordinary_commands_are_not_mistaken_for_teardown():
         assert not ps._is_box_teardown(line), line
 
 
-def test_no_stage_the_sweep_runs_can_stop_the_shared_box():
+def test_no_stage_the_sweep_runs_can_stop_the_shared_box() -> None:
     """Every stage rendered from the REAL definition must come out of
     `_stage_script` with no live shutdown/systemd-run line, whatever a future
     stage adds to its own command."""
@@ -150,7 +153,7 @@ def test_no_stage_the_sweep_runs_can_stop_the_shared_box():
     assert not live, live
 
 
-def test_the_known_eval_judge_teardown_trap_is_actually_in_the_definition():
+def test_the_known_eval_judge_teardown_trap_is_actually_in_the_definition() -> None:
     """Guards the guard: if the SF stops carrying the trap this test should be
     revisited rather than the suppression silently becoming dead code."""
     judge = [s for s in _rendered_stages() if s.name.endswith("EvalJudgeProcess")]
@@ -190,13 +193,13 @@ def _sweep_run_date() -> str:
     )
 
 
-def test_a_clean_preflight_is_a_pass(tmp_path):
+def test_a_clean_preflight_is_a_pass(tmp_path: Any) -> None:
     result = ps.run_stage(_stage(), str(tmp_path), 60, runner=_completed(0))
     assert result.verdict == ps.PASSED
     assert result.returncode == 0
 
 
-def test_a_non_zero_preflight_is_a_failure_carrying_its_last_stderr_line(tmp_path):
+def test_a_non_zero_preflight_is_a_failure_carrying_its_last_stderr_line(tmp_path: Any) -> None:
     runner = _completed(1, stderr="warning: noise\nERROR: predictor.yaml not found\n")
     result = ps.run_stage(_stage(), str(tmp_path), 60, runner=runner)
     assert result.verdict == ps.FAILED
@@ -206,14 +209,14 @@ def test_a_non_zero_preflight_is_a_failure_carrying_its_last_stderr_line(tmp_pat
     assert "rc=1" in result.reason
 
 
-def test_an_oom_is_named_as_a_resource_kill_not_a_generic_failure(tmp_path):
+def test_an_oom_is_named_as_a_resource_kill_not_a_generic_failure(tmp_path: Any) -> None:
     result = ps.run_stage(_stage(), str(tmp_path), 60, runner=_completed(137))
     assert result.verdict == ps.FAILED
     assert "RESOURCE KILL" in result.reason and "OOM" in result.reason
 
 
-def test_a_timeout_is_a_hard_fail_named_as_a_resource_kill(tmp_path):
-    def runner(*_a, **_k):
+def test_a_timeout_is_a_hard_fail_named_as_a_resource_kill(tmp_path: Any) -> None:
+    def runner(*_a: Any, **_k: Any) -> Never:
         raise subprocess.TimeoutExpired(cmd="bash", timeout=60)
 
     result = ps.run_stage(_stage(), str(tmp_path), 60, runner=runner)
@@ -222,12 +225,12 @@ def test_a_timeout_is_a_hard_fail_named_as_a_resource_kill(tmp_path):
     assert "Not retried" in result.reason
 
 
-def test_a_harness_fault_is_unmeasured_not_a_stage_failure(tmp_path):
+def test_a_harness_fault_is_unmeasured_not_a_stage_failure(tmp_path: Any) -> None:
     """The bug class: a detector that cannot tell its own harness fault from a
     finding reports the harness fault AS the defect, always in the alarming
     direction."""
 
-    def runner(*_a, **_k):
+    def runner(*_a: Any, **_k: Any) -> Never:
         raise OSError("no such executable: bash")
 
     result = ps.run_stage(_stage(), str(tmp_path), 60, runner=runner)
@@ -238,7 +241,7 @@ def test_a_harness_fault_is_unmeasured_not_a_stage_failure(tmp_path):
 # ── Run-level honesty ────────────────────────────────────────────────────────
 
 
-def test_a_derivation_failure_is_reported_unmeasured_and_never_ok(tmp_path):
+def test_a_derivation_failure_is_reported_unmeasured_and_never_ok(tmp_path: Any) -> None:
     broken = tmp_path / "broken.json"
     broken.write_text("{not json")
     report = ps.sweep(
@@ -252,7 +255,7 @@ def test_a_derivation_failure_is_reported_unmeasured_and_never_ok(tmp_path):
     assert report.unmeasured_reason and "NOT a clean run" in report.unmeasured_reason
 
 
-def test_an_unmeasured_run_never_advances_the_clean_pointer(tmp_path):
+def test_an_unmeasured_run_never_advances_the_clean_pointer(tmp_path: Any) -> None:
     aws = FakeAws()
     report = ps.SweepReport(
         component_id=ps.COMPONENT_ID,
@@ -267,7 +270,7 @@ def test_an_unmeasured_run_never_advances_the_clean_pointer(tmp_path):
     assert f"{ps.REPORT_PREFIX}/latest.json" in aws.objects
 
 
-def test_a_clean_run_does_advance_the_clean_pointer():
+def test_a_clean_run_does_advance_the_clean_pointer() -> None:
     aws = FakeAws()
     report = ps.SweepReport(
         component_id=ps.COMPONENT_ID,
@@ -283,7 +286,7 @@ def test_a_clean_run_does_advance_the_clean_pointer():
     assert f"{ps.REPORT_PREFIX}/last_clean.json" in aws.objects
 
 
-def test_the_deadman_subject_is_emitted_even_on_an_unmeasured_run():
+def test_the_deadman_subject_is_emitted_even_on_an_unmeasured_run() -> None:
     """The alarm fires on the ABSENCE of this metric, so a run that reported
     'I could not measure' must still emit it — otherwise one incident produces
     two notifications, the sweep's own and the deadman's."""
@@ -300,7 +303,7 @@ def test_the_deadman_subject_is_emitted_even_on_an_unmeasured_run():
     assert ("PreflightSweepRunCompleted", 1) in aws.metrics
 
 
-def test_one_notification_carries_every_failing_stage_by_name():
+def test_one_notification_carries_every_failing_stage_by_name() -> None:
     """observability-policy §7.2a: one notification per group failure, never
     one per member — and the group notification carries the full member list."""
     report = ps.SweepReport(
@@ -324,7 +327,7 @@ def test_one_notification_carries_every_failing_stage_by_name():
     assert "2 failed" in subject
 
 
-def test_the_unmeasured_notification_says_so_in_its_subject():
+def test_the_unmeasured_notification_says_so_in_its_subject() -> None:
     report = ps.SweepReport(
         component_id=ps.COMPONENT_ID, run_id="t", started_at="now",
         measured=False, unmeasured_reason="the box never booted",
@@ -334,7 +337,7 @@ def test_the_unmeasured_notification_says_so_in_its_subject():
     assert "the box never booted" in message
 
 
-def test_a_run_that_swept_nothing_is_not_reported_ok(tmp_path):
+def test_a_run_that_swept_nothing_is_not_reported_ok(tmp_path: Any) -> None:
     """Zero stages passing and zero failing is not a clean sweep, it is a
     sweep that did not happen."""
     empty = tmp_path / "empty.json"
@@ -346,7 +349,7 @@ def test_a_run_that_swept_nothing_is_not_reported_ok(tmp_path):
     assert report.measured is False
 
 
-def test_the_live_definition_derives_a_non_empty_stage_set(tmp_path):
+def test_the_live_definition_derives_a_non_empty_stage_set(tmp_path: Any) -> None:
     """Guards against the sweep silently grading an empty pipeline."""
     report = ps.sweep(SF_PATH, MANIFEST_PATH, "/nonexistent", "t")
     assert report.stages_declared > 0
@@ -367,12 +370,12 @@ DECL = {
 BINDINGS = {"run_date": "2026-08-14"}
 
 
-def _failed(stage="PredictorBacktest"):
+def _failed(stage: Any="PredictorBacktest") -> Any:
     return ps.StageResult(stage=stage, verdict=ps.FAILED, returncode=1,
                           reason="preflight exited rc=1")
 
 
-def test_a_failure_on_an_absent_declared_upstream_is_unsweepable_not_failed():
+def test_a_failure_on_an_absent_declared_upstream_is_unsweepable_not_failed() -> None:
     result = ps.classify_upstream(_failed(), DECL, BINDINGS, lambda _p: [])
     assert result.verdict == ps.UNSWEEPABLE_VERDICT
     assert result.unsweepable_kind == ps.UNSWEEPABLE_UPSTREAM_PENDING
@@ -382,7 +385,7 @@ def test_a_failure_on_an_absent_declared_upstream_is_unsweepable_not_failed():
     assert "Backtester" in result.reason
 
 
-def test_the_prefix_gotcha_a_prefix_holding_only_sweep_markers_is_not_content():
+def test_the_prefix_gotcha_a_prefix_holding_only_sweep_markers_is_not_content() -> None:
     """NON-INFERABLE: backtest/<date>/ EXISTS on a day nothing produced it,
     because the sweep's own .phases/ markers live under it. A probe testing
     prefix EXISTENCE would read as satisfied and measure nothing at all."""
@@ -400,7 +403,7 @@ def test_the_prefix_gotcha_a_prefix_holding_only_sweep_markers_is_not_content():
     assert result.verdict == ps.UNSWEEPABLE_VERDICT
 
 
-def test_a_zero_byte_key_is_not_upstream_content():
+def test_a_zero_byte_key_is_not_upstream_content() -> None:
     present, _ = ps.upstream_content(
         "backtest/2026-08-14/",
         [".phases/"],
@@ -409,7 +412,7 @@ def test_a_zero_byte_key_is_not_upstream_content():
     assert present is False
 
 
-def test_a_real_failure_stays_failed_when_its_declared_upstream_is_populated():
+def test_a_real_failure_stays_failed_when_its_declared_upstream_is_populated() -> None:
     """The regression this whole mechanism must not introduce: a declaration
     that swallows genuine defects. The declaration only ARMS the check; the
     prefix is still probed on the day."""
@@ -422,7 +425,7 @@ def test_a_real_failure_stays_failed_when_its_declared_upstream_is_populated():
     assert "REAL failure" in result.reason
 
 
-def test_a_reworded_launcher_error_cannot_reclassify_anything():
+def test_a_reworded_launcher_error_cannot_reclassify_anything() -> None:
     """The classification is DECLARED per stage, never inferred from stderr.
     A stage with no declaration keeps its failure however its error reads."""
     result = _failed(stage="DataPhase1")
@@ -438,7 +441,7 @@ def test_a_reworded_launcher_error_cannot_reclassify_anything():
     assert result.verdict == ps.FAILED
 
 
-def test_an_upstream_pending_row_carries_the_manifests_written_acknowledgement():
+def test_an_upstream_pending_row_carries_the_manifests_written_acknowledgement() -> None:
     """Mirrors test_a_no_dry_path_stage_gets_its_own_verdict_row_with_repo_and_launcher:
     the manifest's WRITTEN reason must reach the row, not just the auto-generated
     per-run "NOT MEASURABLE TODAY" text — alpha-engine-config-I10717. Without
@@ -451,11 +454,11 @@ def test_an_upstream_pending_row_carries_the_manifests_written_acknowledgement()
     assert result.acknowledged_reason == DECL["reason"]
 
 
-def test_find_recent_populated_upstream_returns_the_most_recent_hit():
+def test_find_recent_populated_upstream_returns_the_most_recent_hit() -> None:
     """Walks backward day by day and stops at the FIRST (most recent, i.e.
     smallest offset) populated date — not the oldest one in the window, and
     not one past it."""
-    def lister(prefix):
+    def lister(prefix: Any) -> Any:
         if prefix == "backtest/2026-08-11/":
             return [{"Key": "backtest/2026-08-11/results/backtest.parquet", "Size": 100}]
         if prefix == "backtest/2026-08-08/":
@@ -472,8 +475,8 @@ def test_find_recent_populated_upstream_returns_the_most_recent_hit():
     assert detail["prefix"] == "backtest/2026-08-11/"
 
 
-def test_find_recent_populated_upstream_none_when_outside_the_window():
-    def lister(prefix):
+def test_find_recent_populated_upstream_none_when_outside_the_window() -> None:
+    def lister(prefix: Any) -> Any:
         # Only populated 9 days back — outside an 8-day window.
         return (
             [{"Key": "backtest/2026-08-05/results/backtest.parquet", "Size": 100}]
@@ -486,8 +489,8 @@ def test_find_recent_populated_upstream_none_when_outside_the_window():
     assert found is None
 
 
-def test_find_recent_populated_upstream_ignores_phase_markers_like_the_same_day_probe():
-    def lister(prefix):
+def test_find_recent_populated_upstream_ignores_phase_markers_like_the_same_day_probe() -> None:
+    def lister(prefix: Any) -> Any:
         return [{"Key": f"{prefix}.phases/preflight.json", "Size": 235}]
 
     found = ps.find_recent_populated_upstream(
@@ -496,12 +499,12 @@ def test_find_recent_populated_upstream_ignores_phase_markers_like_the_same_day_
     assert found is None
 
 
-def test_find_recent_populated_upstream_a_bad_candidate_probe_does_not_abort_the_walk():
+def test_find_recent_populated_upstream_a_bad_candidate_probe_does_not_abort_the_walk() -> None:
     """A lister raising on ONE candidate day (e.g. a transient S3 hiccup while
     probing a specific date) must not stop the walk from finding a real hit
     on a different day — that is a fact about one probe, not about the
     upstream's whole history."""
-    def lister(prefix):
+    def lister(prefix: Any) -> Any:
         if prefix == "backtest/2026-08-13/":
             raise RuntimeError("transient")
         if prefix == "backtest/2026-08-12/":
@@ -515,7 +518,7 @@ def test_find_recent_populated_upstream_a_bad_candidate_probe_does_not_abort_the
     assert found[0] == "2026-08-12"
 
 
-def test_remeasure_upstream_pending_falls_back_to_classify_when_the_override_stage_is_not_sweepable():
+def test_remeasure_upstream_pending_falls_back_to_classify_when_the_override_stage_is_not_sweepable() -> None:
     """If re-deriving the definition against the override run_date does not
     even produce a SWEEPABLE stage (e.g. definition drift breaks the override
     binding), the function must not claim a measurement that never happened —
@@ -524,7 +527,7 @@ def test_remeasure_upstream_pending_falls_back_to_classify_when_the_override_sta
         {"Key": "backtest/2026-08-11/results/backtest.parquet", "Size": 100}
     ]}
 
-    def lister(prefix):
+    def lister(prefix: Any) -> Any:
         return listing.get(prefix, [])
 
     bad_definition = {"States": {}}  # derive_stages finds nothing for this name
@@ -538,8 +541,8 @@ def test_remeasure_upstream_pending_falls_back_to_classify_when_the_override_sta
     assert result.measured_against_run_date is None
 
 
-def test_an_unprobeable_upstream_is_unmeasured_not_a_guess_in_either_direction():
-    def boom(_prefix):
+def test_an_unprobeable_upstream_is_unmeasured_not_a_guess_in_either_direction() -> None:
+    def boom(_prefix: Any) -> Never:
         raise RuntimeError("AccessDenied")
 
     result = ps.classify_upstream(_failed(), DECL, BINDINGS, boom)
@@ -548,7 +551,7 @@ def test_an_unprobeable_upstream_is_unmeasured_not_a_guess_in_either_direction()
     assert "AccessDenied" in result.reason
 
 
-def test_an_upstream_pending_stage_does_not_count_toward_failures_or_page():
+def test_an_upstream_pending_stage_does_not_count_toward_failures_or_page() -> None:
     report = ps.SweepReport(
         component_id=ps.COMPONENT_ID, run_id="t", started_at="now",
         outcome=ps.OUTCOME_DEGRADED, measured=True, stages_declared=2,
@@ -573,7 +576,7 @@ def test_an_upstream_pending_stage_does_not_count_toward_failures_or_page():
     assert f"{ps.REPORT_PREFIX}/last_clean.json" not in aws.objects
 
 
-def test_a_coverage_defect_unsweepable_still_fails_the_run(tmp_path):
+def test_a_coverage_defect_unsweepable_still_fails_the_run(tmp_path: Any) -> None:
     """The loud kind must stay loud: /nonexistent has no launchers at all."""
     report = ps.sweep(SF_PATH, MANIFEST_PATH, "/nonexistent", "t")
     assert report.stages_unsweepable_coverage_defect > 0
@@ -583,20 +586,20 @@ def test_a_coverage_defect_unsweepable_still_fails_the_run(tmp_path):
 # ── I7323 (3): unsweepable forever is its own finding, not coverage ──────────
 
 
-def _unsweepable(stage="PredictorBacktest"):
+def _unsweepable(stage: Any="PredictorBacktest") -> Any:
     return ps.StageResult(
         stage=stage, verdict=ps.UNSWEEPABLE_VERDICT,
         unsweepable_kind=ps.UNSWEEPABLE_UPSTREAM_PENDING, reason="upstream absent",
     )
 
 
-def test_a_streak_below_the_threshold_is_not_yet_a_finding():
+def test_a_streak_below_the_threshold_is_not_yet_a_finding() -> None:
     state, findings = update_streaks(None, [_unsweepable()], "r1", "now", 8)
     assert state["streaks"]["PredictorBacktest"]["consecutive_runs"] == 1
     assert findings == []
 
 
-def test_unsweepable_on_every_run_past_the_threshold_becomes_its_own_finding():
+def test_unsweepable_on_every_run_past_the_threshold_becomes_its_own_finding() -> None:
     prior = {"streaks": {"PredictorBacktest": {"consecutive_runs": 7, "since": "d0"}}}
     _state, findings = update_streaks(prior, [_unsweepable()], "r8", "now", 8)
     assert len(findings) == 1
@@ -605,7 +608,7 @@ def test_unsweepable_on_every_run_past_the_threshold_becomes_its_own_finding():
     assert "measured NOTHING" in findings[0]["finding"]
 
 
-def test_a_stage_that_became_measurable_has_its_streak_dropped():
+def test_a_stage_that_became_measurable_has_its_streak_dropped() -> None:
     prior = {"streaks": {"PredictorBacktest": {"consecutive_runs": 7, "since": "d0"}}}
     passed = ps.StageResult(stage="PredictorBacktest", verdict=ps.PASSED)
     state, findings = update_streaks(prior, [passed], "r8", "now", 8)
@@ -613,7 +616,7 @@ def test_a_stage_that_became_measurable_has_its_streak_dropped():
     assert findings == []
 
 
-def test_the_persistent_finding_is_emitted_separately_from_coverage_findings():
+def test_the_persistent_finding_is_emitted_separately_from_coverage_findings() -> None:
     """It must not read as coverage: a stage nothing has measured for a week is
     the opposite of a covered stage."""
     report = ps.SweepReport(
@@ -634,7 +637,7 @@ def test_the_persistent_finding_is_emitted_separately_from_coverage_findings():
     assert ("PreflightSweepPersistentUnsweepable", 1) in aws.metrics
 
 
-def test_the_streak_threshold_is_declared_in_days_and_derived_against_cadence():
+def test_the_streak_threshold_is_declared_in_days_and_derived_against_cadence() -> None:
     manifest = json.loads(MANIFEST_PATH.read_text())
     cadence = load_cadence(CADENCE_PATH)
     assert manifest["unsweepable_streak_threshold_days"] > 7, (
@@ -646,12 +649,12 @@ def test_the_streak_threshold_is_declared_in_days_and_derived_against_cadence():
     ), "daily cadence means one run per day"
 
 
-def test_an_unreadable_streak_history_is_named_never_treated_as_no_history(tmp_path):
+def test_an_unreadable_streak_history_is_named_never_treated_as_no_history(tmp_path: Any) -> None:
     """Silently resetting to zero would make the finding unable to fire — the
     exact bug class of a detector that cannot report."""
 
     class Broken(FakeAws):
-        def get_json(self, key):
+        def get_json(self: Any, key: Any) -> Never:
             raise RuntimeError("AccessDenied")
 
     aws = Broken()
@@ -664,7 +667,7 @@ def test_an_unreadable_streak_history_is_named_never_treated_as_no_history(tmp_p
 # ── I7324: every declared stage carries a verdict, named on every surface ────
 
 
-def test_every_declared_stage_carries_a_verdict_row():
+def test_every_declared_stage_carries_a_verdict_row() -> None:
     """THE missing assertion that is I7324's root cause: 19 declared, 16 rows,
     and which 3 were missing was unrecoverable from the report."""
     report = ps.sweep(SF_PATH, MANIFEST_PATH, "/nonexistent", "t")
@@ -674,13 +677,13 @@ def test_every_declared_stage_carries_a_verdict_row():
     }
 
 
-def test_the_declared_stage_list_is_serialised_so_declared_minus_swept_is_auditable():
+def test_the_declared_stage_list_is_serialised_so_declared_minus_swept_is_auditable() -> None:
     report = ps.sweep(SF_PATH, MANIFEST_PATH, "/nonexistent", "t")
     assert len(report.declared_stages) == report.stages_declared
     assert all({"stage", "classification"} <= set(s) for s in report.declared_stages)
 
 
-def test_a_no_dry_path_stage_gets_its_own_verdict_row_with_repo_and_launcher():
+def test_a_no_dry_path_stage_gets_its_own_verdict_row_with_repo_and_launcher() -> None:
     report = ps.sweep(SF_PATH, MANIFEST_PATH, "/nonexistent", "t")
     rows = [r for r in report.results if r["verdict"] == ps.NO_DRY_PATH_VERDICT]
     assert len(rows) == report.stages_no_dry_path > 0
@@ -693,7 +696,7 @@ def test_a_no_dry_path_stage_gets_its_own_verdict_row_with_repo_and_launcher():
         assert set(row) >= {"stage", "repo", "launcher", "reason"}
 
 
-def test_coverage_findings_are_non_empty_whenever_a_stage_has_no_dry_path():
+def test_coverage_findings_are_non_empty_whenever_a_stage_has_no_dry_path() -> None:
     report = ps.sweep(SF_PATH, MANIFEST_PATH, "/nonexistent", "t")
     assert report.stages_no_dry_path > 0
     named = {f.get("stage") for f in report.coverage_findings
@@ -703,14 +706,14 @@ def test_coverage_findings_are_non_empty_whenever_a_stage_has_no_dry_path():
     }
 
 
-def test_an_acknowledged_no_dry_path_gap_is_named_but_does_not_fail_the_run():
+def test_an_acknowledged_no_dry_path_gap_is_named_but_does_not_fail_the_run() -> None:
     report = ps.sweep(SF_PATH, MANIFEST_PATH, "/nonexistent", "t")
     gaps = [f for f in report.coverage_findings
             if f["kind"] == ps.FINDING_NO_DRY_PATH]
     assert gaps and all(f["blocking"] is False for f in gaps)
 
 
-def test_the_notification_names_every_non_passed_category_not_only_failures():
+def test_the_notification_names_every_non_passed_category_not_only_failures() -> None:
     report = ps.SweepReport(
         component_id=ps.COMPONENT_ID, run_id="t", started_at="now",
         outcome=ps.OUTCOME_DEGRADED, measured=True,
@@ -744,7 +747,7 @@ def test_the_notification_names_every_non_passed_category_not_only_failures():
     assert "4" in subject
 
 
-def test_a_missing_verdict_is_filled_in_as_not_attempted_and_fails_the_run():
+def test_a_missing_verdict_is_filled_in_as_not_attempted_and_fails_the_run() -> None:
     """The invariant is self-healing AND loud: a hole in the sweep's own
     coverage outranks anything the sweep found."""
     report = ps.sweep(SF_PATH, MANIFEST_PATH, "/nonexistent", "t")
@@ -789,7 +792,27 @@ def _fake_checkout(root: pathlib.Path) -> pathlib.Path:
     return root
 
 
-def test_the_weekday_case_remeasures_against_the_last_populated_instance(tmp_path):
+_BACKTEST_CHAIN = ("PredictorBacktest", "PortfolioOptimizerBacktest")
+
+
+def _manifest_with_backtest_chain_live(tmp_path: pathlib.Path) -> pathlib.Path:
+    """The live manifest with the backtest chain NOT retired.
+
+    PredictorBacktest and PortfolioOptimizerBacktest are retired on the live
+    manifest (Brian 2026-11-10, alpha-engine-config-I13374), but their
+    upstream_artifact_dependencies stay declared, and the upstream-pending /
+    remeasure mechanism (alpha-engine-config-I10717) must keep its coverage for
+    the day a retirement is re-examined and lifted.
+    """
+    manifest = json.loads(MANIFEST_PATH.read_text())
+    for stage in _BACKTEST_CHAIN:
+        manifest["retired_stages"].pop(stage, None)
+    path = tmp_path / "manifest_backtest_chain_live.json"
+    path.write_text(json.dumps(manifest))
+    return path
+
+
+def test_the_weekday_case_remeasures_against_the_last_populated_instance(tmp_path: Any) -> None:
     """The SOTA half of alpha-engine-config-I10717: the weekly SF has not run
     TODAY, but it wrote real content 3 days ago (last Saturday), which is well
     inside the declared 8-day max_age_days. Both stages accept --run-date and
@@ -801,7 +824,7 @@ def test_the_weekday_case_remeasures_against_the_last_populated_instance(tmp_pat
     run_date = _sweep_run_date()
     historical_date = (dt.date.fromisoformat(run_date) - dt.timedelta(days=3)).isoformat()
 
-    def runner(argv, **_kwargs):
+    def runner(argv: Any, **_kwargs: Any) -> Any:
         script = argv[-1]
         backtest_chain = (
             "spot_predictor_backtest.sh" in script
@@ -827,7 +850,7 @@ def test_the_weekday_case_remeasures_against_the_last_populated_instance(tmp_pat
             {"Key": f"backtest/{historical_date}/predictor_sweep_df.parquet", "Size": 91234},
         ],
     })
-    report = ps.sweep(SF_PATH, MANIFEST_PATH, str(root), "t", aws=aws, runner=runner)
+    report = ps.sweep(SF_PATH, _manifest_with_backtest_chain_live(tmp_path), str(root), "t", aws=aws, runner=runner)
 
     assert report.stages_failed == 0
     assert report.stages_unsweepable_upstream_pending == 0
@@ -849,7 +872,7 @@ def test_the_weekday_case_remeasures_against_the_last_populated_instance(tmp_pat
     assert f"{ps.REPORT_PREFIX}/last_clean.json" in aws.objects
 
 
-def test_the_weekday_case_stays_upstream_pending_when_nothing_is_populated_within_max_age(tmp_path):
+def test_the_weekday_case_stays_upstream_pending_when_nothing_is_populated_within_max_age(tmp_path: Any) -> None:
     """THE case that made the sweep's first run email '2 failed', now the
     RARER edge (real staleness, not the ordinary weekday state): the weekly
     SF has not run today, AND nothing populated the upstream prefix at any
@@ -859,7 +882,7 @@ def test_the_weekday_case_stays_upstream_pending_when_nothing_is_populated_withi
     staleness note rather than reading as the routine case."""
     root = _fake_checkout(tmp_path)
 
-    def runner(argv, **_kwargs):
+    def runner(argv: Any, **_kwargs: Any) -> Any:
         script = argv[-1]
         rc = 1 if ("spot_predictor_backtest.sh" in script
                    or "spot_portfolio_optimizer_backtest.sh" in script) else 0
@@ -874,7 +897,7 @@ def test_the_weekday_case_stays_upstream_pending_when_nothing_is_populated_withi
         {"Key": f"backtest/{run_date}/.phases/preflight.json", "Size": 235},
         {"Key": f"backtest/{run_date}/.phases/runtime_smoke.json", "Size": 239},
     ]})
-    report = ps.sweep(SF_PATH, MANIFEST_PATH, str(root), "t", aws=aws, runner=runner)
+    report = ps.sweep(SF_PATH, _manifest_with_backtest_chain_live(tmp_path), str(root), "t", aws=aws, runner=runner)
 
     assert report.stages_failed == 0
     assert report.stages_unsweepable_upstream_pending == 2
@@ -910,12 +933,12 @@ def test_the_weekday_case_stays_upstream_pending_when_nothing_is_populated_withi
     assert f"{ps.REPORT_PREFIX}/last_clean.json" not in aws.objects
 
 
-def test_a_genuinely_broken_backtest_stage_still_fails_when_upstream_is_present(tmp_path):
+def test_a_genuinely_broken_backtest_stage_still_fails_when_upstream_is_present(tmp_path: Any) -> None:
     """The other half of the closes-when: the declaration must not become a
     blanket excuse on the day the pipeline HAS run."""
     root = _fake_checkout(tmp_path)
 
-    def runner(argv, **_kwargs):
+    def runner(argv: Any, **_kwargs: Any) -> Any:
         rc = 1 if "spot_predictor_backtest.sh" in argv[-1] else 0
         return subprocess.CompletedProcess(args=argv, returncode=rc, stdout="", stderr="")
 
@@ -924,13 +947,13 @@ def test_a_genuinely_broken_backtest_stage_still_fails_when_upstream_is_present(
         {"Key": f"backtest/{run_date}/.phases/preflight.json", "Size": 235},
         {"Key": f"backtest/{run_date}/results/backtest.parquet", "Size": 8123},
     ]})
-    report = ps.sweep(SF_PATH, MANIFEST_PATH, str(root), "t", aws=aws, runner=runner)
+    report = ps.sweep(SF_PATH, _manifest_with_backtest_chain_live(tmp_path), str(root), "t", aws=aws, runner=runner)
     failed = {r["stage"] for r in report.results if r["verdict"] == ps.FAILED}
     assert "PredictorBacktest" in failed
     assert report.outcome == ps.OUTCOME_FAILED
 
 
-def test_the_report_written_to_s3_carries_a_verdict_for_every_declared_stage(tmp_path):
+def test_the_report_written_to_s3_carries_a_verdict_for_every_declared_stage(tmp_path: Any) -> None:
     root = _fake_checkout(tmp_path)
     aws = FakeAws()
     report = ps.sweep(SF_PATH, MANIFEST_PATH, str(root), "t", aws=aws,
@@ -949,24 +972,24 @@ def test_the_report_written_to_s3_carries_a_verdict_for_every_declared_stage(tmp
 # ── Console surface ──────────────────────────────────────────────────────────
 
 
-def test_the_declared_cadence_is_read_never_defaulted():
+def test_the_declared_cadence_is_read_never_defaulted() -> None:
     cadence = load_cadence(CADENCE_PATH)
     assert cadence["sweep_cadence"] in cadence["allowed_values"]
     assert cadence["cadence_minutes"] > 0
 
 
-def test_a_cadence_manifest_that_cannot_be_read_raises(tmp_path):
+def test_a_cadence_manifest_that_cannot_be_read_raises(tmp_path: Any) -> None:
     missing = tmp_path / "nope.json"
     with pytest.raises(Exception):
         load_cadence(missing)
 
 
 @pytest.fixture
-def cadence():
+def cadence() -> dict[str, object]:
     return load_cadence(CADENCE_PATH)
 
 
-def test_a_passed_stage_renders_ok_with_its_own_age(cadence):
+def test_a_passed_stage_renders_ok_with_its_own_age(cadence: Any) -> None:
     body = stage_envelope(
         {"stage": "DataPhase1", "verdict": ps.PASSED}, "run-1", "2026-08-13T08:00:00+00:00", cadence
     )
@@ -977,7 +1000,7 @@ def test_a_passed_stage_renders_ok_with_its_own_age(cadence):
     assert body["cadence_minutes"] == cadence["cadence_minutes"]
 
 
-def test_an_unmeasured_stage_never_renders_green(cadence):
+def test_an_unmeasured_stage_never_renders_green(cadence: Any) -> None:
     body = stage_envelope(
         {"stage": "DataPhase1", "verdict": ps.UNMEASURED}, "r", "t", cadence
     )
@@ -985,14 +1008,14 @@ def test_an_unmeasured_stage_never_renders_green(cadence):
     assert body["status"] != ENVELOPE_OK
 
 
-def test_an_unsweepable_stage_is_an_error_because_it_is_unmonitored(cadence):
+def test_an_unsweepable_stage_is_an_error_because_it_is_unmonitored(cadence: Any) -> None:
     body = stage_envelope(
         {"stage": "DataPhase1", "verdict": "unsweepable"}, "r", "t", cadence
     )
     assert body["status"] == ENVELOPE_ERROR
 
 
-def test_an_upstream_pending_stage_renders_attention_not_error_and_not_green(cadence):
+def test_an_upstream_pending_stage_renders_attention_not_error_and_not_green(cadence: Any) -> None:
     body = stage_envelope(
         {"stage": "PredictorBacktest", "verdict": "unsweepable",
          "unsweepable_kind": ps.UNSWEEPABLE_UPSTREAM_PENDING}, "r", "t", cadence
@@ -1001,7 +1024,7 @@ def test_an_upstream_pending_stage_renders_attention_not_error_and_not_green(cad
     assert body["status"] != ENVELOPE_OK
 
 
-def test_an_unrecognised_unsweepable_kind_keeps_the_loud_default(cadence):
+def test_an_unrecognised_unsweepable_kind_keeps_the_loud_default(cadence: Any) -> None:
     body = stage_envelope(
         {"stage": "X", "verdict": "unsweepable", "unsweepable_kind": "brand_new"},
         "r", "t", cadence,
@@ -1009,7 +1032,7 @@ def test_an_unrecognised_unsweepable_kind_keeps_the_loud_default(cadence):
     assert body["status"] == ENVELOPE_ERROR
 
 
-def test_a_no_dry_path_stage_renders_attention_never_green(cadence):
+def test_a_no_dry_path_stage_renders_attention_never_green(cadence: Any) -> None:
     """It is not healthy — the sweep asserts nothing whatever about it. A row
     reading `ok` would claim precondition-health nobody measured."""
     body = stage_envelope(
@@ -1021,7 +1044,7 @@ def test_a_no_dry_path_stage_renders_attention_never_green(cadence):
     assert "no declared envelope mapping" not in body["verdict"]
 
 
-def test_the_rollup_names_the_no_dry_path_stages_rather_than_counting_them(cadence):
+def test_the_rollup_names_the_no_dry_path_stages_rather_than_counting_them(cadence: Any) -> None:
     report = {
         "run_id": "r", "measured": True, "outcome": "degraded",
         "stages_declared": 3, "stages_no_dry_path": 1, "stages_passed": 2,
@@ -1035,10 +1058,88 @@ def test_the_rollup_names_the_no_dry_path_stages_rather_than_counting_them(caden
     assert rollup["no_dry_path_stages"] == ["SaturdayHealthCheck"]
     # The no-dry-path row must not cancel out the stage it represents.
     assert rollup["stages_expected"] == 2 and rollup["stages_reported"] == 2
-    assert rollup["status"] == ENVELOPE_ATTENTION
+    assert rollup["status"] == ENVELOPE_OK
 
 
-def test_an_acknowledged_coverage_gap_does_not_turn_the_rollup_red(cadence):
+def test_reported_clean_sweep_with_acknowledged_gaps_has_ok_rollup(
+    cadence: dict[str, object],
+) -> None:
+    results = [
+        {"stage": f"Measured{i}", "verdict": ps.PASSED} for i in range(14)
+    ]
+    results.extend(
+        {"stage": f"NoDryPath{i}", "verdict": "no_dry_path"} for i in range(7)
+    )
+    results.append({
+        "stage": "Dedicated", "verdict": "unsweepable",
+        "unsweepable_kind": ps.UNSWEEPABLE_DEDICATED_BOX,
+    })
+    report = {
+        "run_id": "r", "measured": True, "outcome": "ok",
+        "stages_declared": 22, "stages_passed": 14,
+        "stages_no_dry_path": 7, "stages_unsweepable": 1,
+        "stages_unsweepable_coverage_defect": 0,
+        "stages_unsweepable_dedicated_box": 1,
+        "coverage_findings": [
+            {"stage": result["stage"], "blocking": False, "finding": "acknowledged"}
+            for result in results if result["verdict"] != ps.PASSED
+        ],
+        "results": results,
+    }
+
+    rollup = rollup_envelope(report, cadence, "t")
+
+    assert rollup["status"] == ENVELOPE_OK
+    assert rollup["stages_unobserved"] == 0
+    assert rollup["dedicated_box_stages"] == ["Dedicated"]
+    assert rollup["no_dry_path_stages"] == [f"NoDryPath{i}" for i in range(7)]
+
+
+def test_blocking_dedicated_box_finding_has_error_rollup(
+    cadence: dict[str, object],
+) -> None:
+    report = {
+        "run_id": "r", "measured": True, "outcome": "failed",
+        "stages_declared": 1, "stages_passed": 0, "stages_unsweepable": 1,
+        "stages_unsweepable_coverage_defect": 0,
+        "stages_unsweepable_dedicated_box": 1,
+        "coverage_findings": [
+            {"stage": "Dedicated", "kind": "dedicated_box", "blocking": True,
+             "finding": "dedicated-box acknowledgement is stale"},
+        ],
+        "results": [
+            {"stage": "Dedicated", "verdict": "unsweepable",
+             "unsweepable_kind": ps.UNSWEEPABLE_DEDICATED_BOX},
+        ],
+    }
+
+    rollup = rollup_envelope(report, cadence, "t")
+
+    assert rollup["status"] == ENVELOPE_ERROR
+    assert rollup["coverage_findings_blocking"] == 1
+    assert rollup["stages_failed"] == 0
+    assert rollup["stages_unsweepable_coverage_defect"] == 0
+
+
+def test_reported_sweep_with_a_coverage_defect_has_non_ok_rollup(cadence: Any) -> None:
+    report = {
+        "run_id": "r", "measured": True, "outcome": "failed",
+        "stages_declared": 2, "stages_passed": 1, "stages_unsweepable": 1,
+        "stages_unsweepable_coverage_defect": 1,
+        "results": [
+            {"stage": "Measured", "verdict": ps.PASSED},
+            {"stage": "Defect", "verdict": "unsweepable",
+             "unsweepable_kind": ps.UNSWEEPABLE_COVERAGE_DEFECT},
+        ],
+    }
+
+    rollup = rollup_envelope(report, cadence, "t")
+
+    assert rollup["status"] != ENVELOPE_OK
+    assert rollup["stages_unsweepable_coverage_defect"] == 1
+
+
+def test_an_acknowledged_coverage_gap_does_not_turn_the_rollup_red(cadence: Any) -> None:
     rollup = rollup_envelope(
         {"run_id": "r", "measured": True, "stages_declared": 1, "stages_passed": 1,
          "stages_no_dry_path": 0,
@@ -1051,7 +1152,7 @@ def test_an_acknowledged_coverage_gap_does_not_turn_the_rollup_red(cadence):
     assert rollup["coverage_findings_blocking"] == 0
 
 
-def test_a_legacy_string_coverage_finding_is_still_treated_as_blocking(cadence):
+def test_a_legacy_string_coverage_finding_is_still_treated_as_blocking(cadence: Any) -> None:
     rollup = rollup_envelope(
         {"run_id": "r", "measured": True, "stages_declared": 1, "stages_passed": 1,
          "coverage_findings": ["a stage lost its dry path"],
@@ -1061,7 +1162,7 @@ def test_a_legacy_string_coverage_finding_is_still_treated_as_blocking(cadence):
     assert rollup["status"] == ENVELOPE_ERROR
 
 
-def test_a_verdict_with_no_declared_mapping_is_not_silently_green(cadence):
+def test_a_verdict_with_no_declared_mapping_is_not_silently_green(cadence: Any) -> None:
     body = stage_envelope(
         {"stage": "DataPhase1", "verdict": "something_new"}, "r", "t", cadence
     )
@@ -1069,13 +1170,13 @@ def test_a_verdict_with_no_declared_mapping_is_not_silently_green(cadence):
     assert "no declared envelope mapping" in body["verdict"]
 
 
-def test_every_row_says_it_covers_preconditions_not_output_correctness(cadence):
+def test_every_row_says_it_covers_preconditions_not_output_correctness(cadence: Any) -> None:
     body = stage_envelope({"stage": "X", "verdict": ps.PASSED}, "r", "t", cadence)
     assert "PRECONDITIONS only" in body["summary"]
     assert "output is correct" in body["summary"]
 
 
-def test_a_stage_the_sweep_produced_no_verdict_for_is_counted_unobserved(cadence):
+def test_a_stage_the_sweep_produced_no_verdict_for_is_counted_unobserved(cadence: Any) -> None:
     """UNOBSERVED must be visible and inside the denominator. A stage nobody
     checks is the one that breaks."""
     report = {
@@ -1091,7 +1192,7 @@ def test_a_stage_the_sweep_produced_no_verdict_for_is_counted_unobserved(cadence
     assert rollup["status"] == ENVELOPE_ERROR
 
 
-def test_the_rollup_publishes_zero_unobserved_rather_than_omitting_it(cadence):
+def test_the_rollup_publishes_zero_unobserved_rather_than_omitting_it(cadence: Any) -> None:
     report = {
         "run_id": "r", "measured": True, "outcome": "ok",
         "stages_declared": 3, "stages_no_dry_path": 0, "stages_passed": 3,
@@ -1103,7 +1204,7 @@ def test_the_rollup_publishes_zero_unobserved_rather_than_omitting_it(cadence):
     assert rollup["status"] == ENVELOPE_OK
 
 
-def test_an_unmeasured_run_rollup_is_an_error_row(cadence):
+def test_an_unmeasured_run_rollup_is_an_error_row(cadence: Any) -> None:
     rollup = rollup_envelope(
         {"run_id": "r", "measured": False, "unmeasured_reason": "no box"}, cadence, "t"
     )
@@ -1111,7 +1212,7 @@ def test_an_unmeasured_run_rollup_is_an_error_row(cadence):
     assert rollup["unmeasured_reason"] == "no box"
 
 
-def test_every_run_publishes_a_row_for_every_reported_stage_plus_the_rollup(cadence):
+def test_every_run_publishes_a_row_for_every_reported_stage_plus_the_rollup(cadence: Any) -> None:
     report = {
         "run_id": "r", "measured": True, "outcome": "failed",
         "stages_declared": 2, "stages_no_dry_path": 0, "stages_failed": 1,
@@ -1127,14 +1228,14 @@ def test_every_run_publishes_a_row_for_every_reported_stage_plus_the_rollup(cade
     assert "ops/checks/ae-preflight-sweep/latest.json" in keys
 
 
-def test_a_parallel_branch_stage_gets_a_stable_unique_console_id():
+def test_a_parallel_branch_stage_gets_a_stable_unique_console_id() -> None:
     a = stage_check_id("ResearchPredictorParallel.PredictorTraining")
     b = stage_check_id("ParityParallel.PredictorTraining")
     assert a != b
     assert "." not in a
 
 
-def test_console_rows_are_published_even_when_the_run_failed(cadence):
+def test_console_rows_are_published_even_when_the_run_failed(cadence: Any) -> None:
     """A row that stops being republished is what makes the console render
     STALE. Skipping the write on a bad run turns a loud failure into a quiet
     ageing green."""
@@ -1149,7 +1250,7 @@ def test_console_rows_are_published_even_when_the_run_failed(cadence):
     assert "ops/checks/ae-preflight-sweep/latest.json" in aws.objects
 
 
-def test_the_sweep_derives_run_date_from_utc_not_local_time():
+def test_the_sweep_derives_run_date_from_utc_not_local_time() -> None:
     """Pins what `_sweep_run_date` above mirrors.
 
     The sweep binds `run_date` from the execution's UTC start time, matching
@@ -1187,10 +1288,10 @@ _WEEKEND_BINDINGS = {"run_date": "2026-08-23"}  # a Sunday
 _NORMALIZED_DECL = {**DECL, "date_normalization": "nyse_trading_day"}
 
 
-def test_the_probe_uses_the_trading_day_the_launcher_normalized_to():
+def test_the_probe_uses_the_trading_day_the_launcher_normalized_to() -> None:
     seen: list[str] = []
 
-    def lister(prefix):
+    def lister(prefix: Any) -> Any:
         seen.append(prefix)
         return []
 
@@ -1200,7 +1301,7 @@ def test_the_probe_uses_the_trading_day_the_launcher_normalized_to():
     )
 
 
-def test_a_real_weekend_failure_is_not_downgraded_when_the_traded_prefix_is_full():
+def test_a_real_weekend_failure_is_not_downgraded_when_the_traded_prefix_is_full() -> None:
     """The regression this exists for: before the normalization, the probe named
     the always-empty Sunday prefix and reclassified a REAL failure."""
     listing = {"backtest/2026-08-21/": [
@@ -1214,10 +1315,10 @@ def test_a_real_weekend_failure_is_not_downgraded_when_the_traded_prefix_is_full
     assert "IS populated" in result.reason
 
 
-def test_an_uncomputable_probe_date_is_unmeasured_never_the_calendar_date(monkeypatch):
+def test_an_uncomputable_probe_date_is_unmeasured_never_the_calendar_date(monkeypatch: Any) -> None:
     """Falling back to the calendar date IS the defect, so it must never happen:
     the sweep says it could not tell instead."""
-    def boom(_run_date, _mode):
+    def boom(_run_date: Any, _mode: Any) -> Never:
         raise ps.DateNormalizationUnavailable("no trading calendar on this box")
 
     monkeypatch.setattr(ps, "normalize_probe_date", boom)
@@ -1227,7 +1328,7 @@ def test_an_uncomputable_probe_date_is_unmeasured_never_the_calendar_date(monkey
     assert "no trading calendar on this box" in result.reason
 
 
-def test_every_declared_upstream_dependency_declares_its_probe_date_rule():
+def test_every_declared_upstream_dependency_declares_its_probe_date_rule() -> None:
     manifest = ps.load_manifest(MANIFEST_PATH)
     decls = manifest["upstream_artifact_dependencies"]
     assert decls
@@ -1242,7 +1343,7 @@ def test_every_declared_upstream_dependency_declares_its_probe_date_rule():
 # ratified as having none. A status with one reachable value grades nothing.
 
 
-def test_a_run_whose_only_gap_is_ratified_no_dry_path_stages_is_ok(tmp_path):
+def test_a_run_whose_only_gap_is_ratified_no_dry_path_stages_is_ok(tmp_path: Any) -> None:
     root = _fake_checkout(tmp_path)
     run_date = _sweep_run_date()
     aws = FakeAws(listing={f"backtest/{run_date}/": [
@@ -1258,7 +1359,7 @@ def test_a_run_whose_only_gap_is_ratified_no_dry_path_stages_is_ok(tmp_path):
     assert f"{ps.REPORT_PREFIX}/last_clean.json" in aws.objects
 
 
-def test_an_unacknowledged_no_dry_path_stage_still_keeps_the_run_out_of_ok(tmp_path):
+def test_an_unacknowledged_no_dry_path_stage_still_keeps_the_run_out_of_ok(tmp_path: Any) -> None:
     root = _fake_checkout(tmp_path)
     manifest = json.loads(MANIFEST_PATH.read_text())
     manifest["no_dry_path_stages"] = [
@@ -1272,7 +1373,7 @@ def test_an_unacknowledged_no_dry_path_stage_still_keeps_the_run_out_of_ok(tmp_p
     assert report.outcome == ps.OUTCOME_FAILED
 
 
-def test_the_gaps_stay_named_on_every_surface_even_on_an_ok_run(tmp_path):
+def test_the_gaps_stay_named_on_every_surface_even_on_an_ok_run(tmp_path: Any) -> None:
     """Reachable OK must not be bought by hiding the coverage gap."""
     root = _fake_checkout(tmp_path)
     run_date = _sweep_run_date()
@@ -1292,7 +1393,7 @@ def test_the_gaps_stay_named_on_every_surface_even_on_an_ok_run(tmp_path):
 # ── The zero-spend rehearsal must agree with the live path ──────────────────
 
 
-def test_the_derive_only_rehearsal_reports_no_blocking_finding_on_the_real_pipeline():
+def test_the_derive_only_rehearsal_reports_no_blocking_finding_on_the_real_pipeline() -> None:
     """`--derive-only` is the documented zero-spend rehearsal. It bound run_date
     AFTER the map-binding scan, so it emitted a blocking
     map_binding_disagreement for `$.run_date` that `sweep()` never emits — the
@@ -1327,11 +1428,11 @@ def test_the_derive_only_rehearsal_reports_no_blocking_finding_on_the_real_pipel
 DEDICATED_STAGE = "ResearchPredictorParallel.EvalJudgeProcess"
 
 
-def _dedicated_result(report):
+def _dedicated_result(report: Any) -> Any:
     return next(r for r in report.results if r["stage"] == DEDICATED_STAGE)
 
 
-def test_the_dedicated_box_stage_is_acknowledged_in_the_live_manifest():
+def test_the_dedicated_box_stage_is_acknowledged_in_the_live_manifest() -> None:
     """The declaration is in the manifest, not in this file — a test that
     carries its own manifest proves the parser works and nothing about the
     pipeline."""
@@ -1344,8 +1445,8 @@ def test_the_dedicated_box_stage_is_acknowledged_in_the_live_manifest():
 
 
 def test_an_acknowledged_dedicated_box_stage_keeps_its_own_kind_and_does_not_fail_the_run(
-    tmp_path,
-):
+    tmp_path: Any,
+) -> None:
     """The whole deliverable in one test: everything else passes, the run is
     OK, and the gap is still carried by its own kind rather than by silence."""
     root = _fake_checkout(tmp_path)
@@ -1367,7 +1468,7 @@ def test_an_acknowledged_dedicated_box_stage_keeps_its_own_kind_and_does_not_fai
     assert report.outcome == ps.OUTCOME_OK
 
 
-def test_the_dedicated_box_gap_is_named_on_every_surface_on_that_ok_run(tmp_path):
+def test_the_dedicated_box_gap_is_named_on_every_surface_on_that_ok_run(tmp_path: Any) -> None:
     """OK is never bought by hiding the gap: a non-blocking finding, the
     notification's acknowledged-gaps block, the declared-stage row, and an
     ATTENTION console row — none of them green, none of them absent."""
@@ -1408,7 +1509,7 @@ def test_the_dedicated_box_gap_is_named_on_every_surface_on_that_ok_run(tmp_path
     assert rollup["status"] == ENVELOPE_ATTENTION
 
 
-def test_an_acknowledged_dedicated_box_stage_never_escalates_the_streak():
+def test_an_acknowledged_dedicated_box_stage_never_escalates_the_streak() -> None:
     """It is unsweepable on every run BY CONSTRUCTION, so a streak would report
     the declaration back as a discovery on a schedule, forever."""
     dedicated = ps.StageResult(
@@ -1435,7 +1536,7 @@ def test_an_acknowledged_dedicated_box_stage_never_escalates_the_streak():
     )
 
 
-def test_an_unacknowledged_unsweepable_stage_is_unchanged_and_still_fails(tmp_path):
+def test_an_unacknowledged_unsweepable_stage_is_unchanged_and_still_fails(tmp_path: Any) -> None:
     """The direction that must NOT move. Drop the declaration and the same
     stage is a coverage_defect that fails the run, exactly as before."""
     root = _fake_checkout(tmp_path)
@@ -1455,7 +1556,7 @@ def test_an_unacknowledged_unsweepable_stage_is_unchanged_and_still_fails(tmp_pa
                 if f.get("kind") == ps.FINDING_DEDICATED_BOX]
 
 
-def test_a_dedicated_box_stage_is_never_run_on_the_sweep_box(tmp_path):
+def test_a_dedicated_box_stage_is_never_run_on_the_sweep_box(tmp_path: Any) -> None:
     """The 2026-10-01 failure (alpha-engine-config-I11779). With the judge's
     launcher present in the sweep box's checkout, the stage must not be sent to
     the sweep box: its env file exists only on the dedicated box, so running it
@@ -1466,7 +1567,7 @@ def test_a_dedicated_box_stage_is_never_run_on_the_sweep_box(tmp_path):
     )
     scripts: list[str] = []
 
-    def runner(argv, **_kwargs):
+    def runner(argv: Any, **_kwargs: Any) -> Any:
         scripts.append(argv[-1])
         return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
 
@@ -1480,7 +1581,7 @@ def test_a_dedicated_box_stage_is_never_run_on_the_sweep_box(tmp_path):
                 if f.get("kind") == ps.FINDING_MANIFEST_DISAGREEMENT]
 
 
-def test_a_stale_dedicated_box_acknowledgement_fails_the_run(tmp_path):
+def test_a_stale_dedicated_box_acknowledgement_fails_the_run(tmp_path: Any) -> None:
     """The acknowledgement is graded the other way too. A stage acknowledged as
     unreachable that the sweep CAN now reach — the definition re-points it at the
     launcher box — is a blocking finding: an entry that outlives its cause is
@@ -1509,15 +1610,29 @@ def test_a_stale_dedicated_box_acknowledgement_fails_the_run(tmp_path):
 # ── A retired stage is not run, and is never silent (alpha-engine-config-I13374) ─
 
 
-def _retired_result(report, stage="Backtester"):
+#: Brian 2026-11-07 (Backtester) and 2026-11-10 ("Retire all 8").
+RETIRED_STAGES = (
+    "Backtester",
+    "ParityParallel.PitParityLookahead",
+    "ParityParallel.PitParityWalkforward",
+    "PitParityCompare",
+    "ParityParallel.ParityReplay",
+    "EvaluatorDiagnostics",
+    "EvaluatorOptimize",
+    "PredictorBacktest",
+    "PortfolioOptimizerBacktest",
+)
+
+
+def _retired_result(report: Any, stage: Any="Backtester") -> Any:
     return next(r for r in report.results if r["stage"] == stage)
 
 
-def test_a_retired_stage_is_not_run_and_is_reported_as_retired(tmp_path):
+def test_a_retired_stage_is_not_run_and_is_reported_as_retired(tmp_path: Any) -> None:
     root = _fake_checkout(tmp_path)
     scripts: list[str] = []
 
-    def runner(argv, **_kwargs):
+    def runner(argv: Any, **_kwargs: Any) -> Any:
         scripts.append(argv[-1])
         return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
 
@@ -1526,21 +1641,23 @@ def test_a_retired_stage_is_not_run_and_is_reported_as_retired(tmp_path):
     assert row["verdict"] == ps.RETIRED_VERDICT
     assert "alpha-engine-config-I13374" in row["reason"]
     assert row["acknowledged_reason"]
-    assert report.stages_retired == 1
+    assert report.stages_retired == len(RETIRED_STAGES)
     assert scripts, "the other stages must still be swept"
     assert not [x for x in scripts if "spot_backtester.sh" in x], (
         "the retired stage's launcher must never be handed to the runner"
     )
+    for stage in RETIRED_STAGES:
+        assert _retired_result(report, stage)["verdict"] == ps.RETIRED_VERDICT, stage
 
 
-def test_a_retired_stage_that_would_fail_does_not_fail_the_run(tmp_path):
+def test_a_retired_stage_that_would_fail_does_not_fail_the_run(tmp_path: Any) -> None:
     """The point of the arc: the retired stage's failure no longer alerts. The
     runner fails EVERY launcher it is handed; the retired stage is never handed
     one, so it contributes no failure."""
     root = _fake_checkout(tmp_path)
     seen: list[str] = []
 
-    def runner(argv, **_kwargs):
+    def runner(argv: Any, **_kwargs: Any) -> Any:
         seen.append(argv[-1])
         return subprocess.CompletedProcess(args=argv, returncode=1, stdout="", stderr="boom")
 
@@ -1551,19 +1668,22 @@ def test_a_retired_stage_that_would_fail_does_not_fail_the_run(tmp_path):
     assert len(report.results) == report.stages_declared
 
 
-def test_the_retirement_is_named_on_every_surface(tmp_path):
+def test_the_retirement_is_named_on_every_surface(tmp_path: Any) -> None:
     root = _fake_checkout(tmp_path)
     report = ps.sweep(SF_PATH, MANIFEST_PATH, str(root), "t", runner=_completed(0))
     findings = [f for f in report.coverage_findings if f.get("kind") == ps.FINDING_RETIRED]
-    assert [f["stage"] for f in findings] == ["Backtester"]
-    assert findings[0]["blocking"] is False
-    assert next(d for d in report.declared_stages if d["stage"] == "Backtester")["retired"]
+    assert sorted(f["stage"] for f in findings) == sorted(RETIRED_STAGES)
+    assert all(f["blocking"] is False for f in findings)
+    for stage in RETIRED_STAGES:
+        assert next(d for d in report.declared_stages if d["stage"] == stage)["retired"]
     subject, body = ps.render_notification(report)
-    assert "retired 1" in body and "RETIRED" in body and "Backtester" in body
+    assert f"retired {len(RETIRED_STAGES)}" in body and "RETIRED" in body
+    for stage in RETIRED_STAGES:
+        assert stage in body
     assert "alpha-engine-config-I13374" in body
 
 
-def test_a_retired_entry_past_its_re_exam_date_fails_the_run(tmp_path):
+def test_a_retired_entry_past_its_re_exam_date_fails_the_run(tmp_path: Any) -> None:
     root = _fake_checkout(tmp_path)
     manifest = json.loads(MANIFEST_PATH.read_text())
     manifest["retired_stages"]["Backtester"]["re_exam"] = "2026-11-08"

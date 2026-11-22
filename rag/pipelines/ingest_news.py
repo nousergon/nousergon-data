@@ -53,7 +53,7 @@ from __future__ import annotations
 
 import logging
 from datetime import date as Date
-from typing import Any, Sequence
+from typing import NotRequired, Protocol, Sequence, TypedDict, cast
 
 from collectors.news_aggregator import AggregatedNewsArticle
 
@@ -66,6 +66,51 @@ logger = logging.getLogger(__name__)
 # filter "news only" vs "filings only" by source-prefix without
 # enumerating vendors.
 _RAG_SOURCE_PREFIX = "news_"
+
+
+class _EmbedTextsFn(Protocol):
+    def __call__(self, texts: list[str]) -> list[list[float]]: ...
+
+
+class _DocumentExistsFn(Protocol):
+    def __call__(
+        self,
+        ticker: str,
+        doc_type: str,
+        filed_date: Date,
+        source: str,
+        external_id: str | None,
+    ) -> bool: ...
+
+
+class _Chunk(TypedDict):
+    content: str
+    section_label: str
+    embedding: NotRequired[list[float]]
+
+
+class _PendingDocument(TypedDict):
+    article: AggregatedNewsArticle
+    ticker: str
+    rag_source: str
+    external_id: str | None
+    chunk: _Chunk
+
+
+class _IngestDocumentFn(Protocol):
+    def __call__(
+        self,
+        *,
+        ticker: str,
+        sector: str | None,
+        doc_type: str,
+        source: str,
+        filed_date: Date,
+        title: str | None,
+        url: str | None,
+        chunks: list[_Chunk],
+        external_id: str | None,
+    ) -> str | None: ...
 
 
 def _rag_source(news_article_source: str) -> str:
@@ -113,9 +158,9 @@ def ingest_articles(
     *,
     filed_date: Date,
     ticker_to_sector: dict[str, str] | None = None,
-    embed_texts_fn=None,
-    document_exists_fn=None,
-    ingest_document_fn=None,
+    embed_texts_fn: _EmbedTextsFn | None = None,
+    document_exists_fn: _DocumentExistsFn | None = None,
+    ingest_document_fn: _IngestDocumentFn | None = None,
     dry_run: bool = False,
 ) -> dict[str, int]:
     """Ingest aggregated news articles into the RAG corpus.
@@ -159,8 +204,10 @@ def ingest_articles(
         from nousergon_lib.rag import document_exists
         document_exists_fn = document_exists
     if ingest_document_fn is None:
-        from nousergon_lib.rag import ingest_document
-        ingest_document_fn = ingest_document
+        # Upstream annotates chunks with a bare dict.
+        from nousergon_lib.rag import ingest_document  # pyright: ignore[reportUnknownVariableType]
+        # The library's public annotation uses an unparameterized dict for chunks.
+        ingest_document_fn = cast(_IngestDocumentFn, ingest_document)
     ticker_to_sector = ticker_to_sector or {}
 
     stats = {
@@ -179,7 +226,7 @@ def ingest_articles(
     # already batches internally in blocks of up to 128, see
     # ``nousergon_lib.rag.embeddings.embed_texts``) instead of once PER
     # article, which was the previous N-embedding-calls-per-run shape.
-    pending: list[dict[str, Any]] = []
+    pending: list[_PendingDocument] = []
     for article in articles:
         body = _chunk_text(article)
         if not body or len(body) < 20:

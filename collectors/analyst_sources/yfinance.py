@@ -18,8 +18,8 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
+from krepis.yfinance_quiet import quiet_yfinance
 from nousergon_lib.sources import AnalystSnapshot
-from nousergon_lib.yfinance_quiet import quiet_yfinance
 
 logger = logging.getLogger(__name__)
 
@@ -41,12 +41,12 @@ class YfinanceAnalystAdapter:
 
     name = "yfinance"
 
-    def __init__(self, yf_module: Any = None) -> None:
+    def __init__(self, yf_module: object = None) -> None:
         self._yf = yf_module  # default lazy-import
 
-    def _get_yf(self) -> Any:
+    def _get_yf(self) -> object:
         if self._yf is None:
-            import yfinance
+            import yfinance  # pyright: ignore[reportMissingTypeStubs]  # yfinance ships no stubs or py.typed
             self._yf = yfinance
         return self._yf
 
@@ -85,7 +85,7 @@ class YfinanceAnalystAdapter:
         )
 
 
-def _as_float(v: Any) -> float | None:
+def _as_float(v: Any) -> float | None:  # pyright: ignore[reportExplicitAny]  # raw value from yfinance's untyped .info JSON
     if v is None:
         return None
     try:
@@ -97,7 +97,7 @@ def _as_float(v: Any) -> float | None:
         return None
 
 
-def _as_int(v: Any) -> int | None:
+def _as_int(v: Any) -> int | None:  # pyright: ignore[reportExplicitAny]  # raw value from yfinance's untyped .info JSON
     if v is None:
         return None
     try:

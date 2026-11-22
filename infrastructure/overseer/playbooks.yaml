@@ -50,6 +50,7 @@ playbooks:
     wake:
       - "eventbridge:alpha-engine-saturday-sf-watch-failed (fleet SF terminal failure -> triage Lambda -> router, M2)"
       - "eventbridge:alpha-engine-sf-watch-spot-interruption + alpha-engine-sf-watch-instance-terminated (reclaim/relaunch)"
+      - "eventbridge:crucible-v2-bootstrap-death-redispatch (a crucible v2 `weekly` box shut down with a failed exit record -> crucible-v2-dispatcher -> router, pipeline crucible-v2-weekly, alpha-engine-config-I13712)"
     cadence: "event-driven only — no scheduled wake"
     # `wake` above is prose for a human; `triggers` is the same fact in a shape
     # a reader can JOIN (alpha-engine-config-I7056). Without it, nothing could
@@ -73,6 +74,15 @@ playbooks:
       # `drill_isolation` governs how a drill run is graded, not whether the
       # thing that starts it is a trigger.
       - {surface: scheduler, name: alpha-engine-sf-watch-canary-drill-weekly}
+      # alpha-engine-config-I13712. A crucible v2 weekly arc is not a Step
+      # Function, so no SF status-change rule sees it fail. The crucible-v2
+      # stack's EXISTING EC2 shutting-down rule already routes every
+      # crucible-v2 box's death to that stack's dispatcher; for a `weekly`
+      # box whose exit record reads failed (not reclaimed), the dispatcher
+      # invokes this router with this playbook. No new rule or schedule was
+      # created for it. The rule lives in nous-ergon-ops
+      # `infrastructure/cloudformation/crucible-v2.yaml` (BootstrapDeathRedispatchRule).
+      - {surface: events, name: crucible-v2-bootstrap-death-redispatch}
     executor_function: alpha-engine-sf-watch-spot-dispatcher
     executor_lambda_dir: sf-watch-spot-dispatcher
     # Executor verdict `reason` values that are by-design declines — the
@@ -1688,6 +1698,53 @@ alert_classes:
     # ruling, not an incident.
     tier: notify-silent
     chat: order-book
+  - class: crucible_v2_market_open_close
+    # alpha-engine-config-I12024 (Brian 2026-11-10: "I want to receive Telegram
+    # alerts when the market opens and when the market closes, along with the
+    # status of the order book and all of the related infrastructure"). Two
+    # notices a trading day from the trading box, crucible-executor
+    # executor/v2_market_alert.py on its own timers (09:40 and 16:07 ET):
+    # the order book and what came up at the open; the orders, the session's
+    # stop and the broker's open orders at the close. Each goes straight
+    # through krepis.telegram.send_message (never flow-doctor, so its daily cap
+    # cannot hold them) with KREPIS_EVENT_SOURCE set to this source in its
+    # systemd unit, so send_message's intake hook attributes every send here.
+    # A problem the notice finds rides the same once-a-day message as a
+    # Problem line with Impact / Auto-fix / You; a failed SEND pages through
+    # executor_trader_unit_failed, not this row.
+    source: "crucible-executor/v2-market-alert"
+    severities: [info]
+    intake: bus
+    response: drain-queue
+    # DECLARED notify-silent, chat order-book: the daily order-book / trading
+    # class of §7.2b, the same disposition as crucible_v2_morning_report.
+    tier: notify-silent
+    chat: order-book
+
+  - class: crucible_v2_session_watchdog
+    # alpha-engine-config-I12024 (Brian 2026-11-11: no holds -- fix it and keep
+    # trading the same day, without him). crucible-executor
+    # executor/v2_session_watchdog.py, every five minutes in the trading
+    # window on the trading box, restarts a dead or stalled v2 session up to
+    # its daily cap and stops a restarted one at the 16:05 hard stop. Each
+    # notice goes straight through krepis.telegram.send_message via
+    # notifier.send_trading_notice (never flow-doctor) with KREPIS_EVENT_SOURCE
+    # set to this source in its systemd unit. `info` = restarted / hard-stopped;
+    # `warning` = out of restarts, or deliberately not restarted (operator
+    # stop, kill switch, money-path chain) -- the message names the exact
+    # start command. A failed SEND exits non-zero and pages through the
+    # unit-failure path, not this row.
+    source: "crucible-executor/v2-session-watchdog"
+    severities: [info, warning]
+    intake: bus
+    response: drain-queue
+    # DECLARED notify-silent, chat order-book: the same trading-day disposition
+    # as crucible_v2_market_open_close. The schema has no per-severity tier;
+    # paging the "out of restarts" warning separately would be an
+    # episode_overrides entry, which is a routing decision for the Decision
+    # Queue, not this row.
+    tier: notify-silent
+    chat: order-book
 
   # ── data plane (nousergon-data) ──
   - class: data_collection_daily_report
@@ -2335,6 +2392,27 @@ alert_classes:
     # human's attention (it hides real spend from every cost surface) but not
     # tonight's page; it clears on its own once the generator emits a price
     # for the row (alpha-engine-config-PR10549 is exactly that fix).
+    tier: tracked-only
+    chat: none
+  - class: krepis_llm_fallback_engaged
+    # alpha-engine-config-I13940 (krepis-PR328): krepis/llm.py publishes ONE
+    # alert through krepis.alerts.publish, severity warning, source
+    # FALLBACK_ALERT_SOURCE ("krepis.llm.fallback"), when a router-edge group
+    # ENTERS a fallback episode -- the configured primary failed and a
+    # substitute deployment served the call. Calls inside the episode do not
+    # re-alert, recovery re-arms, and a 60-minute dedup key covers
+    # short-lived processes. Without this row the source resolves to PAGE as
+    # registry drift (krepis.alert_tiers.resolve_tier's no-row branch).
+    source: "krepis.llm.fallback"
+    severities: [warning]
+    intake: bus
+    response: drain-queue
+    # DECLARED: the call SUCCEEDED on the substitute, so the condition is
+    # degraded, not down -- the same disposition as llm_egress_proxy_sli and
+    # litellm_proxy_degraded_start above, and as data_spot_quota_fallback
+    # ("succeeded on fallback"). A primary that is actually unreachable with
+    # no working substitute fails the call, which surfaces on the consumer's
+    # own class; drain-queue owns triage of why the primary dropped out.
     tier: tracked-only
     chat: none
 

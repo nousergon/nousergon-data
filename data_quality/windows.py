@@ -290,7 +290,7 @@ def overlapping(
     """
     if end < start:
         raise ValueError(f"end {end} precedes start {start}")
-    hits = []
+    hits: list[QualityWindow] = []
     for window in WINDOWS:
         if artifact not in window.artifacts:
             continue

@@ -59,12 +59,13 @@ Same three-way honesty as every reader in this package:
 from __future__ import annotations
 
 import datetime as dt
-from typing import Any
+from collections.abc import Iterable, Mapping
+from typing import TypeGuard, cast
 
 from nousergon_lib.gates import read_store_document
 
 from data_gate.descriptors import Unit
-from data_gate.evidence import GateStore, Reading, _parse_utc
+from data_gate.evidence import GateStore, Reading, parse_utc
 from data_gate.producers.console_entity import RECEIPT_KEY, RECEIPT_SCHEMA
 
 __all__ = [
@@ -147,7 +148,12 @@ def receipt_key(unit: Unit) -> str:
     return RECEIPT_KEY.format(unit_id=unit.unit_id)
 
 
-def _identity_problems(unit: Unit, document: dict[str, Any]) -> list[str]:
+def _is_json_object(value: object) -> TypeGuard[dict[str, object]]:
+    """``isinstance(value, dict)``: a decoded JSON object, whose keys are strings."""
+    return isinstance(value, dict)
+
+
+def _identity_problems(unit: Unit, document: Mapping[str, object]) -> list[str]:
     problems: list[str] = []
     if document.get("schema") != RECEIPT_SCHEMA:
         problems.append(f"schema {document.get('schema')!r}, expected {RECEIPT_SCHEMA!r}")
@@ -158,9 +164,9 @@ def _identity_problems(unit: Unit, document: dict[str, Any]) -> list[str]:
     return problems
 
 
-def _currency_problems(document: dict[str, Any], now: dt.datetime) -> list[str]:
+def _currency_problems(document: Mapping[str, object], now: dt.datetime) -> list[str]:
     stamp = document.get("checked_at")
-    checked = _parse_utc(stamp) if stamp else None
+    checked = parse_utc(stamp) if stamp else None
     if checked is None:
         return [f"`checked_at` {stamp!r} is not an ISO-8601 timestamp: an undated reading is not a current one"]
     if now - checked > RECEIPT_MAX_AGE:
@@ -169,14 +175,16 @@ def _currency_problems(document: dict[str, Any], now: dt.datetime) -> list[str]:
     return []
 
 
-def _reachability_problems(unit: Unit, document: dict[str, Any]) -> list[str]:
+def _reachability_problems(unit: Unit, document: Mapping[str, object]) -> list[str]:
     doctor = document.get("doctor")
-    if not isinstance(doctor, dict):
+    if not _is_json_object(doctor):
         return ["no `doctor` record: nothing shows the console was asked where this unit is"]
     problems: list[str] = []
     if str(doctor.get("identifier") or "") != unit.component_id:
         problems.append(f"doctor.identifier {doctor.get('identifier')!r} is not {unit.component_id!r}")
-    steps = [s for s in (doctor.get("steps") or []) if isinstance(s, dict)]
+    # Iterated unchecked, as it always was: a non-iterable `steps` raises here.
+    reported = cast("Iterable[object]", doctor.get("steps") or [])
+    steps = [s for s in reported if _is_json_object(s)]
     by_name = {str(s.get("name") or ""): s for s in steps}
     missing = [name for name in REQUIRED_LINKS if name not in by_name]
     if missing:
@@ -189,9 +197,9 @@ def _reachability_problems(unit: Unit, document: dict[str, Any]) -> list[str]:
     return problems
 
 
-def _honesty_problems(unit: Unit, document: dict[str, Any]) -> list[str]:
+def _honesty_problems(unit: Unit, document: Mapping[str, object]) -> list[str]:
     entity = document.get("entity")
-    if not isinstance(entity, dict):
+    if not _is_json_object(entity):
         return ["no `entity` record: nothing shows what state the console renders this unit in"]
     problems: list[str] = []
     if str(entity.get("kind") or "") != "component":
