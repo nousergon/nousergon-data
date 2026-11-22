@@ -1,4 +1,3 @@
-# ruff: noqa: ANN001, ANN002, ANN003, ANN201, ANN202, ANN204, ANN205, ANN206
 """Handler tests for alpha-engine-overseer-dispatcher (alpha-engine-config-I2823).
 
 Pins the router contract: registry-driven routing to the executor, bool

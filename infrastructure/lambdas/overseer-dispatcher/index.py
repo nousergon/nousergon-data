@@ -62,6 +62,7 @@ import urllib.request
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import boto3
 import yaml
@@ -256,7 +257,7 @@ def _write_ledger(key: str, record: dict[str, object]) -> str | None:
         return None
 
 
-def handler(event: dict, context: object) -> dict:  # noqa: ARG001 — Lambda contract
+def handler(event: dict[str, Any], context: object) -> dict[str, Any]:  # pyright: ignore[reportExplicitAny]  # raw Lambda event / verdict JSON  # noqa: ARG001 — Lambda contract
     """Route a dispatch request to its playbook's executor. Clean-JSON
     contract: anticipated failures return ``routed: false`` verdicts (and
     escalate where the failure means lost coverage), never raise."""

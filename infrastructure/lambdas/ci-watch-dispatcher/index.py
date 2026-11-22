@@ -1,4 +1,3 @@
-# pyright: reportExplicitAny=false
 """alpha-engine-ci-watch-dispatcher — launch the Fleet CI Watch diagnose+fix
 agent on a dedicated EC2 spot box, once per real CI failure event.
 
@@ -88,9 +87,9 @@ import logging
 import os
 import re
 import shlex
-from typing import Any
 import uuid
 from datetime import datetime, timezone
+from typing import Any
 
 import boto3
 
@@ -559,7 +558,7 @@ def _terminate_instance(instance_id: str) -> None:
 def _launch_ci_watch_spot(repo: str, sha: str, run_id: str, run_url: str,
                           workflow: str, branch: str,
                           is_drill: str = "false", model: str = "",
-                          dispatch_run_id: str = "") -> dict[str, Any]:
+                          dispatch_run_id: str = "") -> dict[str, Any]:  # pyright: ignore[reportExplicitAny]  # raw verdict JSON
     """Launch + bootstrap the CI-watch box. SYNCHRONOUS contract: every
     anticipated failure mode returns a clean, well-formed launched:false
     rather than raising — see module docstring."""
@@ -673,7 +672,7 @@ def _launch_ci_watch_spot(repo: str, sha: str, run_id: str, run_url: str,
     return verdict
 
 
-def handler(event: dict[str, Any], context: object) -> dict[str, Any]:  # noqa: ARG001 — Lambda contract
+def handler(event: dict[str, Any], context: object) -> dict[str, Any]:  # pyright: ignore[reportExplicitAny]  # raw Lambda event / verdict JSON  # noqa: ARG001 — Lambda contract
     """Synchronous handler invoked once per real CI failure event. `event`
     carries {"repo", "sha", "run_id", "run_url", "workflow", "branch"} from
     the GHA job's `lambda invoke` payload (RequestResponse).

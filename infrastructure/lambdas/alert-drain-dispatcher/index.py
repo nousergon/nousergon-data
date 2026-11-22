@@ -1,4 +1,3 @@
-# pyright: reportExplicitAny=false
 """alpha-engine-alert-drain-dispatcher — launch the Overseer alert-drain agent
 on a dedicated EC2-spot box, twice daily (alpha-engine-config-I2824, epic
 I2821 phase 3).
@@ -43,8 +42,8 @@ import logging
 import os
 import re
 import shlex
-from typing import Any
 from datetime import datetime, timezone
+from typing import Any
 
 from nousergon_lib import spot_dispatch
 from nousergon_lib.spot_dispatch import SpotLaunchError, SpotProbeError
@@ -266,7 +265,7 @@ def _terminate_instance(instance_id: str) -> None:
     spot_dispatch.terminate_on_failure(instance_id, region=REGION, label="alert-drain")
 
 
-def handler(event: dict[str, Any], context: object) -> dict[str, Any]:  # noqa: ARG001 — Lambda contract
+def handler(event: dict[str, Any], context: object) -> dict[str, Any]:  # pyright: ignore[reportExplicitAny]  # raw Lambda event / verdict JSON  # noqa: ARG001 — Lambda contract
     """Synchronous handler invoked by the overseer-dispatcher router (playbook
     ``alert-drain``) when the twice-daily Scheduler fires — or with
     ``{"is_drill": "true"}`` on a canary drill. Clean-JSON contract identical

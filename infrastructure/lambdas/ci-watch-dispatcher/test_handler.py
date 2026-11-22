@@ -1,4 +1,3 @@
-# ruff: noqa: ANN001, ANN002, ANN003, ANN201, ANN202, ANN204, ANN205, ANN206
 """Unit tests for the synchronous CI-failure -> ci-watch-spot dispatcher.
 
 Hermetic: ``nousergon_lib.ec2_spot`` and ``boto3`` are stubbed in sys.modules

@@ -1,4 +1,3 @@
-# ruff: noqa: ANN001, ANN002, ANN003, ANN201, ANN202, ANN204, ANN205, ANN206
 """Handler tests for alpha-engine-alert-drain-dispatcher (alpha-engine-config-I2824).
 
 Pins the executor contract: clean-JSON verdicts (never raises), single-lane

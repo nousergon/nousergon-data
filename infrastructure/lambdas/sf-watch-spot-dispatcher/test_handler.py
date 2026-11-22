@@ -1,4 +1,3 @@
-# ruff: noqa: ANN001, ANN002, ANN003, ANN201, ANN202, ANN204, ANN205, ANN206
 """Unit tests for the synchronous SF-failure -> sf-watch-spot dispatcher.
 
 Hermetic: ``nousergon_lib.ec2_spot`` and ``boto3`` are stubbed in sys.modules
@@ -1278,6 +1277,22 @@ def test_a_v2_weekly_defer_carries_the_dispatch_id_forward(monkeypatch):
     payload = json.loads(sched["Target"]["Input"])
     assert payload["dispatch_id"] == _V2_DISPATCH_ID
     assert payload["execution_arn"] == ""
+
+
+def test_a_deferred_relaunch_carries_the_dispatch_run_id_forward(monkeypatch):
+    """alpha-engine-config-I7082: the deferred box is the same dispatch, so it
+    must still export the router's ledger key rather than an honest null."""
+    idx = _load(
+        monkeypatch, env={"SF_WATCH_DISPATCH_ENABLED": "true"},
+        running_instances={
+            ("saturday", "ne-weekly-freshness-pipeline", "2026-07-11"): ["i-already-running"],
+        },
+    )
+    key = "overseer/dispatch_ledger/2026-07-11/120000-sf-watch-abcd1234.json"
+    out = idx.handler(_event(dispatch_run_id=key), _FakeContext())
+    assert out["reason"] == "deferred"
+    (sched,) = idx._test_scheduler.created
+    assert json.loads(sched["Target"]["Input"])["dispatch_run_id"] == key
 
 
 def test_dispatch_run_id_export_is_shell_safe_and_optional(monkeypatch):
