@@ -176,7 +176,7 @@ import sys
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, cast
 from zoneinfo import ZoneInfo
 
 import boto3
@@ -848,32 +848,37 @@ def _publish_watchdog_alert(
         dedup_key=dedup_key,
         dedup_window_min=dedup_window_min,
     )
-    telegram_ok = notify_via_flow_doctor(
-        message,
-        silent=False,
-        severity=severity,
-        dedup_key=dedup_key,
-        flow_name=_FLOW_NAME,
-        topics=PIPELINE_OBSERVER_TELEGRAM_TOPICS,
-        db_basename=_DB_BASENAME,
-        context=context,
-        # Must match the SNS/bus alerts.publish() source= above exactly —
-        # both paths alert on the same event, and the registered
-        # `pipeline_watchdog_stuck_sf` class in playbooks.yaml keys on this
-        # string (config-I3513).
-        source="alpha-engine-pipeline-watchdog",
-    )
+    # Only an explicit True from publish() suppresses Telegram: a missing or
+    # malformed verdict must still page rather than silence the channel.
+    dedup_skipped = getattr(cast(object, result), "dedup_skipped", False) is True
+    telegram_ok = False
+    if not dedup_skipped:
+        telegram_ok = notify_via_flow_doctor(
+            message,
+            silent=False,
+            severity=severity,
+            dedup_key=dedup_key,
+            flow_name=_FLOW_NAME,
+            topics=PIPELINE_OBSERVER_TELEGRAM_TOPICS,
+            db_basename=_DB_BASENAME,
+            context=context,  # pyright: ignore[reportUnknownArgumentType]
+            # Must match the SNS/bus alerts.publish() source= above exactly —
+            # both paths alert on the same event, and the registered
+            # `pipeline_watchdog_stuck_sf` class in playbooks.yaml keys on this
+            # string (config-I3513).
+            source="alpha-engine-pipeline-watchdog",
+        )
     logger.warning(
         "watchdog ALERT: severity=%s dedup_key=%s sns_ok=%s telegram_ok=%s dedup_skipped=%s",
         severity,
         dedup_key,
         result.sns.ok,
         telegram_ok,
-        getattr(result, "dedup_skipped", False),
+        dedup_skipped,
     )
     return (
         f"sns_ok={result.sns.ok} telegram_ok={telegram_ok} "
-        f"dedup_skipped={getattr(result, 'dedup_skipped', False)}"
+        f"dedup_skipped={dedup_skipped}"
     )
 
 
@@ -2160,7 +2165,7 @@ def _check_weekly_silence(
     )
 
 
-def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
+def handler(event: dict, context: object) -> dict[str, object]:  # noqa: ARG001 — Lambda contract
     """EventBridge cron handler. Runs the 3 per-SF liveness checks, the
     preopen schedule-buffer canary, and the 2 prior-day failed-run checks,
     and returns a structured summary the Lambda console / CW logs can read
@@ -2277,7 +2282,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         now_utc=now_utc, weekly_paused_reason=weekly_paused_reason
     )
 
-    summary = {
+    summary: dict[str, object] = {
         "fired_at_utc": now_utc.isoformat(),
         "is_trading_today": is_trading_today,
         "is_sunday": is_sunday,
