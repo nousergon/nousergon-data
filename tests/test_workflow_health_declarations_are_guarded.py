@@ -17,7 +17,7 @@ from typing import Any
 import yaml
 
 _ROOT = Path(__file__).resolve().parent.parent
-_CI = _ROOT / ".github" / "workflows" / "ci.yml"
+_CI = _ROOT / ".github" / "workflows" / "workflow-health-declarations.yml"
 _JOB = "workflow-health-declarations"
 _MIN_LIB = 224  # v0.124.224 first shipped the console entry point
 _ENTRY = "workflow-health-semantics"
@@ -29,7 +29,7 @@ def _ci() -> dict[str, Any]:
 
 def _job() -> dict[str, Any]:
     jobs: dict[str, Any] = _ci()["jobs"]
-    assert _JOB in jobs, f"ci.yml has no `{_JOB}` job"
+    assert _JOB in jobs, f"{_CI.name} has no `{_JOB}` job"
     return jobs[_JOB]
 
 
@@ -37,10 +37,22 @@ def _runs() -> list[str]:
     return [s["run"] for s in _job()["steps"] if "run" in s]
 
 
-def test_ci_runs_on_pull_requests() -> None:
+def test_workflow_runs_on_pull_requests() -> None:
     # PyYAML parses the bare key `on` as boolean True.
     triggers = _ci().get("on", _ci().get(True))
     assert "pull_request" in triggers
+    assert "merge_group" in triggers
+    assert "push" in triggers
+    # No paths filter on any trigger: it must report on every PR.
+    for name, cfg in triggers.items():
+        assert not (cfg or {}).get("paths"), f"{name} has a paths filter"
+        assert not (cfg or {}).get("paths-ignore"), f"{name} has a paths-ignore filter"
+
+
+def test_ci_yml_no_longer_carries_the_job() -> None:
+    # It moved out so ci.yml stays held to the root nousergon-lib pin.
+    ci = yaml.safe_load((_CI.parent / "ci.yml").read_text())
+    assert _JOB not in ci["jobs"]
 
 
 def test_job_is_unconditional() -> None:
