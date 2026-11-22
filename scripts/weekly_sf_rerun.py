@@ -113,11 +113,13 @@ import sys
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 # sys.path insertion (not a package import) so this resolves identically
 # whether run directly (`python scripts/weekly_sf_rerun.py`) or loaded by
 # spec_from_file_location the way tests/test_weekly_sf_rerun.py does.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+_Json = dict[str, Any]  # pyright: ignore[reportExplicitAny] — raw JSON object
 from sf_rerun_common import (  # noqa: E402 — see sys.path insertion above
     derive_calendar_date,
     derive_run_date,
@@ -916,13 +918,13 @@ def _flat_states(sm_def: dict) -> dict:
     return dict(_walk_states(sm_def.get("States", {})))
 
 
-def _rule_skip_flag(rule: dict) -> str | None:
+def _rule_skip_flag(rule: _Json) -> str | None:
     """The single ``skip_*`` key a Choice rule tests, or None if the rule
     tests anything else (or more than one thing)."""
     flags = set()
     other = False
 
-    def rec(node):
+    def rec(node: object) -> None:
         nonlocal other
         if not isinstance(node, dict):
             return
@@ -1126,7 +1128,7 @@ class CadenceSkipsUnreadable(RuntimeError):
     """
 
 
-def cadence_declared_skips(path: Path = None) -> dict:
+def cadence_declared_skips(path: Path | None = None) -> dict[str, bool]:
     """The ``skip_*`` flags the SCHEDULED weekly run declares for itself.
 
     Parsed out of ``SaturdayTrigger.Targets[saturday-pipeline].Input`` in
@@ -1174,10 +1176,10 @@ class RerunPlan:
     original_input: dict
     calendar_date: str = ""
     calendar_date_provenance: str = ""
-    completed: list = field(default_factory=list)   # stage names
+    completed: list[str] = field(default_factory=list)   # stage names
     degraded: list = field(default_factory=list)    # stage names (re-run!)
     failed: list = field(default_factory=list)      # stage names
-    skip_flags: dict = field(default_factory=dict)  # flag -> True
+    skip_flags: dict[str, bool] = field(default_factory=dict)  # flag -> True
     warnings: list = field(default_factory=list)
     notes: list = field(default_factory=list)
 
@@ -1195,7 +1197,7 @@ class RerunPlan:
     # a derived skip set trustworthy at all: a skip whose evidence cannot be
     # named is indistinguishable from an inherited flag.
     chain: list = field(default_factory=list)
-    witnessed_by: dict = field(default_factory=dict)
+    witnessed_by: dict[str, str] = field(default_factory=dict)
 
     # alpha-engine-config-I11075: the operator's named reason for dispatching a
     # rerun that can enter no spine stage. Emitted into the execution input so
@@ -1203,13 +1205,57 @@ class RerunPlan:
     # why" without anyone having to find the terminal that launched it.
     accept_vacuous_reason: str = ""
 
+    # alpha-engine-config-I13864: the operator's own reasons for skipping a
+    # producer, ``--skip-reason FLAG=REASON``. They supplement (and override) the
+    # evidence-derived reasons in ``skipped_producer_reasons``.
+    operator_skip_reasons: dict[str, str] = field(default_factory=dict)
+
     # alpha-engine-config-I12228: the cycle's collection-readiness anchor (an
     # RFC3339 instant), emitted as ``collection_not_before``. See
     # ``cycle_collection_anchor``. Empty = not derivable; the key is then left
     # out and the SF's InitializeInput floor (the rerun's own start) applies.
     collection_not_before: str = ""
 
-    def rerun_input(self) -> dict:
+    def skipped_producer_reasons(self) -> dict[str, str]:
+        """Per skipped producer, WHY this recovery does not re-run it.
+
+        alpha-engine-config-I13864: the SF ends a recovery that skips a declared
+        producer in a failure terminal (it is not a full run), so the record of
+        why each producer was skipped has to travel with the execution. Keyed by
+        the emitted ``skip_*`` flag. A flag the CADENCE declares for itself is
+        not a skip of this recovery and is not listed.
+
+        The default reason is evidence, not boilerplate: the stage the flag
+        belongs to was witnessed COMPLETE by a named execution in the recovery
+        chain (``witnessed_by``). A flag with no such evidence has no default and
+        needs ``--skip-reason``; an empty value is never emitted, because a skip
+        no one can explain is indistinguishable from an inherited one.
+        """
+        declared = cadence_declared_skips()
+        evidence: dict[str, str] = {}
+        for stage in STAGES:
+            witness = self.witnessed_by.get(stage.name)
+            if (
+                stage.flag in self.skip_flags
+                and stage.name in self.completed
+                and witness
+                and stage.flag not in evidence
+            ):
+                evidence[stage.flag] = f"{stage.name} completed in {witness}"
+        return {
+            flag: reason
+            for flag in sorted(self.skip_flags)
+            if flag not in declared
+            and (reason := (self.operator_skip_reasons.get(flag) or evidence.get(flag) or "").strip())
+        }
+
+    def unexplained_skips(self) -> list[str]:
+        """Emitted skip flags (cadence-declared ones excluded) with no reason."""
+        declared = cadence_declared_skips()
+        reasons = self.skipped_producer_reasons()
+        return sorted(f for f in self.skip_flags if f not in declared and f not in reasons)
+
+    def rerun_input(self) -> _Json:
         """The emitted StartExecution input.
 
         Non-``skip_*`` keys pass through from the source execution
@@ -1271,6 +1317,12 @@ class RerunPlan:
         out["pipeline_role"] = EMITTED_ROLE
         out.update(declared)
         out.update(self.skip_flags)
+        # alpha-engine-config-I13864: a RECORD, never a switch. The SF reads no
+        # key named here when deciding the terminal, so acknowledging a skip
+        # cannot turn a partial or vacuous execution into a success.
+        reasons = self.skipped_producer_reasons()
+        if reasons:
+            out["skipped_producer_reasons"] = reasons
         if self.accept_vacuous_reason:
             out["vacuous_rerun_accepted_reason"] = self.accept_vacuous_reason
         if self.collection_not_before:
@@ -1289,7 +1341,7 @@ def _simulate_reachable_works(flags: dict, original_input: dict) -> set:
 
     ran: set = set()
 
-    def run_linear(names: list):
+    def run_linear(names: list[str]) -> None:
         for n in names:
             if not effective[n]:
                 ran.add(n)
@@ -1301,7 +1353,7 @@ def _simulate_reachable_works(flags: dict, original_input: dict) -> set:
     run_linear(sorted(BRANCH_A_STAGES, key=lambda n: [s.name for s in STAGES].index(n)))
     run_linear(["predictor_training"])
     # tail: CheckSkipBacktester's skip route OVERSHOOTS to CheckSkipEvaluator
-    def run_parity_family():
+    def run_parity_family() -> None:
         # alpha-engine-config#6030: skip_parity bypasses the WHOLE family
         # (ParityParallel + compare); otherwise each fine-grained stage runs
         # per its own flag (the three branch gates + the compare gate).
@@ -1415,7 +1467,7 @@ def resolve_chain(links: list) -> tuple:
     return outcome, witness
 
 
-def _parse_anchor(value) -> datetime | None:
+def _parse_anchor(value: object) -> datetime | None:
     """An aware datetime from a datetime or an RFC3339 string, else None."""
     if isinstance(value, datetime):
         return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
@@ -1804,7 +1856,7 @@ def decide_mutex_action(
 # (imported above) — lifted unchanged on the weekday_sf_rerun.py second
 # adoption (alpha-engine-config#6694, shared-code-policy).
 
-def resolve_default_execution(sf, sm_arn: str) -> dict:
+def resolve_default_execution(sf: Any, sm_arn: str) -> _Json:  # pyright: ignore[reportExplicitAny] — untyped boto3 client
     """Latest terminal-failed (FAILED or TIMED_OUT) execution."""
     for ex in list_all_executions(sf, sm_arn):
         if ex["status"] in ("FAILED", "TIMED_OUT"):
@@ -1816,7 +1868,7 @@ def resolve_default_execution(sf, sm_arn: str) -> dict:
     )
 
 
-def next_rerun_name(sf, sm_arn: str, run_date: str) -> str:
+def next_rerun_name(sf: Any, sm_arn: str, run_date: str) -> str:  # pyright: ignore[reportExplicitAny] — untyped boto3 client
     prefix = f"watch-rerun-{run_date}-"
     ns = []
     for ex in list_all_executions(sf, sm_arn):
@@ -1849,7 +1901,12 @@ CHAIN_WINDOW_DAYS_BEFORE = 1
 CHAIN_WINDOW_DAYS_AFTER = 6
 
 
-def chain_candidates(executions: list, run_date: str, source_arn: str, source_start) -> tuple:
+def chain_candidates(
+    executions: list[_Json],
+    run_date: str,
+    source_arn: str,
+    source_start: object,
+) -> tuple[list[_Json], list[_Json]]:
     """Split ``executions`` into (candidates, non_terminal) for the chain of
     ``run_date``, oldest first.
 
@@ -1876,7 +1933,12 @@ def chain_candidates(executions: list, run_date: str, source_arn: str, source_st
     return cands, non_terminal
 
 
-def collect_chain_histories(sf, sm_arn: str, run_date: str, source: dict) -> tuple:
+def collect_chain_histories(
+    sf: Any,  # pyright: ignore[reportExplicitAny] — untyped boto3 client
+    sm_arn: str,
+    run_date: str,
+    source: _Json,
+) -> tuple[list[tuple[str, list[_Json]]], list[str]]:
     """``([(label, events), ...], warnings)`` for every EARLIER terminal
     execution of ``run_date``, oldest first.
 
@@ -1978,6 +2040,27 @@ def refuse_fallback_run_date_without_acceptance(plan: "RerunPlan", accept: bool)
     )
 
 
+def refuse_unexplained_skips(plan: "RerunPlan") -> None:
+    """Refuse (SystemExit) a --start that skips a producer with no stated reason.
+
+    alpha-engine-config-I13864: such a recovery ends in a failure terminal by
+    design, and its input is the only durable record of why each producer was
+    left out. Derived skips carry their evidence (the execution that completed
+    the stage); anything else needs ``--skip-reason FLAG=REASON``.
+    """
+    missing = plan.unexplained_skips()
+    if not missing:
+        return
+    raise SystemExit(
+        "FATAL (unexplained skip, alpha-engine-config-I13864): this recovery "
+        f"skips {', '.join(missing)} with no recorded reason. A recovery that "
+        "skips a declared producer is not a full run and the execution ends in "
+        "a failure terminal; the input must say why each producer was left out. "
+        "Re-run with "
+        + " ".join(f"--skip-reason {flag}='why'" for flag in missing)
+    )
+
+
 class VacuousRerunError(Exception):
     """The proposed rerun can enter NO declared spine stage.
 
@@ -2048,7 +2131,7 @@ def refuse_vacuous_rerun(
     )
 
 
-def _predictor_cycle_verdict(s3, trading_day: str) -> str:
+def _predictor_cycle_verdict(s3: Any, trading_day: str) -> str:  # pyright: ignore[reportExplicitAny] — untyped boto3 client
     """GetObject arena/model/{trading_day}.verdict; return its whole body.
 
     Any S3 error -- NoSuchKey included, which is the "this cycle never reached
@@ -2136,7 +2219,11 @@ def predictor_skip_trading_day(plan: "RerunPlan") -> str:
     return plan.run_date
 
 
-def check_predictor_skip_freshness(s3, trading_day: str, emitted_input: dict) -> None:
+def check_predictor_skip_freshness(
+    s3: Any,  # pyright: ignore[reportExplicitAny] — untyped boto3 client
+    trading_day: str,
+    emitted_input: _Json,
+) -> None:
     """Mirror ValidatePredictorSkipWeightsFresh / CheckPredictorSkipWeightsFresh.
 
     If the SF will validate this input's skip_predictor_training claim (see
@@ -2170,7 +2257,7 @@ def check_predictor_skip_freshness(s3, trading_day: str, emitted_input: dict) ->
         )
 
 
-def apply_predictor_skip_coherence(plan: "RerunPlan", s3) -> None:
+def apply_predictor_skip_coherence(plan: "RerunPlan", s3: Any) -> None:  # pyright: ignore[reportExplicitAny] — untyped boto3 client
     """The skip-coherence pre-flight main() runs, against the EMITTED input.
 
     Reads the document that would actually be dispatched (cadence-declared
@@ -2217,6 +2304,16 @@ def _print_plan(plan: RerunPlan, source_arn: str, source_status: str, name: str,
     print(f"degraded stages  : {', '.join(plan.degraded) or '(none)'}")
     print(f"failed stages    : {', '.join(plan.failed) or '(none identified)'}")
     print(f"derived skips    : {', '.join(sorted(plan.skip_flags)) or '(none)'}")
+    # alpha-engine-config-I13864: a skip with no reason is refused at --start;
+    # shown here so --dry-run says which ones need --skip-reason.
+    for flag, reason in sorted(plan.skipped_producer_reasons().items()):
+        print(f"  skip reason    : {flag}: {reason}")
+    if plan.unexplained_skips():
+        print(
+            "  UNEXPLAINED    : "
+            + ", ".join(plan.unexplained_skips())
+            + " - --start refuses without --skip-reason FLAG=REASON"
+        )
     for label in plan.chain:
         seen = [
             f"{name} ({plan_verdict})"
@@ -2293,6 +2390,17 @@ def main(argv: list | None = None) -> int:
         ),
     )
     ap.add_argument(
+        "--skip-reason", action="append", default=[], metavar="FLAG=REASON",
+        help=(
+            "why a skipped producer is not re-run, e.g. "
+            "--skip-reason skip_scanner='completed in the 09-18 run, artifact "
+            "verified' (repeatable). Required to --start for any emitted skip "
+            "flag that has no derived evidence (alpha-engine-config-I13864); the "
+            "reason is recorded in the execution input as skipped_producer_reasons "
+            "and cannot change the execution's terminal outcome."
+        ),
+    )
+    ap.add_argument(
         "--rerun-stage",
         action="append",
         default=[],
@@ -2318,7 +2426,7 @@ def main(argv: list | None = None) -> int:
 
     if args.execution_arn:
         desc = sf.describe_execution(executionArn=args.execution_arn)
-        source = {"executionArn": args.execution_arn, "status": desc["status"], "startDate": desc["startDate"]}
+        source: _Json = {"executionArn": args.execution_arn, "status": desc["status"], "startDate": desc["startDate"]}
     else:
         source = resolve_default_execution(sf, args.state_machine_arn)
     source_arn, source_status = source["executionArn"], source["status"]
@@ -2414,6 +2522,25 @@ def main(argv: list | None = None) -> int:
             _print_plan(plan, source_arn, source_status, name, args.state_machine_arn)
             raise SystemExit(2)
 
+    # Skip reasons (alpha-engine-config-I13864). Parsed against the FINAL skip
+    # set, so a reason for a flag this plan does not emit is an error rather than
+    # a record of a skip that never happened.
+    for item in args.skip_reason:
+        flag, sep, reason = item.partition("=")
+        flag, reason = flag.strip(), reason.strip()
+        if not sep or not reason:
+            raise SystemExit(
+                f"FATAL: --skip-reason {item!r} must be FLAG=REASON with a "
+                "nonempty reason (alpha-engine-config-I13864)."
+            )
+        if flag not in plan.skip_flags:
+            raise SystemExit(
+                f"FATAL: --skip-reason names {flag!r}, which this recovery does "
+                f"not skip (emitted skips: {sorted(plan.skip_flags) or 'none'}). "
+                "A reason for a skip that is not emitted would be a false record."
+            )
+        plan.operator_skip_reasons[flag] = reason
+
     # Vacuity pre-flight (alpha-engine-config-I11075). Computed against the
     # EMITTED input — cadence-declared skips included — so the verdict is about
     # the document that would actually be dispatched, not the derived subset.
@@ -2460,6 +2587,9 @@ def main(argv: list | None = None) -> int:
     # for exactly this reason on 2026-08-16). --dry-run always shows it
     # above; --start additionally refuses unless explicitly acknowledged.
     refuse_fallback_run_date_without_acceptance(plan, args.accept_fallback_run_date)
+
+    # alpha-engine-config-I13864: every skipped producer carries a reason.
+    refuse_unexplained_skips(plan)
 
     # alpha-engine-config-I11075: a rerun that can enter no spine stage is the
     # skip-to-green shape I9693 measured thirteen times — refused before the

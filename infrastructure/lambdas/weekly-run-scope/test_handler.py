@@ -64,6 +64,7 @@ from run_scope import (
     GRADED_DISPOSITIONS,
     NOT_REACHED,
     build_run_scope,
+    classify_execution_scope,
     caught_failures,
     derive_gates,
     entered_sequence,
@@ -1547,3 +1548,189 @@ def test_a_production_execution_keeps_the_live_key(monkeypatch):
         assert index.scope_key("2026-10-15", index.rehearsal_execution(arn)) == (
             "backtest/2026-10-15/run_scope.json"
         )
+
+
+# ---------------------------------------------------------------------------
+# This execution's own producer-scope verdict (alpha-engine-config-I13864)
+# ---------------------------------------------------------------------------
+
+
+def _scope(rows: dict[str, tuple[str, str]], after_scope=None, degraded=False):
+    """A scope block from ``{stage: (disposition, flag)}``, nothing else."""
+    block = {
+        "degraded": degraded,
+        "stages": {
+            stage: {
+                "disposition": disposition,
+                "flag": flag,
+                "disabled_by": flag if disposition == DISABLED else None,
+            }
+            for stage, (disposition, flag) in rows.items()
+        },
+        "after_scope": after_scope or {},
+    }
+    return block
+
+
+def test_a_complete_execution_stays_eligible_for_success():
+    scope = _scope({
+        "Scanner": (ENABLED_COMPLETED, "skip_scanner"),
+        "Backtester": (ENABLED_COMPLETED, "skip_backtester"),
+    }, after_scope={"Director": {"flag": "skip_director", "input_flag": None}})
+    result = classify_execution_scope(scope)
+    assert result["verdict"] == "COMPLETE"
+    assert result["skipped_producers"] == []
+
+
+def test_a_cadence_declared_skip_is_not_a_skipped_producer():
+    """The scheduled run is declared not to run parity, data_phase2 or RAG
+    ingestion; counting those would fail every canonical Saturday."""
+    scope = _scope({
+        "Scanner": (ENABLED_COMPLETED, "skip_scanner"),
+        "Parity": (DISABLED, "skip_parity"),
+        "DataPhase2": (DISABLED, "skip_data_phase2"),
+        "RAGIngestion": (DISABLED, "skip_rag_ingestion"),
+    })
+    result = classify_execution_scope(scope)
+    assert result["verdict"] == "COMPLETE"
+    assert result["cadence_declared_skips"] == ["DataPhase2", "Parity", "RAGIngestion"]
+
+
+def test_a_partially_skipped_execution_names_the_skipped_producers():
+    scope = _scope({
+        "Scanner": (DISABLED, "skip_scanner"),
+        "Backtester": (ENABLED_COMPLETED, "skip_backtester"),
+        "Parity": (DISABLED, "skip_parity"),
+    })
+    result = classify_execution_scope(scope)
+    assert result["verdict"] == "PARTIAL"
+    assert result["skipped_producers"] == ["Scanner"]
+    assert result["skipped_flags"] == ["skip_scanner"]
+
+
+def test_a_skip_after_the_scope_was_taken_is_read_off_this_executions_input():
+    """ReportCard, Director, ScannerLeaderboard and AggregateCosts run after
+    RunScope, so the history cannot hold them; their flags in THIS execution's
+    input are the evidence."""
+    scope = _scope(
+        {"Scanner": (ENABLED_COMPLETED, "skip_scanner")},
+        after_scope={
+            "Director": {"flag": "skip_director", "input_flag": True},
+            "ReportCard": {"flag": "skip_report_card", "input_flag": None},
+        },
+    )
+    result = classify_execution_scope(scope)
+    assert result["verdict"] == "PARTIAL"
+    assert result["skipped_producers"] == ["Director"]
+
+
+def test_a_never_entered_gate_whose_input_flag_was_true_is_a_skip():
+    scope = _scope({
+        "Scanner": (ENABLED_COMPLETED, "skip_scanner"),
+        "Backtester": (NOT_REACHED, "skip_backtester"),
+    })
+    scope["stages"]["Backtester"]["input_flag"] = True
+    assert classify_execution_scope(scope)["verdict"] == "PARTIAL"
+    # ... but an unexplained NOT_REACHED is an absence of evidence, not a skip.
+    scope["stages"]["Backtester"]["input_flag"] = None
+    assert classify_execution_scope(scope)["verdict"] == "COMPLETE"
+
+
+def test_an_all_skipped_execution_is_vacuous():
+    scope = _scope({
+        "Scanner": (DISABLED, "skip_scanner"),
+        "Backtester": (DISABLED, "skip_backtester"),
+    })
+    result = classify_execution_scope(scope)
+    assert result["verdict"] == "VACUOUS"
+    assert result["skipped_producers"] == ["Backtester", "Scanner"]
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [
+        {"degraded": True, "degraded_reason": "history unreadable", "stages": {}},
+        {"stages": {}},
+        {},
+        {"stages": None},
+    ],
+)
+def test_an_unavailable_scope_is_never_read_as_complete(scope):
+    result = classify_execution_scope(scope)
+    assert result["verdict"] == "UNAVAILABLE"
+    assert result["skipped_producers"] == []
+
+
+def test_an_earlier_execution_cannot_conceal_this_executions_skip():
+    """The reason the verdict is taken BEFORE the cycle-level merge.
+
+    The incumbent artifact holds the scanner as completed by the scheduled run;
+    this recovery skipped it. The merge keeps the stronger claim, so the merged
+    artifact reads as complete while this execution's own rows say otherwise.
+    """
+    this_execution = _scope({
+        "Scanner": (DISABLED, "skip_scanner"),
+        "Backtester": (ENABLED_COMPLETED, "skip_backtester"),
+    })
+    incumbent = {
+        "stages": {
+            "Scanner": {"disposition": ENABLED_COMPLETED, "flag": "skip_scanner"},
+            "Backtester": {"disposition": ENABLED_COMPLETED, "flag": "skip_backtester"},
+        },
+        "contributing_executions": ["arn:scheduled"],
+    }
+    own = classify_execution_scope(this_execution)
+    merged, _ = merge_run_scopes(incumbent, dict(this_execution))
+    assert merged["stages"]["Scanner"]["disposition"] == ENABLED_COMPLETED
+    assert classify_execution_scope(merged)["verdict"] == "COMPLETE"
+    assert own["verdict"] == "PARTIAL"
+    assert own["skipped_producers"] == ["Scanner"]
+
+
+def test_the_handler_returns_this_executions_verdict_over_the_merge(
+    monkeypatch, definition, real_run_history
+):
+    """End to end through ``_persist``: the returned payload carries the verdict
+    derived from this execution's own history, and the artifact written to S3
+    does not (one execution's claim does not belong in a cycle-wide record)."""
+    index, written = _index(
+        monkeypatch, definition=definition, history=real_run_history
+    )
+    result = index.handler(
+        {
+            "run_date": "2026-08-15",
+            "execution_arn": "arn:x",
+            "state_machine_arn": "arn:y",
+            "execution_input": {"skip_parity": True},
+        },
+        None,
+    )
+    verdict = result["execution_scope"]
+    assert verdict["verdict"] in {"PARTIAL", "VACUOUS", "COMPLETE", "UNAVAILABLE"}
+    assert verdict == classify_execution_scope(
+        build_run_scope(
+            definition, real_run_history, run_date="2026-08-14",
+            execution_arn="arn:x", state_machine_arn="arn:y",
+            input_flags={"skip_parity": True},
+        )
+    )
+    assert "execution_scope" not in json.loads(written["Body"].decode())
+
+
+def test_a_failed_derivation_returns_an_unavailable_verdict(monkeypatch):
+    index, _ = _index(monkeypatch, raises=RuntimeError("no such execution"))
+    result = index.handler(
+        {"run_date": "2026-08-14", "execution_arn": "a", "state_machine_arn": "b"},
+        None,
+    )
+    assert result["execution_scope"]["verdict"] == "UNAVAILABLE"
+
+
+def test_a_dry_run_also_returns_the_verdict(monkeypatch, definition, real_run_history):
+    index, _ = _index(monkeypatch, definition=definition, history=real_run_history)
+    result = index.handler(
+        {"run_date": "2026-08-14", "execution_arn": "a", "state_machine_arn": "b",
+         "dry_run": True},
+        None,
+    )
+    assert "verdict" in result["execution_scope"]

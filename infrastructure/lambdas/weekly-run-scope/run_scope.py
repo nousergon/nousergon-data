@@ -83,7 +83,7 @@ the rules below were established rather than assumed.
 """
 from __future__ import annotations
 
-from typing import Any, Iterable
+from typing import Any, Iterable, cast
 
 SCHEMA = "run_scope-1.0.0"
 SCHEMA_VERSION = 1
@@ -518,7 +518,7 @@ def _input_lookup(execution_input: dict, variable: str) -> tuple:
     return True, cursor
 
 
-def evaluate_rule(rule: dict, execution_input: dict, writable: set):
+def evaluate_rule(rule: dict, execution_input: dict, writable: set) -> bool | None:
     """Three-valued evaluation of one Choice rule against a proposed input.
 
     Returns ``True``, ``False`` or :data:`UNKNOWN`. UNKNOWN is returned whenever
@@ -643,7 +643,11 @@ def reachable_states(definition: dict, execution_input: dict) -> frozenset:
     return frozenset(reach)
 
 
-def enabled_spine_stages(definition: dict, execution_input: dict, spine) -> tuple:
+def enabled_spine_stages(
+    definition: dict[str, object],
+    execution_input: dict[str, object],
+    spine: Iterable[str],
+) -> tuple[str, ...]:
     """The declared spine stages this input can still enter, in spine order.
 
     An empty result is the vacuity proof: the execution can enter no stage whose
@@ -665,7 +669,9 @@ def declared_skip_flags(definition: dict) -> tuple:
     return tuple(sorted({gate["flag"] for gate in derive_gates(definition).values()}))
 
 
-def ungated_spine_stages(definition: dict, spine) -> tuple:
+def ungated_spine_stages(
+    definition: dict[str, object], spine: Iterable[str]
+) -> tuple[str, ...]:
     """Spine stages still enterable when EVERY declared skip flag is set.
 
     This is the coverage instrument for the whole guard. A spine stage that no
@@ -674,11 +680,17 @@ def ungated_spine_stages(definition: dict, spine) -> tuple:
     ``PIPELINE_STAGE_ORDER`` without a gate shows up here rather than silently
     weakening the refusal. It must be empty.
     """
-    all_true = {flag: True for flag in declared_skip_flags(definition)}
+    all_true: dict[str, object] = dict.fromkeys(
+        cast("tuple[str, ...]", declared_skip_flags(definition)), True
+    )
     return enabled_spine_stages(definition, all_true, spine)
 
 
-def disabling_flags_for_input(definition: dict, execution_input: dict, spine) -> dict:
+def disabling_flags_for_input(
+    definition: dict[str, object],
+    execution_input: dict[str, object],
+    spine: Iterable[str],
+) -> dict[str, tuple[str, ...]]:
     """Per spine stage this input CANNOT enter, which of its own flags did it.
 
     Attribution is by counterfactual against the input in hand: a flag is named
@@ -692,7 +704,7 @@ def disabling_flags_for_input(definition: dict, execution_input: dict, spine) ->
     any single flag maps to an empty tuple, which is the honest answer.
     """
     disabled = set(spine) - set(enabled_spine_stages(definition, execution_input, spine))
-    mapping = {stage: [] for stage in spine if stage in disabled}
+    mapping: dict[str, list[str]] = {stage: [] for stage in spine if stage in disabled}
     for flag in declared_skip_flags(definition):
         if not execution_input.get(flag):
             continue
@@ -895,7 +907,7 @@ def _observed_choice_exits(history: list[dict] | None) -> dict[str, str]:
 class _History:
     """One pass over the history, indexed for chain walking."""
 
-    def __init__(self, history: list[dict]):
+    def __init__(self, history: list[dict]) -> None:
         events = [e for e in history if isinstance(e, dict)]
         self.by_id = {e.get("id"): e for e in events}
         self.position = {id(e): i for i, e in enumerate(events)}
@@ -1338,6 +1350,120 @@ def _statement(
             f"recorded ({', '.join(sorted(after_scope))})"
         )
     return "; ".join(parts) + "."
+
+
+# ---------------------------------------------------------------------------
+# 5. This execution's own verdict (alpha-engine-config-I13864)
+# ---------------------------------------------------------------------------
+#
+# ``VacuousRun`` (I9693) catches an execution that entered NO spine stage. An
+# execution that skipped SOME declared producer entered the spine, so it passed
+# that gate and ended SUCCEEDED: a recovery that skips twenty producers and runs
+# one is indistinguishable in list-executions from a full run.
+#
+# The verdict is taken from the rows derived from THIS execution's history,
+# BEFORE ``merge_run_scopes`` folds in the cycle's other executions. The merged
+# artifact is the strongest claim anyone has made about each stage, so an
+# earlier execution that completed a stage the present one skipped would
+# otherwise hide the skip. That is why the verdict is computed here and returned
+# beside the merge result rather than read back out of it.
+
+SCOPE_COMPLETE = "COMPLETE"
+SCOPE_PARTIAL = "PARTIAL"
+SCOPE_VACUOUS = "VACUOUS"
+SCOPE_UNAVAILABLE = "UNAVAILABLE"
+
+#: The ``skip_*`` flags the CADENCE trigger declares for itself
+#: (``SaturdayTrigger`` Input in ``alpha-engine-orchestration.yaml``). A stage
+#: the canonical schedule is declared not to run is outside the declared stage
+#: set, not a skipped producer, or every scheduled Saturday would end in a Fail.
+#: Pinned to the CFN declaration by ``tests/test_run_scope_wiring.py``, so a
+#: flag added there without being added here fails CI rather than silently
+#: counting as a skip.
+CADENCE_DECLARED_SKIP_FLAGS = frozenset(
+    {"skip_data_phase2", "skip_parity", "skip_rag_ingestion"}
+)
+
+
+def classify_execution_scope(scope: dict[str, object]) -> dict[str, object]:
+    """Classify one execution's producer scope. Pure; reads only ``scope``.
+
+    * ``UNAVAILABLE`` - the scope could not be derived (degraded) or carries no
+      stage rows. Never read as complete.
+    * ``VACUOUS`` - a producer was skipped and nothing ran or is still to run.
+      The SF's ``VacuousRun`` terminal owns this outcome; it is reported here so
+      the two cannot disagree silently.
+    * ``PARTIAL`` - at least one declared producer was skipped, whether the gate
+      was observed taking its skip branch (``DISABLED``), was never entered
+      although this execution's input carried its flag (``NOT_REACHED``), or
+      sits after this scope was taken and its input flag is true.
+    * ``COMPLETE`` - no declared producer was skipped.
+
+    Producers skipped by a cadence-declared flag are reported separately and do
+    not make a scope partial.
+    """
+    raw_stages = scope.get("stages")
+    stages = (
+        cast("dict[str, dict[str, object]]", raw_stages)
+        if isinstance(raw_stages, dict)
+        else {}
+    )
+    if scope.get("degraded") or not stages:
+        return {
+            "verdict": SCOPE_UNAVAILABLE,
+            "skipped_producers": [],
+            "skipped_flags": [],
+            "cadence_declared_skips": [],
+            "reason": str(scope.get("degraded_reason") or "no stage rows were derived"),
+        }
+
+    skipped: dict[str, str] = {}
+    declared: dict[str, str] = {}
+    ran = 0
+    pending = 0
+
+    def note(stage: str, flag: object) -> None:
+        if flag in CADENCE_DECLARED_SKIP_FLAGS:
+            declared[stage] = str(flag)
+        else:
+            skipped[stage] = str(flag)
+
+    for stage, row in stages.items():
+        disposition = row.get("disposition")
+        if disposition in GRADED_DISPOSITIONS:
+            ran += 1
+        elif disposition == DISABLED:
+            note(stage, row.get("disabled_by") or row.get("flag"))
+        elif disposition == NOT_REACHED and row.get("input_flag") is True:
+            note(stage, row.get("flag"))
+    raw_after = scope.get("after_scope")
+    after_scope = (
+        cast("dict[str, dict[str, object]]", raw_after)
+        if isinstance(raw_after, dict)
+        else {}
+    )
+    for stage, row in after_scope.items():
+        if row.get("input_flag") is True:
+            note(stage, row.get("flag"))
+        else:
+            pending += 1
+
+    if skipped and not ran and not pending:
+        verdict = SCOPE_VACUOUS
+    elif skipped:
+        verdict = SCOPE_PARTIAL
+    else:
+        verdict = SCOPE_COMPLETE
+    return {
+        "verdict": verdict,
+        "skipped_producers": sorted(skipped),
+        "skipped_flags": sorted(set(skipped.values())),
+        "cadence_declared_skips": sorted(declared),
+        "reason": (
+            "this execution skipped " + ", ".join(sorted(skipped))
+            if skipped else "this execution skipped no declared producer"
+        ),
+    }
 
 
 def graded_stage_names(block: Any) -> list[str]:

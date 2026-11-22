@@ -120,6 +120,28 @@ An error-recording state is read off the definition, not off names: a `Fail`,
 or a `Pass` whose `ResultPath` writes an error (`$.error`, `$.*_error`) or sets
 a `*degraded*` field true.
 
+## This execution's own verdict (alpha-engine-config-I13864)
+
+The response carries `execution_scope`: `{verdict, skipped_producers,
+skipped_flags, cadence_declared_skips, reason}`. It is computed from the rows
+derived from THIS execution's history **before** they are merged into the cycle
+artifact, and it rides the return value only (it is not written to S3). Reading
+it back out of the merged artifact would let an earlier execution that completed
+a stage hide that this one skipped it.
+
+| Verdict | Meaning | Weekly SF |
+|---|---|---|
+| `COMPLETE` | no declared producer skipped | eligible for SUCCEEDED |
+| `PARTIAL` | a declared producer was skipped | `CheckExecutionScope` -> `MarkExecutionScopeIncomplete` -> page, DEGRADED marker, `DegradedRun` |
+| `VACUOUS` | skipped, and nothing ran or is still to run | left to `VacuousRun` (unchanged) |
+| `UNAVAILABLE` | scope could not be derived, was bypassed, or is unrecognised | `MarkExecutionScopeUnavailable`, same terminal |
+
+A skip the cadence trigger declares for itself (`CADENCE_DECLARED_SKIP_FLAGS`,
+pinned to the `SaturdayTrigger` input by `tests/test_run_scope_wiring.py`) is
+outside the declared stage set and does not count. Stages that run after this
+Lambda (`ReportCard`, `Director`, `ScannerLeaderboard`, `AggregateCosts`) are
+judged from their `skip_*` flag on this execution's input.
+
 ## Failure posture
 
 Fail-open, and only here. A scope block that could not be built returns every

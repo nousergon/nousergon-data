@@ -263,3 +263,105 @@ def test_the_gating_is_read_from_the_definition_not_listed(mod, sf_def, spine):
             body["Choices"] = []
     all_true = {f: True for f in run_scope.declared_skip_flags(sf_def)}
     assert run_scope.enabled_spine_stages(stripped, all_true, spine) == tuple(spine)
+
+
+# ---------------------------------------------------------------------------
+# A recovery that skips a declared producer says why (alpha-engine-config-I13864)
+#
+# The SF ends such a recovery in a failure terminal (it is not a full run), so
+# the execution input is the only durable record of why each producer was left
+# out. Derived skips carry their evidence; any other skip needs --skip-reason; an
+# acknowledgment of a vacuous rerun changes none of it.
+# ---------------------------------------------------------------------------
+
+
+def _plan(mod, **kwargs):
+    base = dict(
+        run_date="2026-09-18",
+        run_date_provenance="test",
+        original_input={},
+    )
+    base.update(kwargs)
+    return mod.RerunPlan(**base)
+
+
+def test_a_derived_skip_records_the_execution_that_completed_the_stage(mod):
+    stage = next(s for s in mod.STAGES if s.emit_skip)
+    plan = _plan(
+        mod,
+        skip_flags={stage.flag: True},
+        completed=[stage.name],
+        witnessed_by={stage.name: "scheduled-run-2026-09-18"},
+    )
+    reasons = plan.rerun_input()["skipped_producer_reasons"]
+    assert reasons == {stage.flag: f"{stage.name} completed in scheduled-run-2026-09-18"}
+    assert plan.unexplained_skips() == []
+    mod.refuse_unexplained_skips(plan)  # does not raise
+
+
+def test_a_skip_with_no_evidence_and_no_reason_is_refused_naming_the_flag(mod):
+    plan = _plan(mod, skip_flags={"skip_scanner": True})
+    assert plan.unexplained_skips() == ["skip_scanner"]
+    assert "skipped_producer_reasons" not in plan.rerun_input()
+    with pytest.raises(SystemExit) as exc:
+        mod.refuse_unexplained_skips(plan)
+    message = str(exc.value)
+    assert "skip_scanner" in message
+    assert "--skip-reason" in message
+    assert "alpha-engine-config-I13864" in message
+
+
+def test_an_operator_reason_is_recorded_verbatim_and_clears_the_refusal(mod):
+    plan = _plan(mod, skip_flags={"skip_scanner": True})
+    plan.operator_skip_reasons["skip_scanner"] = "artifact verified fresh at 09:40"
+    assert plan.rerun_input()["skipped_producer_reasons"] == {
+        "skip_scanner": "artifact verified fresh at 09:40"
+    }
+    mod.refuse_unexplained_skips(plan)
+
+
+def test_a_blank_reason_is_not_a_reason(mod):
+    plan = _plan(mod, skip_flags={"skip_scanner": True})
+    plan.operator_skip_reasons["skip_scanner"] = "   "
+    assert plan.unexplained_skips() == ["skip_scanner"]
+    with pytest.raises(SystemExit):
+        mod.refuse_unexplained_skips(plan)
+
+
+def test_the_cadence_declared_skips_are_not_this_recoverys_skips(mod):
+    """They are the schedule's own declaration, applied to every run; listing
+    them would make every recovery look like it skipped them by choice."""
+    declared = sorted(mod.cadence_declared_skips())
+    assert declared
+    plan = _plan(mod, skip_flags={"skip_scanner": True, declared[0]: True})
+    plan.operator_skip_reasons["skip_scanner"] = "verified"
+    assert set(plan.rerun_input()["skipped_producer_reasons"]) == {"skip_scanner"}
+    assert plan.unexplained_skips() == []
+
+
+def test_acknowledging_a_vacuous_rerun_cannot_stand_in_for_a_skip_reason(mod):
+    plan = _plan(mod, skip_flags={"skip_scanner": True})
+    plan.accept_vacuous_reason = "I know this is empty"
+    emitted = plan.rerun_input()
+    assert emitted["vacuous_rerun_accepted_reason"] == "I know this is empty"
+    assert "skipped_producer_reasons" not in emitted
+    with pytest.raises(SystemExit):
+        mod.refuse_unexplained_skips(plan)
+
+
+@pytest.mark.parametrize("fixture", REAL_VACUOUS_INPUTS)
+def test_the_real_skip_to_green_inputs_cannot_be_started_without_a_reason_per_skip(mod, fixture):
+    """The September recovery inputs, replayed: every skip they carried needs a
+    reason, and supplying one for each is what clears the refusal."""
+    flags = {
+        key: True for key, value in _input(fixture).items()
+        if key.startswith("skip_") and value is True
+    }
+    assert flags
+    plan = _plan(mod, original_input=_input(fixture), skip_flags=dict(flags))
+    undeclared = sorted(set(flags) - set(mod.cadence_declared_skips()))
+    assert plan.unexplained_skips() == undeclared
+    for flag in undeclared:
+        plan.operator_skip_reasons[flag] = f"{flag} completed earlier in the chain"
+    assert plan.unexplained_skips() == []
+    assert set(plan.rerun_input()["skipped_producer_reasons"]) == set(undeclared)

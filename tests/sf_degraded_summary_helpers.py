@@ -269,15 +269,37 @@ def notify_target(states: dict, data: dict) -> str:
 
     """
 
+    # alpha-engine-config-I13864: CheckShellRunNotify now leads to
+    # CheckExecutionScope, which reads this execution's producer-scope verdict
+    # off the RunScope result. A drill payload describes one DEGRADED FAMILY, so
+    # unless it says otherwise it is the payload of an execution whose scope was
+    # COMPLETE; the scope outcomes themselves are drilled in
+    # tests/test_run_scope_wiring.py. Without this seed every drill would be an
+    # execution of unknown scope and land on the scope-unavailable notifier.
+    data = {
+        "run_scope_result": {"Payload": {"execution_scope": {"verdict": "COMPLETE"}}},
+        **data,
+    }
+
+    def lookup(var: str) -> tuple[bool, object]:
+        cursor: object = data
+        for segment in var.removeprefix("$.").split("."):
+            if not isinstance(cursor, dict) or segment not in cursor:
+                return False, None
+            cursor = cursor[segment]
+        return True, cursor
+
     def eval_rule(rule: dict) -> bool:
         if "And" in rule:
             return all(eval_rule(op) for op in rule["And"])
-        var = rule["Variable"].lstrip("$.")
-        present = var in data
+        var = rule["Variable"]
+        present, value = lookup(var)
         if "IsPresent" in rule:
             return present == rule["IsPresent"]
         assert present, f"unguarded dereference of {var} in drill payload {data}"
-        return data[var] == rule["BooleanEquals"]
+        if "StringEquals" in rule:
+            return value == rule["StringEquals"]
+        return value == rule["BooleanEquals"]
 
     cur = "CheckShellRunNotify"
     while states[cur]["Type"] in ("Choice", "Pass"):

@@ -141,7 +141,9 @@ def test_the_friday_pm_shell_run_cannot_reach_it(states):
         if any(c.get("Variable") == "$.shell_run" for c in rule.get("And", []))
     ]
     assert shell_branch == ["NotifyShellRunComplete"]
-    assert notify["Default"] == "CheckGateDegradedNotify"
+    # alpha-engine-config-I13864: the real path now takes the producer-scope
+    # Choice first, which hands a COMPLETE scope on to CheckGateDegradedNotify.
+    assert notify["Default"] == "CheckExecutionScope"
 
     reachable = _reachable(states, "NotifyShellRunComplete")
     assert "ShellRunComplete" in reachable

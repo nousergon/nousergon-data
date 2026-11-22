@@ -69,6 +69,11 @@ _FAMILY_BY_STATE = {
     "SetReportCardDegradedSummary": "report_card",
     "SetScannerLeaderboardResourceKillSummary": "scanner_leaderboard",
     "SetMutexAcquireDegradedFlagSummary": "mutex_acquire",
+    # alpha-engine-config-I13864: this execution's own producer scope, decided
+    # at CheckExecutionScope before the completion notifier. Both setters write
+    # the one family key, `execution_scope`.
+    "MarkExecutionScopeIncomplete": "execution_scope",
+    "MarkExecutionScopeUnavailable": "execution_scope",
     "NotifyCompleteDegraded": "completion_notify",
     "NotifyShellRunCompleteDegraded": "preflight_notify",
 }

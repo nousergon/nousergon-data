@@ -158,7 +158,15 @@ class TestChainOrdering:
         )
         # config#2278: the real-run success edge now passes through the
         # gate-degraded completion Choice before NotifyComplete.
-        assert states["CheckShellRunNotify"]["Default"] == "CheckGateDegradedNotify"
+        # alpha-engine-config-I13864: the gate's Default is now the producer-
+        # scope Choice, whose COMPLETE branch is what reaches the unchanged
+        # CheckGateDegradedNotify -> NotifyComplete.
+        assert states["CheckShellRunNotify"]["Default"] == "CheckExecutionScope"
+        complete = next(
+            rule for rule in states["CheckExecutionScope"]["Choices"]
+            if any(op.get("StringEquals") == "COMPLETE" for op in rule.get("And", []))
+        )
+        assert complete["Next"] == "CheckGateDegradedNotify"
         assert states["CheckGateDegradedNotify"]["Default"] == "NotifyComplete"
 
     def test_wait_for_substrate_routes_via_status_choice(self, states):

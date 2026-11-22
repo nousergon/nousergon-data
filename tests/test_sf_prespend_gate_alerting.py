@@ -161,7 +161,13 @@ def test_malformed_gate_payload_routes_to_degraded_chain(states, gate, field, de
 
 
 def test_gate_degraded_threads_into_completion_email(states):
-    assert states["CheckShellRunNotify"]["Default"] == "CheckGateDegradedNotify"
+    # alpha-engine-config-I13864: the producer-scope Choice sits between the
+    # shell-run gate and this one; its COMPLETE branch is what reaches it.
+    assert states["CheckShellRunNotify"]["Default"] == "CheckExecutionScope"
+    assert any(
+        rule["Next"] == "CheckGateDegradedNotify"
+        for rule in states["CheckExecutionScope"]["Choices"]
+    )
 
     choice = states["CheckGateDegradedNotify"]
     # config#2276 extended this Choice with health_check_degraded rules

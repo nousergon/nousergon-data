@@ -60,11 +60,13 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
+from typing import Any, cast
 
 import boto3
 from krepis.dates import resolve_trading_day
 
 from run_scope import build_run_scope, merge_run_scopes, stamp_provenance
+from run_scope import classify_execution_scope
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -122,8 +124,11 @@ class EmptyRunDateError(ValueError):
 #: execution record decides, the input merely says what was asked for.
 _FLAG_PREFIX = "skip_"
 
+# boto3 clients and the Lambda event/response are untyped JSON-shaped objects
+# here, so the few signatures that carry them name `Any` with a line-level ignore.
 
-def _history(client, execution_arn: str) -> list[dict]:
+
+def _history(client: Any, execution_arn: str) -> list[dict[str, object]]:  # pyright: ignore[reportExplicitAny]
     """The execution's own event history, paginated.
 
     ``includeExecutionData=False``: the derivation reads state names and the
@@ -141,7 +146,7 @@ def _history(client, execution_arn: str) -> list[dict]:
     return events
 
 
-def _definition(client, state_machine_arn: str) -> dict:
+def _definition(client: Any, state_machine_arn: str) -> dict[str, object]:  # pyright: ignore[reportExplicitAny]
     described = client.describe_state_machine(stateMachineArn=state_machine_arn)
     return json.loads(described["definition"])
 
@@ -177,7 +182,7 @@ def _error_code(exc: Exception) -> str:
     return type(exc).__name__
 
 
-def _read_incumbent(s3, key: str) -> tuple[dict | None, str | None, bool, str]:
+def _read_incumbent(s3: Any, key: str) -> tuple[dict[str, object] | None, str | None, bool, str]:  # pyright: ignore[reportExplicitAny]
     """The cycle's existing scope artifact, its ETag, and whether we KNOW.
 
     Returns ``(body, etag, read_ok, note)``. ``read_ok`` is the load-bearing
@@ -357,7 +362,7 @@ def _assert_stage_coverage(
             os.environ["RUN_TOKEN"] = previous
 
 
-def handler(event, _context):
+def handler(event: dict[str, Any], _context: object) -> dict[str, Any]:  # pyright: ignore[reportExplicitAny]
     # Captured at handler ENTRY, before any write this invocation makes
     # (alpha-engine-config-I7214).
     _stage_coverage_started = datetime.now(timezone.utc)
@@ -429,6 +434,13 @@ def handler(event, _context):
             f"one. Cause: {type(exc).__name__}."
         )
 
+    # alpha-engine-config-I13864: this execution's own producer-scope verdict,
+    # taken from the rows derived above and BEFORE `_persist` merges in the
+    # cycle's other executions. The merge keeps the strongest claim per stage, so
+    # a verdict read back out of it could be satisfied by an earlier execution
+    # and hide what this one skipped.
+    execution_scope = classify_execution_scope(cast("dict[str, object]", scope))
+
     scope["written_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     stamp_provenance(scope, execution_arn, scope["written_at"])
     logger.info("run scope: %s", scope["statement"])
@@ -442,6 +454,7 @@ def handler(event, _context):
         # leave a missing `s3:GetObject` to be discovered by the Saturday run
         # it protects.
         scope["dry_run"] = True
+        scope["execution_scope"] = execution_scope
         if run_date:
             _, _, read_ok, note = _read_incumbent(
                 boto3.client("s3"), scope_key(run_date, rehearsal)
@@ -465,9 +478,14 @@ def handler(event, _context):
         scope["stage_coverage"] = _assert_stage_coverage(
             "RunScope", _stage_coverage_started, None, rehearsal
         )
+        scope["execution_scope"] = execution_scope
         return scope
 
     written = _persist(scope, scope_key(run_date, rehearsal))
+    # `_persist` returns the cycle-level merge. The verdict about THIS execution
+    # rides the RETURN value only: it is not written into the cycle artifact,
+    # where it would be one execution's claim sitting in a cycle-wide record.
+    written["execution_scope"] = execution_scope
     written["stage_coverage"] = _assert_stage_coverage(
         "RunScope", _stage_coverage_started, run_date, rehearsal
     )

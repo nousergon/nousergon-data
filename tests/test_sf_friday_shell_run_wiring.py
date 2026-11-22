@@ -799,7 +799,15 @@ class TestStrictSuperset:
     def test_success_notify_gate_default_is_notify_complete(self, states):
         # config#2278: the real-run success edge now passes through the
         # gate-degraded completion Choice before NotifyComplete.
-        assert states["CheckShellRunNotify"]["Default"] == "CheckGateDegradedNotify"
+        # alpha-engine-config-I13864: ... and, before that, through the
+        # execution-scope Choice, whose COMPLETE branch is what keeps the real
+        # run eligible for NotifyComplete.
+        assert states["CheckShellRunNotify"]["Default"] == "CheckExecutionScope"
+        complete = next(
+            rule for rule in states["CheckExecutionScope"]["Choices"]
+            if any(op.get("StringEquals") == "COMPLETE" for op in rule.get("And", []))
+        )
+        assert complete["Next"] == "CheckGateDegradedNotify"
         assert states["CheckGateDegradedNotify"]["Default"] == "NotifyComplete"
 
 

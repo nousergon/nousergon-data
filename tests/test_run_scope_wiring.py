@@ -209,3 +209,220 @@ def test_the_s3_artifact_remains_the_fallback_not_the_removal(states):
     ).read_text()
     assert "put_object" in handler
     assert "KEY_TEMPLATE.format(run_date=run_date)" in handler
+
+
+# ---------------------------------------------------------------------------
+# This execution's own producer scope decides the terminal
+# (alpha-engine-config-I13864)
+#
+# `VacuousRun` (I9693) fails an execution that entered NO spine stage. One that
+# skipped SOME declared producer entered the spine and ended SUCCEEDED, so a
+# recovery that skipped twenty producers read like a full run. The verdict is
+# RunScope's `execution_scope`, computed from THIS execution's rows before the
+# cycle-level merge, and it is acted on at `CheckExecutionScope` - BEFORE the
+# completion notifier and marker, so a partial scope rides the existing degraded
+# chokepoint (DEGRADED marker, run-slot release, DegradedRun terminal that
+# pages) and never reaches a Succeed.
+#
+# It is deliberately NOT at the observe-only tail after WeeklyCoverageSweep: that
+# tail may not reach a Fail other than VacuousRun
+# (tests/sf_degraded_summary_helpers.py::assert_observe_only_tail). Two earlier
+# attempts put the new Fail terminals there and broke 150 contract tests.
+# ---------------------------------------------------------------------------
+
+_VERDICT = "$.run_scope_result.Payload.execution_scope.verdict"
+
+
+def _walk(states: dict, start: str, data: dict) -> list[str]:
+    """Follow the definition from ``start`` with ASL Choice semantics, over a
+    minimal state document. Task and Pass states are assumed to succeed and to
+    leave the document unchanged except for a Pass state's own ``ResultPath``.
+    Returns the visited state names, ending at a Succeed, a Fail or a loop."""
+
+    def lookup(var: str):
+        cursor = data
+        for segment in var.removeprefix("$.").split("."):
+            if not isinstance(cursor, dict) or segment not in cursor:
+                return False, None
+            cursor = cursor[segment]
+        return True, cursor
+
+    def holds(rule: dict) -> bool:
+        if "And" in rule:
+            return all(holds(r) for r in rule["And"])
+        if "Or" in rule:
+            return any(holds(r) for r in rule["Or"])
+        if "Not" in rule:
+            return not holds(rule["Not"])
+        present, value = lookup(rule["Variable"])
+        if "IsPresent" in rule:
+            return present == rule["IsPresent"]
+        if not present:
+            return False
+        if "StringEquals" in rule:
+            return value == rule["StringEquals"]
+        if "BooleanEquals" in rule:
+            return value is rule["BooleanEquals"]
+        raise AssertionError(f"walker does not model {rule}")
+
+    path, cur = [], start
+    while cur not in path:
+        path.append(cur)
+        state = states[cur]
+        if state["Type"] in ("Succeed", "Fail"):
+            return path
+        if state["Type"] == "Choice":
+            cur = next(
+                (r["Next"] for r in state["Choices"] if holds(r)), state.get("Default")
+            )
+            assert cur, f"{path[-1]} has no matching rule and no Default"
+            continue
+        if state["Type"] == "Pass" and state.get("ResultPath") == "$.degraded_summary":
+            data = {**data, "degraded_summary": {"degraded": True}}
+        assert "Next" in state, f"{cur} ends the walk without a terminal"
+        cur = state["Next"]
+    return path
+
+
+def _scope_doc(verdict: str | None) -> dict:
+    doc: dict = {"degraded_summary": {"degraded": False, "reasons": {}}}
+    if verdict is not None:
+        doc["run_scope_result"] = {"Payload": {"execution_scope": {"verdict": verdict}}}
+    return doc
+
+
+def test_the_real_run_reaches_the_scope_choice_before_the_degraded_gate(states):
+    assert states["CheckShellRunNotify"]["Default"] == "CheckExecutionScope"
+    shell = states["CheckShellRunNotify"]["Choices"]
+    assert [rule["Next"] for rule in shell] == ["NotifyShellRunComplete"]
+
+
+def test_the_scope_choice_reads_the_run_scope_verdict_and_nothing_an_operator_writes(states):
+    """An acknowledgment is a record: no rule or setter may dereference it."""
+    # The Comment prose may NAME the keys to say they are ignored; behaviour
+    # (Variable/Parameters/Choices) may not read them.
+    for name in ("CheckExecutionScope", "MarkExecutionScopeIncomplete", "MarkExecutionScopeUnavailable"):
+        body = {k: v for k, v in states[name].items() if k != "Comment"}
+        behaviour = json.dumps(body)
+        assert "vacuous_rerun_accepted_reason" not in behaviour
+        assert "skipped_producer_reasons" not in behaviour
+
+
+@pytest.mark.parametrize(
+    ("verdict", "first_hop"),
+    [
+        ("COMPLETE", "CheckGateDegradedNotify"),
+        ("VACUOUS", "CheckGateDegradedNotify"),
+        ("PARTIAL", "MarkExecutionScopeIncomplete"),
+        ("UNAVAILABLE", "MarkExecutionScopeUnavailable"),
+        ("SOMETHING_NEW", "MarkExecutionScopeUnavailable"),
+        (None, "MarkExecutionScopeUnavailable"),
+    ],
+)
+def test_each_scope_outcome_takes_its_own_branch(states, verdict, first_hop):
+    walked = _walk(states, "CheckExecutionScope", _scope_doc(verdict))
+    assert walked[1] == first_hop
+
+
+@pytest.mark.parametrize(
+    "verdict", ["PARTIAL", "UNAVAILABLE", "SOMETHING_NEW", None]
+)
+def test_a_partial_or_unavailable_scope_can_only_end_in_the_degraded_terminal(states, verdict):
+    walked = _walk(states, "CheckExecutionScope", _scope_doc(verdict))
+    assert walked[-1] == "DegradedRun", walked
+    assert states["DegradedRun"]["Type"] == "Fail"
+    assert "WriteCompletionMarker" not in walked  # the clean marker
+    assert "WriteCompletionMarkerDegraded" in walked
+    assert "NotifyCompleteMultipleDegraded" in walked  # the page, before the marker
+    assert walked.index("NotifyCompleteMultipleDegraded") < walked.index(
+        "WriteCompletionMarkerDegraded"
+    )
+
+
+def test_a_complete_scope_remains_eligible_for_succeeded(states):
+    walked = _walk(states, "CheckExecutionScope", _scope_doc("COMPLETE"))
+    assert "NotifyComplete" in walked and "WriteCompletionMarker" in walked
+    assert "MarkExecutionScopeIncomplete" not in walked
+    assert "MarkExecutionScopeUnavailable" not in walked
+
+
+def test_a_vacuous_scope_is_left_to_the_existing_vacuous_terminal(states):
+    """Preserved, not replaced: the VacuousRun gate is downstream and unchanged."""
+    walked = _walk(states, "CheckExecutionScope", _scope_doc("VACUOUS"))
+    assert "MarkExecutionScopeIncomplete" not in walked
+    assert states["CheckExecutionDidWork"]["Choices"][0]["Next"] == (
+        "CheckRunSlotHeldBeforeVacuousRun"
+    )
+    assert states["CheckRunSlotHeldBeforeVacuousRun"]["Default"] == "VacuousRun"
+
+
+@pytest.mark.parametrize(
+    ("name", "reason"),
+    [
+        ("MarkExecutionScopeIncomplete", "execution_scope_partial"),
+        ("MarkExecutionScopeUnavailable", "execution_scope_unavailable"),
+    ],
+)
+def test_the_setters_record_the_verdict_and_accumulate_into_the_summary(states, name, reason):
+    state = states[name]
+    params = state["Parameters"]
+    assert state["Type"] == "Pass"
+    assert state["ResultPath"] == "$.degraded_summary"
+    assert params["degraded"] is True
+    assert params["reason"] == reason
+    assert "$.degraded_summary.reasons" in params["reasons.$"]
+    assert "execution_scope" in params["reasons.$"]
+    assert "execution_scope" in params or "execution_scope.$" in params
+    assert "PARTITION FAMILY = trading_day" in state["Comment"]
+
+
+def test_the_partial_setter_carries_the_skipped_producers_and_the_unavailable_one_derefs_nothing(states):
+    assert states["MarkExecutionScopeIncomplete"]["Parameters"]["execution_scope.$"] == (
+        "$.run_scope_result.Payload.execution_scope"
+    )
+    # The unavailable path exists precisely when $.run_scope_result may be
+    # absent, so it may not dereference it.
+    assert "run_scope_result" not in json.dumps(
+        states["MarkExecutionScopeUnavailable"]["Parameters"]
+    )
+
+
+def test_the_new_fail_states_are_not_reachable_from_the_observe_only_tail(states):
+    """The constraint two attempts broke: no Fail other than VacuousRun may be
+    reachable from WeeklyCoverageSweep. This change adds no Fail state at all."""
+    new = {"CheckExecutionScope", "MarkExecutionScopeIncomplete", "MarkExecutionScopeUnavailable"}
+    seen, stack = set(), ["WeeklyCoverageSweep"]
+    while stack:
+        name = stack.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        body = states[name]
+        stack.extend(
+            [body["Next"]] if "Next" in body else []
+        )
+        stack.extend(rule["Next"] for rule in body.get("Choices", []))
+        if body.get("Default"):
+            stack.append(body["Default"])
+        stack.extend(c["Next"] for c in body.get("Catch", []))
+    assert not (seen & new)
+
+
+def test_the_cadence_declared_skip_set_matches_the_trigger_declaration():
+    """`run_scope.CADENCE_DECLARED_SKIP_FLAGS` is the set of skips the scheduled
+    run is declared to make; a flag added to the SaturdayTrigger input without
+    being added there would make every scheduled Saturday end partial."""
+    import importlib.util
+    import sys
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "weekly_sf_rerun_for_cadence", root / "scripts" / "weekly_sf_rerun.py"
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    import run_scope  # on sys.path via weekly_sf_rerun's own insertion
+
+    assert run_scope.CADENCE_DECLARED_SKIP_FLAGS == frozenset(module.cadence_declared_skips())
