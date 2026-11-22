@@ -98,7 +98,7 @@ import re
 import statistics
 import sys
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, cast
 
 from execution_digest import STATE_DURATION_FLOORS_SEC, parse_task_state_durations
 
@@ -593,7 +593,7 @@ def render_report(recommendations: Sequence[FloorRecommendation]) -> str:
     return "\n".join(lines)
 
 
-def _default_fetch_history(sf_client: Any, execution_arn: str) -> List[dict]:
+def _default_fetch_history(sf_client: Any, execution_arn: str) -> Tuple[List[Dict[str, object]], bool]:
     # alpha-engine-config-I10545: fetch_execution_history now returns
     # (events, truncated) so callers can surface truncation; this adapter
     # keeps truncation explicit for collect_state_duration_samples.
@@ -608,11 +608,16 @@ def _default_fetch_history(sf_client: Any, execution_arn: str) -> List[dict]:
 
     # Returns (events, truncated) so collect_state_duration_samples can keep a
     # truncated history out of the cache (alpha-engine-config-I11792).
-    return fetch_execution_history(  # pyright: ignore[reportReturnType, reportUnknownVariableType]
-        sf_client,
-        execution_arn,
-        page_size=HISTORY_PAGE_SIZE,
-        include_execution_data=True,
+    # The cast types the JSON event dicts at this boundary; the shared
+    # fetcher itself still returns bare ``dict`` events.
+    return cast(
+        Tuple[List[Dict[str, object]], bool],
+        fetch_execution_history(
+            sf_client,
+            execution_arn,
+            page_size=HISTORY_PAGE_SIZE,
+            include_execution_data=True,
+        ),
     )
 
 
