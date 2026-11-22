@@ -133,6 +133,11 @@ ast.parse(src)
 print('index.py syntax OK')
 "
 
+source "${SCRIPT_DIR}/../_shared/run_handler_tests.sh"
+NOUSERGON_LIB_REQ=$(requirement_pin "${SCRIPT_DIR}/requirements.txt" nousergon-lib)
+KREPIS_REQ=$(requirement_pin "${SCRIPT_DIR}/requirements.txt" krepis)
+run_handler_tests "${SCRIPT_DIR}" "${KREPIS_REQ}" "${NOUSERGON_LIB_REQ}"
+
 # ----- 1. Package: pip install deps (Lambda-safe) + zip handler --------------
 
 LAMBDAS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
