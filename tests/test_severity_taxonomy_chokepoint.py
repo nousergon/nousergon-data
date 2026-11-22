@@ -222,6 +222,14 @@ _REGISTRY: dict[str, dict[str, list[dict]]] = {
         ],
     },
     "infrastructure/lambdas/expense-collector/index.py": {
+        "alert_cost_source_degradations": [
+            {
+                "event_class": "Cost-source soft degradation digest",
+                "severity": "warning",
+                "silent": False,
+                "citation": "alpha-engine-config-I11113 (2026-11-20) — pending taxonomy entry",
+            },
+        ],
         "_alert_over_budget": [
             {
                 "event_class": "Expense-collector over-budget alert",
@@ -330,7 +338,7 @@ def _call_sites(root: Path) -> dict[str, set[str]]:
 # ---------------------------------------------------------------------------
 
 
-def test_all_notify_via_flow_doctor_callsites_are_registered():
+def test_all_notify_via_flow_doctor_callsites_are_registered() -> None:
     """Every ``notify_via_flow_doctor`` call site in production code must be in
     ``_REGISTRY``, keyed by file path and enclosing function name.
 
@@ -367,7 +375,7 @@ def test_all_notify_via_flow_doctor_callsites_are_registered():
     )
 
 
-def test_registry_entries_are_honest():
+def test_registry_entries_are_honest() -> None:
     """Every registry entry's file must still exist and still actually call
     ``notify_via_flow_doctor`` from the named function — a stale entry (file
     deleted, or function migrated off the call) must be removed, not left to
@@ -390,7 +398,7 @@ def test_registry_entries_are_honest():
     assert not problems, f"stale _REGISTRY entries: {problems}"
 
 
-def test_guard_catches_an_injected_violation():
+def test_guard_catches_an_injected_violation() -> None:
     """Honesty test: prove the scan actually fires on a synthetic new call site,
     not just that the current tree happens to be clean."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -414,7 +422,7 @@ def test_guard_catches_an_injected_violation():
         assert "infrastructure/lambdas/totally-new-lambda/index.py" not in _REGISTRY
 
 
-def test_guard_ignores_test_directory_matches():
+def test_guard_ignores_test_directory_matches() -> None:
     """A test file that references notify_via_flow_doctor (e.g. stubbing,
     mocking, or this guard's own docstrings) must not trip the production scan."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -431,7 +439,7 @@ def test_guard_ignores_test_directory_matches():
         assert found == {}
 
 
-def test_guard_excludes_flow_doctor_sink_itself():
+def test_guard_excludes_flow_doctor_sink_itself() -> None:
     """The flow_doctor_telegram.py definition must not be flagged — it is the
     sink definition, not a call site."""
     found = _call_sites(_REPO)
