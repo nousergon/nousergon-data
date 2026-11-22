@@ -325,6 +325,32 @@ jobs:
     uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@62597e550c08c0b7a7fe0af490cb141e344061b3 # main
     secrets: inherit
 
+  # alpha-engine-config-I13916: the shared finding-surface guard. A workflow
+  # that declares WORKFLOW_HEALTH_FINDING_STEPS names its finding steps by
+  # string; renaming a step without updating the declaration silently turns a
+  # detector's intended red into an unexplained one (or mutes it). The validator
+  # lives in nousergon-lib (`workflow_health_semantics`, console entry
+  # `workflow-health-semantics`, first shipped in v0.124.224) and reads only
+  # this repo's own workflow files. It runs unconditionally on every PR: no
+  # paths filter, no `if:`, no continue-on-error. The pin is installed WITHOUT
+  # extras and apart from requirements.txt on purpose: the validator needs only
+  # pyyaml and the standard library, and moving the repo-wide lib pin would
+  # change the weekly-run dependency set. Pinned by
+  # tests/test_workflow_health_declarations_are_guarded.py.
+  workflow-health-declarations:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7
+        with:
+          python-version: "3.12"
+      - name: Install the shared workflow-health validator (pinned nousergon-lib)
+        run: |
+          pip install --quiet --upgrade pip
+          pip install --quiet "nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.224"
+      - name: Validate workflow finding-surface declarations
+        run: workflow-health-semantics --workflow-dir .github/workflows
+
   # Rejects any dependency extra written with an underscore. pip <23.3 does not
   # normalise `_` to `-` in a REQUESTED extra while setuptools always normalises
   # the DECLARED one, so `pkg[flow_doctor]` matches nothing against
