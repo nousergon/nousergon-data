@@ -154,7 +154,7 @@ from nousergon_lib.pipeline_status.registry import (  # noqa: E402
 )
 from krepis.dates import resolve_trading_day  # noqa: E402
 
-_Json = dict[str, Any]  # pyright: ignore[reportExplicitAny] — raw execution/state JSON
+_Json = dict[str, Any]  # pyright: ignore[reportExplicitAny] — raw JSON object (boto3 response)
 
 
 def _landed_spine(sm_arn: str, sm_def: dict) -> tuple[str, ...]:
@@ -218,10 +218,10 @@ _CFN_ORCHESTRATION = (
 
 # ---------------------------------------------------------------------------
 # Declarative stage table — pinned against infrastructure/step_function.json
-# by tests/test_weekly_sf_rerun.py (witness = the state the SF enters iff the
-# stage completed successfully OR was skipped; either way the rerun must not
-# re-run it, and originally-skipped stages carry their flag from the
-# preserved original input anyway). degraded_witness = a *Degraded /
+# by tests/test_weekly_sf_rerun.py (work + witness = the stage ran and
+# completed successfully; a skip route may enter the same witness without
+# entering work, and must not manufacture a derived skip. Cadence-declared
+# skips are reapplied separately from their source of truth). degraded_witness = a *Degraded /
 # Publish*Degraded state entered iff the stage ran but FAILED and was
 # absorbed fail-open so the pipeline could continue (weekly-sf-policy §2.3);
 # entering one OVERRIDES witness: the stage is re-run, never skipped — the
@@ -235,8 +235,8 @@ class Stage:
     flag: str
     gate: str                      # the CheckSkip* Choice state
     work: str                      # the stage's first work state
-    witness: frozenset             # entered => completed-or-skipped
-    degraded_witness: frozenset = frozenset()
+    witness: frozenset[str]        # entered => completed-or-skipped
+    degraded_witness: frozenset[str] = frozenset()
     # A *Degraded / Publish*Degraded state entered iff the stage RAN BUT
     # FAILED and was absorbed fail-open (weekly-sf-policy §2.3) so the
     # pipeline could continue — entering one OVERRIDES witness: the stage
@@ -244,7 +244,7 @@ class Stage:
     # (alpha-engine-config-I6055 — the 2026-08-01 Director hard-fail that
     # the next rerun skipped; extended to Parity by alpha-engine-config-I6025).
     emit_skip: bool = True         # False => never emit the flag (see notes)
-    historical_work: frozenset = frozenset()
+    historical_work: frozenset[str] = frozenset()
     # Work-state names this stage carried in a PRIOR SF definition. Failure
     # detection reads `work in entered`, and this script runs against captured
     # execution histories — including ones written before a rename or a split.
@@ -620,6 +620,7 @@ STAGES: tuple[Stage, ...] = (
         }),
         emit_skip=False,
         detect_failure=False,
+        historical_work=frozenset({"Parity"}),
         note=(
             "family row (alpha-engine-config#6030): skip_parity bypasses the"
             " WHOLE family but is NEVER auto-emitted — the fine-grained rows"
@@ -926,7 +927,7 @@ def _rule_skip_flag(rule: dict) -> str | None:
     flags = set()
     other = False
 
-    def rec(node: Any) -> None:  # pyright: ignore[reportExplicitAny] — raw Choice-rule JSON
+    def rec(node: Any) -> None:  # pyright: ignore[reportExplicitAny] — raw ASL JSON node
         nonlocal other
         if not isinstance(node, dict):
             return
@@ -1293,7 +1294,7 @@ def _simulate_reachable_works(flags: dict, original_input: dict) -> set:
 
     ran: set = set()
 
-    def run_linear(names: list) -> None:
+    def run_linear(names: list[str]) -> None:
         for n in names:
             if not effective[n]:
                 ran.add(n)
@@ -1350,7 +1351,7 @@ def _simulate_reachable_works(flags: dict, original_input: dict) -> set:
     return ran
 
 
-def classify_stages(entered: set) -> dict:
+def classify_stages(entered: set[str]) -> dict[str, str]:
     """One execution's verdict per stage: ``"degraded"`` | ``"completed"`` |
     ``"failed"``. A stage the execution never attempted is ABSENT from the
     result — "not observed here" and "did not complete" are different facts,
@@ -1370,7 +1371,17 @@ def classify_stages(entered: set) -> dict:
             # (I6055: the 2026-08-01 Director hard-fail recorded as
             # "post_eval complete", then skipped by the next rerun).
             out[stage.name] = "degraded"
-        elif entered & stage.witness:
+        elif (
+            entered & stage.witness
+            and (
+                stage.work in entered
+                or bool(entered & stage.historical_work)
+            )
+        ):
+            # A completion needs evidence of BOTH work and its downstream
+            # witness. Several skip routes converge on the same witness as a
+            # successful run; treating that route-only entry as completion
+            # makes an ad-hoc skip self-perpetuating across recovery links.
             out[stage.name] = "completed"
         elif stage.detect_failure and (
             stage.work in entered or (entered & stage.historical_work)
@@ -1861,7 +1872,7 @@ CHAIN_WINDOW_DAYS_AFTER = 6
 
 
 def chain_candidates(
-    executions: list[_Json], run_date: str, source_arn: str, source_start: datetime | None
+    executions: list[_Json], run_date: str, source_arn: str, source_start: datetime | None,
 ) -> tuple[list[_Json], list[_Json]]:
     """Split ``executions`` into (candidates, non_terminal) for the chain of
     ``run_date``, oldest first.
@@ -2344,9 +2355,10 @@ def main(argv: list | None = None) -> int:
     ddb = boto3.client("dynamodb", region_name=args.region)
     s3 = boto3.client("s3", region_name=args.region)
 
+    source: _Json
     if args.execution_arn:
         desc = sf.describe_execution(executionArn=args.execution_arn)
-        source: _Json = {"executionArn": args.execution_arn, "status": desc["status"], "startDate": desc["startDate"]}
+        source = {"executionArn": args.execution_arn, "status": desc["status"], "startDate": desc["startDate"]}
     else:
         source = resolve_default_execution(sf, args.state_machine_arn)
     source_arn, source_status = source["executionArn"], source["status"]
