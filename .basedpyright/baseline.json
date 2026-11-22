@@ -155232,22 +155232,6 @@
         ],
         "./infrastructure/lambdas/sf-telegram-notifier/execution_digest.py": [
             {
-                "code": "reportUnusedImport",
-                "range": {
-                    "startColumn": 24,
-                    "endColumn": 32,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportUnusedImport",
-                "range": {
-                    "startColumn": 40,
-                    "endColumn": 48,
-                    "lineCount": 1
-                }
-            },
-            {
                 "code": "reportUnknownParameterType",
                 "range": {
                     "startColumn": 27,
