@@ -7,6 +7,9 @@ Each test pins one decision branch (watch-day eligibility, alert-or-skip,
 dedup wiring, fail-loud) per the ``feedback_no_silent_fails`` discipline.
 """
 
+# Test functions and lightweight SDK doubles intentionally omit annotations.
+# ruff: noqa: ANN001, ANN002, ANN003, ANN201, ANN202, ANN204, ANN205, ANN206
+
 from __future__ import annotations
 
 import importlib
@@ -448,15 +451,42 @@ def test_check_sf_emits_alert_when_zero_executions_in_window():
     assert call_kwargs["source"] == "alpha-engine-pipeline-watchdog"
     assert call_kwargs["sns_topic_arn"] == index.WATCHDOG_SNS_TOPIC_ARN
     assert call_kwargs["telegram"] is False
+    assert call_kwargs["dedup_key"].startswith("pipeline-watchdog-Weekday SF-")
+    assert call_kwargs["dedup_window_min"] == 12 * 60
     assert "Weekday SF" in call_kwargs["message"]
     assert "24h" in call_kwargs["message"]
     _fd_mod.notify_via_flow_doctor.assert_called_once()
     fd_kwargs = _fd_mod.notify_via_flow_doctor.call_args.kwargs
     assert fd_kwargs["silent"] is False
     assert fd_kwargs["severity"] == "error"
+    assert fd_kwargs["dedup_key"] == call_kwargs["dedup_key"]
     assert fd_kwargs["flow_name"] == index._FLOW_NAME
     assert fd_kwargs["topics"] == _ng_fleet_mod.PIPELINE_OBSERVER_TELEGRAM_TOPICS
+    assert fd_kwargs["db_basename"] == index._DB_BASENAME
+    assert fd_kwargs["context"] == {"sf_label": "Weekday SF", "sf_arn": WKD_ARN}
+    assert fd_kwargs["source"] == "alpha-engine-pipeline-watchdog"
     assert "Weekday SF" in _fd_mod.notify_via_flow_doctor.call_args.args[0]
+
+
+def test_check_sf_skips_telegram_when_publish_dedup_skipped():
+    _alerts_mod.publish.return_value = _make_publish_result(
+        sns_ok=True,
+        telegram_ok=False,
+        dedup_skipped=True,
+    )
+
+    result = index._check_sf(
+        sf_label="Weekday SF",
+        sf_arn=WKD_ARN,
+        is_watch_day=True,
+        skip_reason_if_not_watching="(unused)",
+        window_seconds=24 * 3600,
+        client=_make_sfn_client({}),
+    )
+
+    assert result.alert_emitted is True
+    _alerts_mod.publish.assert_called_once()
+    _fd_mod.notify_via_flow_doctor.assert_not_called()
 
 
 def test_check_sf_alert_uses_distinct_watchdog_sns_topic_not_alpha_engine_alerts():
