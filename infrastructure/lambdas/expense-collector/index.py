@@ -96,6 +96,7 @@ distinct from the separate Claude-Max WET pace alert that Lambda used to send
 from __future__ import annotations
 
 import calendar
+import hashlib
 import json
 import logging
 import os
@@ -540,10 +541,12 @@ def alert_cost_source_degradations(
         f"• `{day}` `{callsite}` `{source}`: *{count}*"
         for (day, callsite, source), count in sorted(counts.items())
     )
+    identity = json.dumps(sorted(counts.items()), separators=(",", ":"))
+    fingerprint = hashlib.sha256(identity.encode()).hexdigest()[:16]
     try:
         return notify_via_flow_doctor(
             "\n".join(lines), silent=False, severity="warning",
-            dedup_key=f"{_FLOW_NAME}:cost-source-degradation",
+            dedup_key=f"{_FLOW_NAME}:cost-source-degradation:{fingerprint}",
             flow_name=_FLOW_NAME, topics=_ALERT_TOPICS,
             db_basename=_DB_BASENAME,
             context={"degraded_cost_rows": sum(counts.values())},

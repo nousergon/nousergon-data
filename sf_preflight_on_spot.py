@@ -88,6 +88,8 @@ import signal
 import sys
 import time
 from datetime import datetime, timezone
+from types import FrameType
+from typing import NoReturn
 
 log = logging.getLogger("sf_preflight_on_spot")
 
@@ -131,7 +133,7 @@ class _BudgetExceeded(BaseException):
     check's fail and carry on past the budget."""
 
 
-def _on_alarm(signum, frame):  # pragma: no cover - signal plumbing
+def _on_alarm(signum: int, frame: FrameType | None) -> NoReturn:  # pragma: no cover - signal plumbing
     raise _BudgetExceeded(f"on-spot preflight exceeded its {BUDGET_SECONDS}s budget")
 
 
@@ -341,9 +343,10 @@ def _record_stage_coverage(
 
         from krepis.stage_coverage import assert_stage_coverage
 
-        kwargs: dict = {"window_start": started, "run_date": run_date}
         if "execution_name" in inspect.signature(assert_stage_coverage).parameters:
-            kwargs["execution_name"] = execution_name
+            verdict = assert_stage_coverage(
+                STAGE, window_start=started, run_date=run_date, execution_name=execution_name,
+            )
         elif (execution_name or "").startswith(REHEARSAL_EXECUTION_PREFIX):
             log.warning(
                 "stage-coverage: %s is a rehearsal and this krepis cannot "
@@ -351,7 +354,8 @@ def _record_stage_coverage(
                 execution_name, STAGE,
             )
             return "rehearsal without krepis namespacing"
-        verdict = assert_stage_coverage(STAGE, **kwargs)
+        else:
+            verdict = assert_stage_coverage(STAGE, window_start=started, run_date=run_date)
         return None if isinstance(verdict, dict) else "no verdict returned"
     except Exception as exc:  # noqa: BLE001 - observe mode, recorded on the verdict line
         log.error("stage-coverage: %s verdict not recorded: %s", STAGE, exc)

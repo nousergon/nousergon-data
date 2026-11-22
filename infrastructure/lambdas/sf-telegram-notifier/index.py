@@ -38,6 +38,7 @@ import boto3
 
 from execution_digest import (
     build_execution_digest,
+    fetch_execution_history,  # pyright: ignore[reportUnknownVariableType]
     parse_run_date_from_execution_name,
     parse_run_date_from_input,
 )
@@ -123,6 +124,8 @@ _DEGRADED_EMOJI = "\U0001f7e0"  # 🟠
 # green; rendering the honest terminal as a generic red would trade one
 # misreading for another.
 _VACUOUS_EMOJI = "\U0001f6d1"  # 🛑
+
+_SKIPPED_EMOJI = "⏭️"
 
 # Every severity this notifier can emit is exempt from the fleet-shared daily
 # alert budget. Justified by the producer being BOUNDED, not by the traffic
@@ -294,6 +297,35 @@ def _is_vacuous_run(describe_resp: dict | None) -> bool:
     return (describe_resp.get("error") or "") == "VacuousRun"
 
 
+def _is_declared_weekly_skip(
+    sf_client: Any,  # noqa: ANN401  # pyright: ignore[reportExplicitAny] — untyped boto3 client
+    execution_arn: str,
+    execution_name: str,
+) -> bool:
+    """Classify a weekly success from its complete entered-state history."""
+    from nousergon_lib.pipeline_status import (
+        RunStatus,
+        WorkVerdict,
+        classify_work,
+        entered_states_from_history,
+    )
+
+    raw_history_events, history_truncated = fetch_execution_history(  # pyright: ignore[reportUnknownVariableType]
+        sf_client, execution_arn
+    )
+    history_events = cast(list[dict[str, object]], raw_history_events)
+    if history_truncated:
+        return False
+    work_outcome = classify_work(
+        state_machine_name=WEEKLY_PIPELINE_NAME,
+        status=RunStatus.SUCCEEDED,
+        entered_states=entered_states_from_history(history_events),
+        execution_arn=execution_arn,
+        execution_name=execution_name,
+    )
+    return work_outcome.verdict is WorkVerdict.SKIPPED
+
+
 def _normalize_cause_snippet(snippet: str, *, max_chars: int = _CAUSE_MAX_CHARS) -> str:
     """Collapse embedded newlines and cap length for a single Telegram line.
 
@@ -360,7 +392,9 @@ def _build_message(
     only the rendered label/emoji distinguish it.
     """
     status = detail.get("status", "UNKNOWN")
-    execution_arn = detail.get("executionArn", "")
+    execution_arn = cast(
+        str, detail.get("executionArn") or ""  # pyright: ignore[reportUnknownMemberType]
+    )
     if describe_resp is None:
         describe_resp = _describe_execution(execution_arn)
     is_preflight = _is_preflight_execution(describe_resp)
@@ -383,11 +417,14 @@ def _build_message(
     else:
         display_status = status
         emoji = _STATUS_EMOJI.get(status, "\U0001f4e8")
-    exec_name = detail.get("name", "") or "(unknown execution)"
+    exec_name = cast(
+        str, detail.get("name") or "(unknown execution)"  # pyright: ignore[reportUnknownMemberType]
+    )
     hollow_suspect = False
     detailed_failure_cause: str | None = None
     needs_triage = False
     artifact_concern: str | None = None
+    is_declared_skip = False
 
     lines = [f"{emoji} *{label} — {display_status}*"]
 
@@ -425,6 +462,24 @@ def _build_message(
         lines.append("*States:*")
         lines.extend(digest_lines)
 
+        # A weekly run-day gate-out is a successful Step Functions execution,
+        # but it is not a successful weekly run.  Read the declared terminal
+        # from the complete history; duration and an absent/failed history are
+        # deliberately not evidence of a skip.
+        if sm_name == WEEKLY_PIPELINE_NAME and status == "SUCCEEDED" and not is_preflight:
+            try:
+                is_declared_skip = _is_declared_weekly_skip(
+                    sf_client, execution_arn, exec_name
+                )
+                if is_declared_skip:
+                    lines[0] = f"{_SKIPPED_EMOJI} *{label} — SKIPPED — not a run day*"
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "could not classify weekly work outcome for %s: %s",
+                    execution_arn,
+                    exc,
+                )
+
         # nousergon-data-i5289 (alpha-engine-config#5289 scope item 4): a
         # post-close RECONCILE SUCCEEDED/DEGRADED terminal (EOD_PIPELINE_NAME is
         # ne-postclose-reconcile-pipeline since the 2026-09-30 split — the
@@ -449,6 +504,7 @@ def _build_message(
             sm_name == WEEKLY_PIPELINE_NAME
             and not is_preflight
             and not is_partial
+            and not is_declared_skip
             and (status == "SUCCEEDED" or is_degraded)
         ):
             exec_output = _parse_output(describe_resp)
