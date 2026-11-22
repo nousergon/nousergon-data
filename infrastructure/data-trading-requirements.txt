@@ -50,4 +50,4 @@ feedparser>=6.0.14
 lxml>=6.1.3
 jsonschema>=4.26.0
 arcticdb>=6.28.3
-nousergon-lib[arcticdb,flow-doctor,rag,contracts,github-app,gates] @ git+https://github.com/nousergon/nousergon-lib@v0.124.189
+nousergon-lib[arcticdb,flow-doctor,rag,contracts,github-app,gates] @ git+https://github.com/nousergon/nousergon-lib@v0.124.226

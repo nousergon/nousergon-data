@@ -41,10 +41,13 @@ import logging
 import os
 import signal
 import time
-from contextlib import contextmanager, nullcontext
+from collections.abc import Generator
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
+from types import FrameType
+from typing import Any, NoReturn
 
 import boto3
 import yaml
@@ -364,7 +367,7 @@ class _CollectorError(RuntimeError):
     phase writes an ``error`` marker (→ a recovery RE-RUNS it) instead of a lying
     ``ok`` marker. Caught at the call site to preserve best-effort-continue."""
 
-    def __init__(self, name: str, detail, result: dict | None = None) -> None:
+    def __init__(self, name: str, detail: Any, result: Any = None) -> None:  # pyright: ignore[reportExplicitAny] -- a collector's error detail and result dict are whatever it reported
         super().__init__(f"{name}: {detail}")
         self.detail = detail
         #: The collector's own result dict, when it produced one before failing.
@@ -727,10 +730,10 @@ def _feature_group_extra_outputs(run_date: str) -> tuple[tuple[str, object, obje
     from ``groups_written`` had no columns available this run (writer.py:60) and
     is correctly NOT recorded — never a copy of the descriptor's 5-entry list
     regardless of what actually landed on S3 (alpha-engine-config-I10855)."""
-    def _present(group: str):
+    def _present(group: str) -> object:
         return lambda r: group in (r.get("groups_written") or {})
 
-    def _rows(group: str):
+    def _rows(group: str) -> object:
         return lambda r: (r.get("groups_written") or {}).get(group) or 0
 
     return tuple(
@@ -808,10 +811,10 @@ def _signal_returns_extra_outputs() -> tuple[tuple[object, object, object], ...]
     when the run wrote no rows and so uploaded nothing. Each is recorded with
     ``total_written``, the rows this run changed in the database (the same
     convention D08's ``research.db`` outputs use with ``rows_inserted``)."""
-    def _present(field: str):
+    def _present(field: str) -> object:
         return lambda r: bool((r.get("db_upload") or {}).get(field))
 
-    def _key(field: str):
+    def _key(field: str) -> object:
         return lambda r: [(r.get("db_upload") or {})[field]]
 
     return tuple(
@@ -885,7 +888,7 @@ def _run_manifest_context(reg: "PhaseRegistry", unit: run_units.PhaseUnit) -> di
 def _phase_collect(
     reg: "PhaseRegistry | None",
     name: str,
-    run_fn,
+    run_fn: Any,  # pyright: ignore[reportExplicitAny] -- each collector callable returns its own result dict
     *,
     artifact_key: str | None = None,
     extra_outputs: tuple[tuple[str, object, object], ...] = (),
@@ -964,7 +967,7 @@ def _phase_collect(
         if not worst.clean:
             raise _GuardRejectedPublish(name, result, worst.detail)
 
-    def _body(run_ctx) -> dict:
+    def _body(run_ctx: Any) -> dict[str, Any]:  # pyright: ignore[reportExplicitAny] -- a collector's result dict is heterogeneous JSON
         try:
             result = _phase_body(
                 reg,
@@ -999,7 +1002,9 @@ def _phase_collect(
         # collector's own result dict, so the captured one is returned rather
         # than the wrapper's None (the same restoration `_run_whole_mode_unit`
         # makes, for the same reason).
-        if run_result.status == "not_applicable":
+        # `value` is None only on that path (the body always returns a dict),
+        # so the second test only narrows the type.
+        if run_result.status == "not_applicable" or run_result.value is None:
             return captured["result"]
         return run_result.value
     except run_units.EmptyProduction:
@@ -1072,7 +1077,7 @@ def _phase_not_run(
 
     unit = run_units.unit_for(reg.data_mode, name)
 
-    def _body(run_ctx) -> dict:
+    def _body(run_ctx: Any) -> dict[str, Any]:  # pyright: ignore[reportExplicitAny] -- a collector's result dict is heterogeneous JSON
         run_ctx.record_guard(
             expectations.EMPTY_FRESH_GUARD.name,
             mode=expectations.EMPTY_FRESH_GUARD.mode.value,
@@ -1097,7 +1102,7 @@ def _phase_not_run(
 
 
 def _record_phase_lineage(
-    run_ctx,
+    run_ctx: Any,  # pyright: ignore[reportExplicitAny] -- the run-manifest context is handed through untyped call chains
     unit: run_units.PhaseUnit,
     name: str,
     result: dict,
@@ -1398,7 +1403,7 @@ def _prior_same_date_ok_manifest(reg: "PhaseRegistry", unit_id: str) -> str | No
     return None
 
 
-def _record_collector_guards(run_ctx, result: dict) -> None:
+def _record_collector_guards(run_ctx: Any, result: Any) -> None:  # pyright: ignore[reportExplicitAny] -- the run-manifest context is handed through untyped call chains
     """Fold guard readings a COLLECTOR graded itself onto its run manifest.
 
     `alpha-engine-config-I10827`. Most guards on this board are evaluated here,
@@ -1430,7 +1435,7 @@ def _record_collector_guards(run_ctx, result: dict) -> None:
         run_ctx.record_metric(metric)
 
 
-def _with_bar_settlement(result: dict, *, fetched_at, run_date: str, keys: tuple[str, ...]) -> dict:
+def _with_bar_settlement(result: dict, *, fetched_at: datetime | str, run_date: str, keys: tuple[str, ...]) -> dict[str, Any]:  # pyright: ignore[reportExplicitAny] -- a collector's result dict is heterogeneous JSON
     """``result`` with one `bar_settlement` guard entry per written key.
 
     `alpha-engine-config-I11203`. The same observe-mode reading D03/D19 already
@@ -1451,7 +1456,7 @@ def _with_bar_settlement(result: dict, *, fetched_at, run_date: str, keys: tuple
     return stamped
 
 
-def _record_rejections(run_ctx, result: dict, pairs: tuple[tuple[str, str], ...]) -> None:
+def _record_rejections(run_ctx: Any, result: Any, pairs: tuple[tuple[str, str], ...]) -> None:  # pyright: ignore[reportExplicitAny] -- the run-manifest context is handed through untyped call chains
     """Fold a collector's own not-published counts onto its manifest, by reason.
 
     `alpha-engine-config-I10810` deliverable 2. A count that is absent, is not a
@@ -1478,13 +1483,13 @@ def _record_rejections(run_ctx, result: dict, pairs: tuple[tuple[str, str], ...]
 def _phase_body(
     reg: "PhaseRegistry",
     name: str,
-    run_fn,
+    run_fn: Any,  # pyright: ignore[reportExplicitAny] -- each collector callable returns its own result dict
     *,
     artifact_key: str | None,
     supports_auto_skip: bool,
     verify_artifact_exists: bool,
     bucket: str | None,
-    before_marker=None,
+    before_marker: Any = None,  # pyright: ignore[reportExplicitAny] -- a hook taking the collector's result dict
 ) -> dict:
     """The phase-registry half of :func:`_phase_collect`.
 
@@ -1514,13 +1519,13 @@ def _phase_body(
 def _phase_body_marked(
     reg: "PhaseRegistry",
     name: str,
-    run_fn,
+    run_fn: Any,  # pyright: ignore[reportExplicitAny] -- each collector callable returns its own result dict
     *,
     artifact_key: str | None,
     supports_auto_skip: bool,
     verify_artifact_exists: bool,
     bucket: str | None,
-    before_marker=None,
+    before_marker: Any = None,  # pyright: ignore[reportExplicitAny] -- a hook taking the collector's result dict
 ) -> dict:
     """:func:`_phase_body`'s work, inside the phase marker's context manager.
 
@@ -1596,7 +1601,7 @@ def _phase_body_marked(
         return result
 
 
-def _maybe_phase(reg: "PhaseRegistry | None", name: str, **log_ctx):
+def _maybe_phase(reg: "PhaseRegistry | None", name: str, **log_ctx: Any) -> AbstractContextManager[Any]:  # pyright: ignore[reportExplicitAny] -- log context is free-form; the context is a PhaseContext, or None in a dry run
     """Marker-only phase wrapper (watchdog + START/END marker, no auto-skip) for
     steps whose body manages its own hard-fail/best-effort posture inline —
     MorningEnrich's preflight/append/self-heal. Returns the registry's phase
@@ -1617,7 +1622,7 @@ def _maybe_phase(reg: "PhaseRegistry | None", name: str, **log_ctx):
 _CLASSIFIED_SKIP_REASONS: tuple[str, ...] = ("stale_overwrite", "already_regraded")
 
 
-def _run_whole_mode_unit(mode: str, fn, config: dict, args: argparse.Namespace) -> dict:
+def _run_whole_mode_unit(mode: str, fn: Any, config: Any, args: argparse.Namespace) -> dict[str, Any]:  # pyright: ignore[reportExplicitAny] -- each mode's entry point and its config/result dicts are heterogeneous
     """Run a whole-mode unit under the run-manifest wrapper.
 
     Five of this module's run modes ARE one audit unit end to end — morning
@@ -1663,7 +1668,7 @@ def _run_whole_mode_unit(mode: str, fn, config: dict, args: argparse.Namespace) 
 
     captured: dict = {}
 
-    def _body(run_ctx) -> dict:
+    def _body(run_ctx: Any) -> dict[str, Any]:  # pyright: ignore[reportExplicitAny] -- a collector's result dict is heterogeneous JSON
         token = _CURRENT_RUN_CTX.set(run_ctx)
         try:
             result = fn(config, args)
@@ -1740,7 +1745,9 @@ def _run_whole_mode_unit(mode: str, fn, config: dict, args: argparse.Namespace) 
         # and returns with `value=None`. The caller's contract is the mode's own
         # result dict, so the captured one is returned rather than the wrapper's
         # None, which would turn an honest non-run into an AttributeError.
-        if run_result.status == "not_applicable":
+        # `value` is None only on that path (the body always returns a dict),
+        # so the second test only narrows the type.
+        if run_result.status == "not_applicable" or run_result.value is None:
             return captured["result"]
         return run_result.value
     except run_units.EmptyProduction:
@@ -1956,7 +1963,7 @@ _MODE_EXTRA_OUTPUTS: dict[str, tuple[tuple[object, object, object], ...]] = {
 }
 
 
-def _record_mode_lineage(run_ctx, mode: str, unit_id: str, result: dict) -> None:
+def _record_mode_lineage(run_ctx: Any, mode: str, unit_id: str, result: Any) -> None:  # pyright: ignore[reportExplicitAny] -- the run-manifest context is handed through untyped call chains
     """Fold a whole-mode unit's published outputs onto its run manifest.
 
     ``alpha-engine-config-I10861``: every S3 key the mode's own result shows
@@ -3207,7 +3214,7 @@ class _HardTimeout(BaseException):
 
 
 @contextmanager
-def _hard_timeout(seconds: int, label: str):
+def _hard_timeout(seconds: int, label: str) -> Generator[None, None, None]:
     """SIGALRM-based hard wall-clock bound for a best-effort block.
 
     Main-thread only (weekly_collector runs as the main thread under both
@@ -3217,7 +3224,7 @@ def _hard_timeout(seconds: int, label: str):
     the bound. SIGALRM interrupts blocking syscalls (socket recv), so it bounds
     a hung network fetch, not just CPU-bound loops.
     """
-    def _handler(signum, frame):
+    def _handler(signum: int, frame: FrameType | None) -> NoReturn:
         raise _HardTimeout(f"{label} exceeded {seconds}s hard timeout")
 
     try:
@@ -6285,7 +6292,7 @@ MAX_PANEL_CATCH_UP_PER_RUN = 5
 
 
 @contextmanager
-def _trigger_override(trigger: str):
+def _trigger_override(trigger: str) -> Generator[None, None, None]:
     """Set ``$NE_DATA_TRIGGER`` for the run manifests written inside the block."""
     previous = os.environ.get(run_units.TRIGGER_ENV)
     os.environ[run_units.TRIGGER_ENV] = trigger
