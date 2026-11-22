@@ -1,11 +1,14 @@
 schema_version: 2
 # Each movement-tolerant identity is the source path plus enclosing symbol. The
-# fingerprint hashes the exception handler's semantic AST (without positions),
-# so moving a handler is harmless while changing its body requires review.
+# fingerprint hashes the semantic AST of the whole `try` statement holding the
+# swallow (guarded statements and handlers, without positions or comments), so
+# moving a site is harmless while changing what it guards or how it swallows
+# requires review. Identical try statements share a fingerprint; the identity
+# tells them apart.
 entries:
   - path: collectors/alternative.py
     identity: collectors/alternative.py::_fetch_revisions
-    fingerprint: 8e7b1ed8f690a9d36ad90fef15cd89d966c372ba41fcbedd66f1ddf99332a6ce
+    fingerprint: 3897c969b5dce780fcfd5afdc9222a2fde659e9bf3f6c072c1cbdc58ffa51722
     reason: >-
       (a) failure mode swallowed: archive/revisions/{date}.json is absent
       because this codebase has no writer for that key. (c) recording surface:
@@ -14,7 +17,7 @@ entries:
     tracking: alpha-engine-config-I10226
   - path: emailer.py
     identity: emailer.py::_build_email
-    fingerprint: 8e7b1ed8f690a9d36ad90fef15cd89d966c372ba41fcbedd66f1ddf99332a6ce
+    fingerprint: 58dd730459bb617d8b890cc86c61e0f889ff0c953a5c2f634135f95be221036c
     reason: >-
       (a) failure mode swallowed: started_at or completed_at is missing or
       unparseable. (c) recording surface: none; only the cosmetic duration in
@@ -23,7 +26,7 @@ entries:
     tracking: alpha-engine-config-I10226
   - path: features/compute.py
     identity: features/compute.py::_load_cached_fundamentals
-    fingerprint: 8e7b1ed8f690a9d36ad90fef15cd89d966c372ba41fcbedd66f1ddf99332a6ce
+    fingerprint: f7fadcac6c4f798b07fe623e4b8137025995d432afef7300fca0a471bbdbed70
     reason: >-
       (a) failure mode swallowed: the exact-date S3 fundamentals key is
       missing or unreadable. (c) recording surface: the subsequent most-recent
@@ -32,7 +35,7 @@ entries:
     tracking: alpha-engine-config-I10226
   - path: weekly_collector.py
     identity: weekly_collector.py::_run_morning_enrich
-    fingerprint: 8e7b1ed8f690a9d36ad90fef15cd89d966c372ba41fcbedd66f1ddf99332a6ce
+    fingerprint: b4da507277c176e2e77413cbde0f2357078162b0dc357b0bf0f1d9c4eb0c4b71
     reason: >-
       (a) failure mode swallowed: started_at or completed_at is missing or
       unparseable. (c) recording surface: the logger.info summary immediately
@@ -41,7 +44,7 @@ entries:
     tracking: alpha-engine-config-I10226
   - path: weekly_collector.py
     identity: weekly_collector.py::_run_daily
-    fingerprint: 8e7b1ed8f690a9d36ad90fef15cd89d966c372ba41fcbedd66f1ddf99332a6ce
+    fingerprint: b4da507277c176e2e77413cbde0f2357078162b0dc357b0bf0f1d9c4eb0c4b71
     reason: >-
       (a) failure mode swallowed: started_at or completed_at is missing or
       unparseable. (c) recording surface: the logger.info summary immediately
@@ -50,7 +53,7 @@ entries:
     tracking: alpha-engine-config-I10226
   - path: weekly_collector.py
     identity: weekly_collector.py::_finalize
-    fingerprint: 8e7b1ed8f690a9d36ad90fef15cd89d966c372ba41fcbedd66f1ddf99332a6ce
+    fingerprint: b4da507277c176e2e77413cbde0f2357078162b0dc357b0bf0f1d9c4eb0c4b71
     reason: >-
       (a) failure mode swallowed: started_at or completed_at is missing or
       unparseable. (c) recording surface: the logger.info summary immediately

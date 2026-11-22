@@ -16,9 +16,15 @@ see the file header there.
 
 The detector retains the fleet guard's `_is_debug_only_or_pass` shape, but
 this repository's call-site also derives a movement-tolerant identity from the
-enclosing symbol and a content-sensitive fingerprint from each handler's AST.
-Source positions are excluded from the fingerprint, so unrelated line movement
-does not invalidate an allowance while a handler edit does.
+enclosing symbol and a content-sensitive fingerprint from the AST of the whole
+`try` statement that holds the swallow: what it guards AND how it swallows.
+Hashing the handler alone is not enough — every `except Exception: pass` hashes
+identically, so the fingerprint would say nothing about which failure is being
+swallowed, and an edit that moves a data write into a cosmetic `try` would keep
+its allowance (alpha-engine-config-I10944: "blind to a swallow changing
+meaning"). Source positions and comments are excluded from the fingerprint, so
+unrelated line movement does not invalidate an allowance while a change to the
+guarded statements or the handler does.
 
 A new site with no allowlist entry fails the build (`_UNCOVERED` case). An
 allowlist entry whose `expires` has passed fails loudly — re-justify or
@@ -79,9 +85,9 @@ def _is_debug_only_or_pass(body: list[ast.stmt]) -> bool:
     )
 
 
-def _handler_fingerprint(handler: ast.ExceptHandler) -> str:
-    """Hash semantic AST content, excluding movement-only source positions."""
-    content = ast.dump(handler, annotate_fields=True, include_attributes=False)
+def _swallow_fingerprint(statement: ast.Try | ast.TryStar) -> str:
+    """Hash the guarded statements and handlers, excluding source positions."""
+    content = ast.dump(statement, annotate_fields=True, include_attributes=False)
     return hashlib.sha256(content.encode()).hexdigest()
 
 
@@ -93,20 +99,21 @@ def _swallows_in_file(path: Path, *, repo_root: Path) -> list[dict[str, str]]:
     def visit(node: ast.AST, symbols: tuple[str, ...]) -> None:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             symbols = (*symbols, node.name)
-        if (
-            isinstance(node, ast.ExceptHandler)
-            and isinstance(node.type, ast.Name)
-            and node.type.id == "Exception"
-            and _is_debug_only_or_pass(node.body)
-        ):
-            symbol = ".".join(symbols) if symbols else "<module>"
-            found.append(
-                {
-                    "path": relative_path,
-                    "identity": f"{relative_path}::{symbol}",
-                    "fingerprint": _handler_fingerprint(node),
-                }
-            )
+        if isinstance(node, (ast.Try, ast.TryStar)):
+            for handler in node.handlers:
+                if (
+                    isinstance(handler.type, ast.Name)
+                    and handler.type.id == "Exception"
+                    and _is_debug_only_or_pass(handler.body)
+                ):
+                    symbol = ".".join(symbols) if symbols else "<module>"
+                    found.append(
+                        {
+                            "path": relative_path,
+                            "identity": f"{relative_path}::{symbol}",
+                            "fingerprint": _swallow_fingerprint(node),
+                        }
+                    )
         for child in ast.iter_child_nodes(node):
             visit(child, symbols)
 
@@ -138,7 +145,7 @@ def _check_allowlist(
         if "line" in entry:
             failures.append(f"line-number key is forbidden: {entry}")
         for field in required:
-            if not entry.get(field):
+            if not str(entry.get(field) or "").strip():
                 failures.append(f"allowlist entry missing {field!r}: {entry}")
 
     live_by_identity: dict[str, list[dict[str, str]]] = {}
@@ -173,7 +180,7 @@ def _check_allowlist(
         if not matching_sites:
             failures.append(f"{identity} is stale — no matching debug-only/pass swallow")
         elif all(site["fingerprint"] != entry.get("fingerprint") for site in matching_sites):
-            failures.append(f"{identity} changed-body — exception handler fingerprint differs")
+            failures.append(f"{identity} changed-body — swallow fingerprint differs")
 
     for site in live_sites:
         entries = allowed_by_identity.get(site["identity"], [])
@@ -222,6 +229,40 @@ def test_movement_is_ignored_but_changed_body_is_rejected(tmp_path: Path) -> Non
     path.write_text(source.replace("pass", 'logger.debug("ignored")'), encoding="utf-8")
     changed = _swallows_in_file(path, repo_root=tmp_path)
     assert any("changed-body" in failure for failure in _check_allowlist(changed, [entry]))
+
+
+def test_changing_what_an_allowed_swallow_guards_is_rejected(tmp_path: Path) -> None:
+    """Same handler, new guarded statement: the swallow now hides a different
+    failure, so the allowance must not carry over (alpha-engine-config-I10944)."""
+    source = "def run():\n    try:\n        parse_duration()\n    except Exception:\n        pass\n"
+    path = tmp_path / "example.py"
+    path.write_text(source, encoding="utf-8")
+    site = _swallows_in_file(path, repo_root=tmp_path)[0]
+    entry: dict[str, Any] = {
+        **site,
+        "reason": "failure mode and recording surface",
+        "expires": "2099-01-01",
+        "tracking": "issue-1",
+    }
+    path.write_text(source.replace("parse_duration()", "write_prices()"), encoding="utf-8")
+    changed = _swallows_in_file(path, repo_root=tmp_path)
+    assert changed[0]["identity"] == site["identity"]
+    assert _check_allowlist(changed, [entry]) == ["example.py::run changed-body — swallow fingerprint differs"]
+
+    path.write_text(source.replace("        pass\n", "        # cosmetic only\n        pass\n"), encoding="utf-8")
+    assert not _check_allowlist(_swallows_in_file(path, repo_root=tmp_path), [entry])
+
+
+def test_blank_reason_is_rejected() -> None:
+    entry = {
+        "path": "example.py",
+        "identity": "example.py::run",
+        "fingerprint": "abc",
+        "reason": "   ",
+        "expires": "2099-01-01",
+        "tracking": "issue-1",
+    }
+    assert any("missing 'reason'" in failure for failure in _check_allowlist([], [entry]))
 
 
 def test_new_swallow_is_uncovered(tmp_path: Path) -> None:
