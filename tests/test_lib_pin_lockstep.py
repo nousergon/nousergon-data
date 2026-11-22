@@ -435,6 +435,84 @@ def test_cost_gate_contract_rejects_a_drifted_pin(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# workflow-health-declarations.yml: a DELIBERATELY isolated pin
+# (alpha-engine-config-I13916).
+#
+# It installs nousergon-lib for the `workflow-health-semantics` console entry,
+# first shipped in v0.124.224, ahead of requirements.txt. It is its own file
+# (not a job in ci.yml) so ci.yml stays held to the root pin by the sweep.
+# Equality is the wrong contract for the same reason as cost-gate; the contract
+# is a FLOOR (the release that ships the entry point), a LAG BOUND behind root,
+# and a RE-EXAM DATE.
+# --------------------------------------------------------------------------- #
+
+_WFH_WORKFLOW = ".github/workflows/workflow-health-declarations.yml"
+#: First release that ships the `workflow-health-semantics` console entry.
+_WFH_FLOOR = (0, 124, 224)
+#: Max patch releases the pin may trail the root pin before re-measurement.
+_WFH_MAX_LAG = 25
+#: Past this date the isolation must be re-examined (bump root, or dissolve).
+_WFH_RE_EXAM = "2026-12-22"
+
+
+def _wfh_pins() -> list[str]:
+    text = (_REPO_ROOT / _WFH_WORKFLOW).read_text()
+    return re.findall(
+        r"git\+https://github\.com/nousergon/nousergon-lib@(v[0-9]+\.[0-9]+\.[0-9]+)",
+        text,
+    )
+
+
+def test_wfh_has_exactly_one_lib_install_pin():
+    pins = _wfh_pins()
+    assert len(pins) == 1, (
+        f"{_WFH_WORKFLOW} carries {len(pins)} nousergon-lib install pins "
+        f"({pins}); the floor/lag/re-exam contract below covers exactly one"
+    )
+
+
+def test_wfh_pin_is_not_below_its_floor():
+    (pin,) = _wfh_pins()
+    assert _version_tuple(pin) >= _WFH_FLOOR, (
+        f"{_WFH_WORKFLOW} pins nousergon-lib {pin}, below "
+        f"v{'.'.join(map(str, _WFH_FLOOR))}, the first release shipping the "
+        f"workflow-health-semantics console entry"
+    )
+
+
+def test_wfh_pin_does_not_drift_far_behind_root():
+    (pin,) = _wfh_pins()
+    root = _read_pin("requirements.txt", _REQUIREMENTS_PIN_RE)
+    wfh_v, root_v = _version_tuple(pin), _version_tuple(root)
+    if wfh_v[:2] != root_v[:2]:
+        raise AssertionError(
+            f"{_WFH_WORKFLOW} pins nousergon-lib {pin} but requirements.txt is "
+            f"on {root} - a different minor line; re-examine and bump it "
+            f"(alpha-engine-config-I13916)."
+        )
+    lag = root_v[2] - wfh_v[2]
+    assert lag <= _WFH_MAX_LAG, (
+        f"{_WFH_WORKFLOW} pins nousergon-lib {pin}, {lag} patch releases "
+        f"behind requirements.txt's {root} (bound: {_WFH_MAX_LAG}); bump it "
+        f"(alpha-engine-config-I13916)."
+    )
+
+
+def test_wfh_isolation_is_re_examined_by_its_date():
+    (pin,) = _wfh_pins()
+    root = _read_pin("requirements.txt", _REQUIREMENTS_PIN_RE)
+    if pin == root:
+        return  # isolation dissolved; nothing to re-examine
+    today = datetime.now(timezone.utc).date()
+    assert today <= date.fromisoformat(_WFH_RE_EXAM), (
+        f"{_WFH_WORKFLOW}'s isolated nousergon-lib pin {pin} (root: {root}) "
+        f"passed its re-exam date {_WFH_RE_EXAM}. Bump it to the root pin "
+        f"(dissolving the isolation), or record why it stays and move "
+        f"_WFH_RE_EXAM (alpha-engine-config-I13916)."
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Discovery sweep (alpha-engine-config-I7623).
 #
 # The tests above name their surfaces. Every surface added after them drifted
@@ -455,6 +533,7 @@ _GIT_PIN_RE = re.compile(
 _SWEEP_GOVERNED_ELSEWHERE: dict[str, str] = {
     "tests/": "pins inside tests are fixture strings fed to parsers, not installs",
     _COST_GATE_WORKFLOW: "deliberately isolated: floor + lag bound + re-exam (-I11410), tested above",
+    _WFH_WORKFLOW: "deliberately isolated: floor + lag bound + re-exam (-I13916), tested above",
 }
 
 
