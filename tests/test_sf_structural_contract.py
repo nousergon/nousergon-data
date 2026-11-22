@@ -1,4 +1,3 @@
-# ruff: noqa: ANN001, ANN201, ANN202
 """alpha-engine-config#6684 — structural contract over every
 ``infrastructure/step_function*.json`` orchestration definition.
 

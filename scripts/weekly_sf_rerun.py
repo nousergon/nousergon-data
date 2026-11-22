@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# ruff: noqa: ANN001, ANN201, ANN202
 """Mechanical weekly-SF recovery helper (config#2277).
 
 Derives, from a FAILED ``ne-weekly-freshness-pipeline`` execution, the exact
@@ -114,6 +113,7 @@ import sys
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 # sys.path insertion (not a package import) so this resolves identically
 # whether run directly (`python scripts/weekly_sf_rerun.py`) or loaded by
@@ -153,6 +153,8 @@ from nousergon_lib.pipeline_status.registry import (  # noqa: E402
     stage_order_for,
 )
 from krepis.dates import resolve_trading_day  # noqa: E402
+
+_Json = dict[str, Any]  # pyright: ignore[reportExplicitAny] — raw execution/state JSON
 
 
 def _landed_spine(sm_arn: str, sm_def: dict) -> tuple[str, ...]:
@@ -924,7 +926,7 @@ def _rule_skip_flag(rule: dict) -> str | None:
     flags = set()
     other = False
 
-    def rec(node):
+    def rec(node: Any) -> None:  # pyright: ignore[reportExplicitAny] — raw Choice-rule JSON
         nonlocal other
         if not isinstance(node, dict):
             return
@@ -1211,7 +1213,7 @@ class RerunPlan:
     # out and the SF's InitializeInput floor (the rerun's own start) applies.
     collection_not_before: str = ""
 
-    def rerun_input(self) -> dict:
+    def rerun_input(self) -> _Json:
         """The emitted StartExecution input.
 
         Non-``skip_*`` keys pass through from the source execution
@@ -1291,7 +1293,7 @@ def _simulate_reachable_works(flags: dict, original_input: dict) -> set:
 
     ran: set = set()
 
-    def run_linear(names: list):
+    def run_linear(names: list) -> None:
         for n in names:
             if not effective[n]:
                 ran.add(n)
@@ -1303,7 +1305,7 @@ def _simulate_reachable_works(flags: dict, original_input: dict) -> set:
     run_linear(sorted(BRANCH_A_STAGES, key=lambda n: [s.name for s in STAGES].index(n)))
     run_linear(["predictor_training"])
     # tail: CheckSkipBacktester's skip route OVERSHOOTS to CheckSkipEvaluator
-    def run_parity_family():
+    def run_parity_family() -> None:
         # alpha-engine-config#6030: skip_parity bypasses the WHOLE family
         # (ParityParallel + compare); otherwise each fine-grained stage runs
         # per its own flag (the three branch gates + the compare gate).
@@ -1417,7 +1419,7 @@ def resolve_chain(links: list) -> tuple:
     return outcome, witness
 
 
-def _parse_anchor(value) -> datetime | None:
+def _parse_anchor(value: object) -> datetime | None:
     """An aware datetime from a datetime or an RFC3339 string, else None."""
     if isinstance(value, datetime):
         return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
@@ -1806,7 +1808,10 @@ def decide_mutex_action(
 # (imported above) — lifted unchanged on the weekday_sf_rerun.py second
 # adoption (alpha-engine-config#6694, shared-code-policy).
 
-def resolve_default_execution(sf, sm_arn: str) -> dict:
+def resolve_default_execution(
+    sf: Any,  # pyright: ignore[reportExplicitAny] — untyped boto3 client
+    sm_arn: str,
+) -> _Json:
     """Latest terminal-failed (FAILED or TIMED_OUT) execution."""
     for ex in list_all_executions(sf, sm_arn):
         if ex["status"] in ("FAILED", "TIMED_OUT"):
@@ -1818,7 +1823,11 @@ def resolve_default_execution(sf, sm_arn: str) -> dict:
     )
 
 
-def next_rerun_name(sf, sm_arn: str, run_date: str) -> str:
+def next_rerun_name(
+    sf: Any,  # pyright: ignore[reportExplicitAny] — untyped boto3 client
+    sm_arn: str,
+    run_date: str,
+) -> str:
     prefix = f"watch-rerun-{run_date}-"
     ns = []
     for ex in list_all_executions(sf, sm_arn):
@@ -1851,7 +1860,9 @@ CHAIN_WINDOW_DAYS_BEFORE = 1
 CHAIN_WINDOW_DAYS_AFTER = 6
 
 
-def chain_candidates(executions: list, run_date: str, source_arn: str, source_start) -> tuple:
+def chain_candidates(
+    executions: list[_Json], run_date: str, source_arn: str, source_start: datetime | None
+) -> tuple[list[_Json], list[_Json]]:
     """Split ``executions`` into (candidates, non_terminal) for the chain of
     ``run_date``, oldest first.
 
@@ -1878,7 +1889,12 @@ def chain_candidates(executions: list, run_date: str, source_arn: str, source_st
     return cands, non_terminal
 
 
-def collect_chain_histories(sf, sm_arn: str, run_date: str, source: dict) -> tuple:
+def collect_chain_histories(
+    sf: Any,  # pyright: ignore[reportExplicitAny] — untyped boto3 client
+    sm_arn: str,
+    run_date: str,
+    source: _Json,
+) -> tuple[list[tuple[str, list[_Json]]], list[str]]:
     """``([(label, events), ...], warnings)`` for every EARLIER terminal
     execution of ``run_date``, oldest first.
 
@@ -2050,7 +2066,10 @@ def refuse_vacuous_rerun(
     )
 
 
-def _predictor_cycle_verdict(s3, trading_day: str) -> str:
+def _predictor_cycle_verdict(
+    s3: Any,  # pyright: ignore[reportExplicitAny] — untyped boto3 client
+    trading_day: str,
+) -> str:
     """GetObject arena/model/{trading_day}.verdict; return its whole body.
 
     Any S3 error -- NoSuchKey included, which is the "this cycle never reached
@@ -2138,7 +2157,11 @@ def predictor_skip_trading_day(plan: "RerunPlan") -> str:
     return plan.run_date
 
 
-def check_predictor_skip_freshness(s3, trading_day: str, emitted_input: dict) -> None:
+def check_predictor_skip_freshness(
+    s3: Any,  # pyright: ignore[reportExplicitAny] — untyped boto3 client
+    trading_day: str,
+    emitted_input: _Json,
+) -> None:
     """Mirror ValidatePredictorSkipWeightsFresh / CheckPredictorSkipWeightsFresh.
 
     If the SF will validate this input's skip_predictor_training claim (see
@@ -2172,7 +2195,10 @@ def check_predictor_skip_freshness(s3, trading_day: str, emitted_input: dict) ->
         )
 
 
-def apply_predictor_skip_coherence(plan: "RerunPlan", s3) -> None:
+def apply_predictor_skip_coherence(
+    plan: "RerunPlan",
+    s3: Any,  # pyright: ignore[reportExplicitAny] — untyped boto3 client
+) -> None:
     """The skip-coherence pre-flight main() runs, against the EMITTED input.
 
     Reads the document that would actually be dispatched (cadence-declared
@@ -2320,7 +2346,7 @@ def main(argv: list | None = None) -> int:
 
     if args.execution_arn:
         desc = sf.describe_execution(executionArn=args.execution_arn)
-        source = {"executionArn": args.execution_arn, "status": desc["status"], "startDate": desc["startDate"]}
+        source: _Json = {"executionArn": args.execution_arn, "status": desc["status"], "startDate": desc["startDate"]}
     else:
         source = resolve_default_execution(sf, args.state_machine_arn)
     source_arn, source_status = source["executionArn"], source["status"]
