@@ -73,10 +73,16 @@ they would be terminated at the 6.5h fallback cap.
 ## A finished weekly run's box ends early (alpha-engine-config-I11569, I11108)
 
 When a box's `execution-id` tag names an `ne-weekly-freshness-pipeline` execution
-that stopped more than `FINISHED_EXECUTION_REAP_GRACE_SECONDS` (default 3600; the
-old `REHEARSAL_REAP_GRACE_SECONDS` name is still read) ago, the reaper terminates
-it. The reason is `rehearsal-finished` for a `rehearsal-*` execution and
-`execution-finished` for any other.
+whose `DescribeExecution` status is `FAILED`, `ABORTED`, `TIMED_OUT` or `SUCCEEDED`,
+the reaper terminates it on the first scan that sees the terminal status, with no
+grace window (alpha-engine-config-I6009; the former one-hour
+`FINISHED_EXECUTION_REAP_GRACE_SECONDS` / `REHEARSAL_REAP_GRACE_SECONDS` grace is
+gone). `RUNNING` / `PENDING_REDRIVE`, an unrecognised status, or a failed lookup
+keeps the box on its `watchdog-deadline`. The reason is `rehearsal-finished` for a
+`rehearsal-*` execution and `execution-finished` for any other, and the log line
+names the terminal `execution_status`. Every scan also emits
+`orphan_reaper_instances_scanned`, `orphan_reaper_instances_reaped` and
+`orphan_reaper_oldest_terminal_execution_age` (explicit zeros included).
 
 Nothing reuses a finished run's box. Since config#2248 the box is dispatched
 inside the execution, `ec2_instance_id` is never in a cadence input, and
