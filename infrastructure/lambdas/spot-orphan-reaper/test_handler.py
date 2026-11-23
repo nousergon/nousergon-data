@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import importlib
 import json
-import os
 import sys
 import types
 from datetime import datetime, timedelta, timezone
@@ -788,25 +787,31 @@ def _sfn(status: str, stopped_seconds_ago: int | None = None, raises: Exception 
 
 
 class TestFinishedExecutionBoxes:
-    def test_failed_rehearsal_box_is_reaped_after_the_grace(self, index_module):
+    @pytest.mark.parametrize("status", ["FAILED", "ABORTED", "TIMED_OUT", "SUCCEEDED"])
+    def test_each_terminal_status_is_reaped_on_first_scan(self, index_module, status, caplog):
         # rehearsal-2026-09-24-1: FailExecution at 22:51Z, box kept to 11:00Z.
-        sfn = _sfn("FAILED", stopped_seconds_ago=3700)
+        caplog.set_level("WARNING")
+        sfn = _sfn(status, stopped_seconds_ago=60)
         out, ec2, _cw = _run_filtered(index_module, [_weekly_box("i-reh", "rehearsal-2026-09-24-1")], sfn)
         assert out["terminated"] == ["i-reh"]
         assert out["orphan_detail"][0]["reap_reason"] == "rehearsal-finished"
+        assert out["orphan_detail"][0]["execution_status"] == status
         sfn.describe_execution.assert_called_once_with(
             executionArn=_EXEC_PREFIX + "rehearsal-2026-09-24-1")
         ec2.terminate_instances.assert_called_once_with(InstanceIds=["i-reh"])
+        assert any("i-reh" in r.getMessage() and f"execution_status={status}" in r.getMessage()
+                   for r in caplog.records)
 
-    def test_rehearsal_inside_the_grace_is_kept(self, index_module):
-        sfn = _sfn("FAILED", stopped_seconds_ago=600)
-        out, ec2, _cw = _run_filtered(index_module, [_weekly_box("i-reh", "rehearsal-2026-09-24-2")], sfn)
+    @pytest.mark.parametrize("status", ["RUNNING", "PENDING_REDRIVE"])
+    def test_live_execution_is_kept(self, index_module, status):
+        sfn = _sfn(status)
+        out, ec2, _cw = _run_filtered(index_module, [_weekly_box("i-reh", "rehearsal-2026-09-25-1")], sfn)
         assert out["terminated"] == []
         ec2.terminate_instances.assert_not_called()
 
-    def test_running_rehearsal_is_kept(self, index_module):
-        sfn = _sfn("RUNNING")
-        out, ec2, _cw = _run_filtered(index_module, [_weekly_box("i-reh", "rehearsal-2026-09-25-1")], sfn)
+    def test_unrecognized_status_is_kept(self, index_module):
+        sfn = _sfn("FUTURE_STATUS", stopped_seconds_ago=60)
+        out, ec2, _cw = _run_filtered(index_module, [_weekly_box("i-reh", "unknown")], sfn)
         assert out["terminated"] == []
         ec2.terminate_instances.assert_not_called()
 
@@ -818,18 +823,27 @@ class TestFinishedExecutionBoxes:
         assert out["terminated"] == []
         ec2.terminate_instances.assert_not_called()
 
-    def test_failed_production_run_box_is_reaped_after_the_grace(self, index_module):
+    def test_describe_failure_still_uses_deadline_backstop(self, index_module):
+        sfn = _sfn("", raises=RuntimeError("AccessDeniedException"))
+        inst = _weekly_box("i-reh", "rehearsal-2026-09-24-1", age_seconds=50000)
+        inst["Tags"] = [tag for tag in inst["Tags"] if tag["Key"] != "watchdog-deadline"]
+        out, ec2, _cw = _run_filtered(index_module, [inst], sfn)
+        assert out["terminated"] == ["i-reh"]
+        assert out["orphan_detail"][0]["reap_reason"] == "deadline"
+        ec2.terminate_instances.assert_called_once_with(InstanceIds=["i-reh"])
+
+    def test_failed_production_run_box_is_reaped_immediately(self, index_module):
         # 2026-09-19: FAILED at 14:25Z, box idle until a hand-terminate. No
         # watch-rerun reuses the box (rerun inputs carry no ec2_instance_id).
-        sfn = _sfn("FAILED", stopped_seconds_ago=3700)
+        sfn = _sfn("FAILED", stopped_seconds_ago=60)
         out, ec2, _cw = _run_filtered(
             index_module, [_weekly_box("i-prod", "2b6ab316-8060-4011-8140-cccf0f2194bd")], sfn)
         assert out["terminated"] == ["i-prod"]
         assert out["orphan_detail"][0]["reap_reason"] == "execution-finished"
         ec2.terminate_instances.assert_called_once_with(InstanceIds=["i-prod"])
 
-    def test_succeeded_run_box_is_reaped_after_the_grace(self, index_module):
-        sfn = _sfn("SUCCEEDED", stopped_seconds_ago=3700)
+    def test_succeeded_run_box_is_reaped_immediately(self, index_module):
+        sfn = _sfn("SUCCEEDED", stopped_seconds_ago=60)
         out, ec2, _cw = _run_filtered(
             index_module, [_weekly_box("i-ok", "watch-rerun-2026-09-18-4")], sfn)
         assert out["terminated"] == ["i-ok"]
@@ -863,12 +877,26 @@ class TestFinishedExecutionBoxes:
         assert len(_metric_calls(cw, "spot_orphans_terminated")) == 1
         assert _metric_calls(cw, "finished_run_boxes_ended") == []
 
-    def test_production_run_inside_the_grace_is_kept(self, index_module):
+    def test_scan_metrics_include_counts_and_oldest_terminal_age(self, index_module):
         sfn = _sfn("FAILED", stopped_seconds_ago=600)
-        out, ec2, _cw = _run_filtered(
-            index_module, [_weekly_box("i-prod", "2b6ab316-8060-4011-8140-cccf0f2194bd")], sfn)
-        assert out["terminated"] == []
-        ec2.terminate_instances.assert_not_called()
+        out, _ec2, cw = _run_filtered(
+            index_module, [_weekly_box("i-prod", "watch-rerun-2026-08-01-1")], sfn)
+        assert out["terminated"] == ["i-prod"]
+        (call,) = _metric_calls(cw, "orphan_reaper_instances_scanned")
+        points = {point["MetricName"]: point for point in call.kwargs["MetricData"]}
+        assert points["orphan_reaper_instances_scanned"]["Value"] == 1.0
+        assert points["orphan_reaper_instances_reaped"]["Value"] == 1.0
+        assert 599 <= points["orphan_reaper_oldest_terminal_execution_age"]["Value"] <= 601
+
+    def test_empty_scan_metrics_include_explicit_zeros(self, index_module):
+        _out, _ec2, cw = _run_filtered(index_module, [])
+        (call,) = _metric_calls(cw, "orphan_reaper_instances_scanned")
+        points = {point["MetricName"]: point["Value"] for point in call.kwargs["MetricData"]}
+        assert points == {
+            "orphan_reaper_instances_scanned": 0.0,
+            "orphan_reaper_instances_reaped": 0.0,
+            "orphan_reaper_oldest_terminal_execution_age": 0.0,
+        }
 
     def test_other_state_machines_are_never_looked_up(self, index_module):
         # Other definitions' launches may outlive their execution by design.
