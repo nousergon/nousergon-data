@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -51,7 +50,7 @@ def stub_flow_doctor_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("EMAIL_RECIPIENTS", "test@example.com")
     monkeypatch.setenv("GMAIL_APP_PASSWORD", "stub-password")
     monkeypatch.setenv("FLOW_DOCTOR_GITHUB_TOKEN", "stub-token")
-    # config#645: flow-doctor.yaml carries the fleet CRITICAL Telegram notifier.
+    # config#645: flow-doctor.yaml carries the CRITICAL Telegram notifier.
     # flow-doctor fails loud on an unresolved ${VAR},
     # so the wiring tests must seed them (mirrors the runtime, where the box
     # resolves them from SSM /alpha-engine/TELEGRAM_* + /alpha-engine/FLOW_DOCTOR_TELEGRAM_THREAD_*).
@@ -249,24 +248,28 @@ class TestFlowDoctorYamlSchema:
         assert "email" in types, "email channel required for ops alerts"
         assert "github" in types, "github issue channel required for diagnosis"
 
-    def test_yaml_notification_routes(self) -> None:
-        """Only critical reports go to Telegram; durable sinks stay intact."""
+    def test_yaml_notification_channels(self) -> None:
+        """Only critical reports page Telegram; other sinks stay intact."""
         import yaml
+
         with open(REPO_ROOT / "flow-doctor.yaml") as f:
             cfg = yaml.safe_load(f)
 
-        notifiers = cfg["notify"]
-        telegram = [n for n in notifiers if n.get("type") == "telegram"]
-        assert telegram == [{
-            "type": "telegram",
-            "bot_token": "${TELEGRAM_BOT_TOKEN}",
-            "chat_id": "${TELEGRAM_CHAT_ID}",
-            "message_thread_id": "${FLOW_DOCTOR_TELEGRAM_THREAD_CRITICAL}",
-            "parse_mode": "Markdown",
-            "disable_notification": False,
-            "notify_on": ["critical"],
-        }]
-        assert [n for n in notifiers if n.get("type") in {"email", "github", "s3"}] == [
+        telegram = [n for n in cfg["notify"] if n.get("type") == "telegram"]
+        assert telegram == [
+            {
+                "type": "telegram",
+                "bot_token": "${TELEGRAM_BOT_TOKEN}",
+                "chat_id": "${TELEGRAM_CHAT_ID}",
+                "message_thread_id": "${FLOW_DOCTOR_TELEGRAM_THREAD_CRITICAL}",
+                "parse_mode": "Markdown",
+                "disable_notification": False,
+                "notify_on": ["critical"],
+            }
+        ]
+
+        non_telegram = [n for n in cfg["notify"] if n.get("type") != "telegram"]
+        assert non_telegram == [
             {
                 "type": "email",
                 "sender": "${EMAIL_SENDER}",

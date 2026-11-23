@@ -32,7 +32,7 @@ notify:
     subsystem: data_pipeline
     default_root_cause_category: code_bug
   # Telegram forum-topic routing (config#1741 / config#645). Producer subset —
-  # CRITICAL forum topic. Canonical topic specs live in
+  # CRITICAL reports only. Canonical topic specs live in
   # nousergon_lib.flow_doctor_fleet (_FLEET_TELEGRAM_TOPIC_SPECS). Thread IDs
   # resolve from env (seeded from SSM /alpha-engine/ in prod).
   - type: telegram
