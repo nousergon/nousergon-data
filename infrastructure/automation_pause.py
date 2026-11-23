@@ -1150,8 +1150,8 @@ def alert_on_findings(findings: list[dict], source: str = ALERT_SOURCE) -> None:
         # the window that finds the SAME drift collapses to one page, but any
         # change to what is wrong (new trigger, cleared trigger, new kind)
         # mints a fresh key and pages again immediately rather than waiting
-        # out the window. A 24-hour window re-pages an unchanged finding once
-        # daily while it remains open, rather than on every 4-hour check.
+        # out the window. 1440min keeps an unchanged finding to one page per
+        # 24 hours while it remains open; changed findings still page at once.
         dedup_key="automation-pause-check:" + ",".join(kinds),
         dedup_window_min=1440,
     )

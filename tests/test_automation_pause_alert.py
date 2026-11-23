@@ -15,8 +15,9 @@ from __future__ import annotations
 import importlib.util
 import re
 import sys
-from types import ModuleType
 from pathlib import Path
+from types import ModuleType
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -53,7 +54,7 @@ SAMPLE_FINDINGS = [
 
 # --- alert_on_findings() ----------------------------------------------------
 
-def test_alert_publishes_at_error_severity(mod: ModuleType) -> None:
+def test_alert_publishes_at_error_severity(mod: Any) -> None:
     """error/critical is the only severity that reliably phone-pushes with no
     other consumer watching the channel (alpha-engine-config-I7857)."""
     with patch("krepis.alerts.publish") as mock_publish:
@@ -64,7 +65,7 @@ def test_alert_publishes_at_error_severity(mod: ModuleType) -> None:
     assert kwargs["source"] == "test-source"
 
 
-def test_default_source_is_stable_and_registered(mod: ModuleType) -> None:
+def test_default_source_is_stable_and_registered(mod: Any) -> None:
     """The default source is a repo-relative literal with an alert_classes row.
 
     It used to default to ``__file__``, which in CI is the runner's absolute
@@ -87,7 +88,7 @@ def test_default_source_is_stable_and_registered(mod: ModuleType) -> None:
     )
 
 
-def test_alert_message_names_every_finding(mod: ModuleType) -> None:
+def test_alert_message_names_every_finding(mod: Any) -> None:
     with patch("krepis.alerts.publish") as mock_publish:
         mod.alert_on_findings(SAMPLE_FINDINGS)
     (message,), kwargs = mock_publish.call_args
@@ -96,7 +97,7 @@ def test_alert_message_names_every_finding(mod: ModuleType) -> None:
     assert "paused on 2026-08-07 but live state is ENABLED" in message
 
 
-def test_alert_dedup_key_changes_with_the_finding_set(mod: ModuleType) -> None:
+def test_alert_dedup_key_changes_with_the_finding_set(mod: Any) -> None:
     """A different finding set must mint a different dedup key, or a NEW
     drift collapses into an unresolved OLD one's dedup window and never
     pages."""
@@ -110,48 +111,31 @@ def test_alert_dedup_key_changes_with_the_finding_set(mod: ModuleType) -> None:
     assert key_a != key_b
 
 
-def test_alert_dedupes_same_findings_for_a_day_but_sends_changes(mod: ModuleType) -> None:
-    """An unchanged finding waits a day to re-page; changed drift pages now."""
-    now_minute = 0
-    sent_at: dict[str, int] = {}
-    sends: list[str] = []
-
-    def fake_publish(
-        message: str,
-        *,
-        dedup_key: str,
-        dedup_window_min: int,
-        **_kwargs: object,
-    ) -> None:
-        previous = sent_at.get(dedup_key)
-        if previous is None or now_minute - previous >= dedup_window_min:
-            sent_at[dedup_key] = now_minute
-            sends.append(message)
-
-    changed_findings = [{**SAMPLE_FINDINGS[0], "trigger": "some-other-schedule"}]
-    with patch("krepis.alerts.publish", side_effect=fake_publish):
+def test_unchanged_finding_is_deduped_for_24_hours(mod: Any) -> None:
+    """A repeat four-hour check is deduped, while changed drift pages now."""
+    other_finding = [{**SAMPLE_FINDINGS[0], "trigger": "some-other-schedule"}]
+    with patch("krepis.alerts.publish") as mock_publish:
         mod.alert_on_findings(SAMPLE_FINDINGS)
-        now_minute = 4 * 60
+        first_call = mock_publish.call_args
         mod.alert_on_findings(SAMPLE_FINDINGS)
-        assert len(sends) == 1
+        repeated_call = mock_publish.call_args
+        mod.alert_on_findings(other_finding)
+        changed_call = mock_publish.call_args
 
-        mod.alert_on_findings(changed_findings)
-        assert len(sends) == 2
-
-        now_minute = 24 * 60
-        mod.alert_on_findings(SAMPLE_FINDINGS)
-        assert len(sends) == 3
+    assert first_call.kwargs["dedup_window_min"] == 24 * 60
+    assert repeated_call.kwargs["dedup_key"] == first_call.kwargs["dedup_key"]
+    assert changed_call.kwargs["dedup_key"] != first_call.kwargs["dedup_key"]
 
 
 # --- CLI wiring --------------------------------------------------------------
 
-def test_alert_on_fail_requires_check(mod: ModuleType) -> None:
+def test_alert_on_fail_requires_check(mod: Any) -> None:
     with pytest.raises(SystemExit):
         with patch.object(sys, "argv", ["automation_pause.py", "--enforce", "--alert-on-fail"]):
             mod.main()
 
 
-def test_check_without_findings_never_calls_publish(mod: ModuleType) -> None:
+def test_check_without_findings_never_calls_publish(mod: Any) -> None:
     """A clean run must not import/call krepis at all — the whole point of
     the lazy import is that plain --check keeps needing nothing beyond the
     stdlib."""
@@ -162,7 +146,7 @@ def test_check_without_findings_never_calls_publish(mod: ModuleType) -> None:
     mock_publish.assert_not_called()
 
 
-def test_check_with_findings_and_alert_on_fail_calls_publish(mod: ModuleType) -> None:
+def test_check_with_findings_and_alert_on_fail_calls_publish(mod: Any) -> None:
     with patch.object(mod, "check", return_value=SAMPLE_FINDINGS):
         with patch.object(sys, "argv", ["automation_pause.py", "--check", "--alert-on-fail"]):
             with patch("krepis.alerts.publish") as mock_publish:
@@ -170,7 +154,7 @@ def test_check_with_findings_and_alert_on_fail_calls_publish(mod: ModuleType) ->
     mock_publish.assert_called_once()
 
 
-def test_check_with_findings_and_no_alert_flag_never_calls_publish(mod: ModuleType) -> None:
+def test_check_with_findings_and_no_alert_flag_never_calls_publish(mod: Any) -> None:
     """--alert-on-fail must be opt-in — sf-arn-drift-check.yml's existing
     bare `--check` step must not start paging as a side effect of this
     change."""
