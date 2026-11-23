@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -26,7 +27,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 @pytest.fixture
-def stub_flow_doctor_env(monkeypatch):
+def stub_flow_doctor_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Populate the env vars that flow-doctor.yaml's ${VAR} refs resolve.
 
     flow_doctor.init() substitutes these at load time. Stubs are non-empty
@@ -50,18 +51,17 @@ def stub_flow_doctor_env(monkeypatch):
     monkeypatch.setenv("EMAIL_RECIPIENTS", "test@example.com")
     monkeypatch.setenv("GMAIL_APP_PASSWORD", "stub-password")
     monkeypatch.setenv("FLOW_DOCTOR_GITHUB_TOKEN", "stub-token")
-    # config#645: flow-doctor.yaml now carries the fleet Telegram notifiers
-    # (CRITICAL + OPS_HEALTH). flow-doctor fails loud on an unresolved ${VAR},
+    # config#645: flow-doctor.yaml carries the CRITICAL Telegram notifier.
+    # flow-doctor fails loud on an unresolved ${VAR},
     # so the wiring tests must seed them (mirrors the runtime, where the box
     # resolves them from SSM /alpha-engine/TELEGRAM_* + /alpha-engine/FLOW_DOCTOR_TELEGRAM_THREAD_*).
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:stub-token")
     monkeypatch.setenv("TELEGRAM_CHAT_ID", "-100stub")
     monkeypatch.setenv("FLOW_DOCTOR_TELEGRAM_THREAD_CRITICAL", "1")
-    monkeypatch.setenv("FLOW_DOCTOR_TELEGRAM_THREAD_OPS_HEALTH", "2")
 
 
 @pytest.fixture
-def temp_flow_doctor_yaml(tmp_path):
+def temp_flow_doctor_yaml(tmp_path: Path) -> str:
     """Write a copy of the production flow-doctor.yaml with store forced
     to a local sqlite file in the test's tmp_path. Returns the temp yaml path.
 
@@ -83,7 +83,7 @@ def temp_flow_doctor_yaml(tmp_path):
 
 
 @pytest.fixture
-def reset_root_logger():
+def reset_root_logger() -> Iterator[None]:
     """Snapshot + restore root logger handlers around each test."""
     root = logging.getLogger()
     saved = list(root.handlers)
@@ -113,10 +113,10 @@ class TestFlowDoctorYamlPresence:
     pointed at the missing path — silent flow-doctor disable for months.
     """
 
-    def test_yaml_at_repo_root_exists(self):
+    def test_yaml_at_repo_root_exists(self) -> None:
         assert (REPO_ROOT / "flow-doctor.yaml").is_file()
 
-    def test_yaml_path_resolved_by_lambda_handler_exists(self):
+    def test_yaml_path_resolved_by_lambda_handler_exists(self) -> None:
         # Mirrors lambda/handler.py's path computation in the local-dev
         # branch (LAMBDA_TASK_ROOT unset):
         #   os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -124,7 +124,9 @@ class TestFlowDoctorYamlPresence:
         resolved = Path(os.path.dirname(os.path.dirname(os.path.abspath(handler_path)))) / "flow-doctor.yaml"
         assert resolved.is_file(), f"Lambda handler resolves to {resolved}"
 
-    def test_yaml_path_resolved_by_lambda_handler_under_lambda_runtime(self, tmp_path, monkeypatch):
+    def test_yaml_path_resolved_by_lambda_handler_under_lambda_runtime(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         # Lambda flattens lambda/handler.py to /var/task/handler.py, so
         # the original two-dirs-up resolution would land at /var/ — wrong.
         # The handler must honor LAMBDA_TASK_ROOT first. Simulate by
@@ -148,14 +150,14 @@ class TestFlowDoctorYamlPresence:
             "layout means dirname(dirname(__file__)) lands at /var, not /var/task"
         )
 
-    def test_yaml_path_resolved_by_weekly_collector_exists(self):
+    def test_yaml_path_resolved_by_weekly_collector_exists(self) -> None:
         # Mirrors weekly_collector.py's path computation:
         #   Path(__file__).parent / "flow-doctor.yaml"
         wc_path = REPO_ROOT / "weekly_collector.py"
         resolved = wc_path.parent / "flow-doctor.yaml"
         assert resolved.is_file(), f"weekly_collector resolves to {resolved}"
 
-    def test_yaml_path_resolved_by_rag_preflight_exists(self):
+    def test_yaml_path_resolved_by_rag_preflight_exists(self) -> None:
         # Mirrors rag/preflight.py's path computation:
         #   os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         rp_path = REPO_ROOT / "rag" / "preflight.py"
@@ -171,7 +173,7 @@ class TestFlowDoctorYamlSchema:
     yaml to the executor-canonical shape.
     """
 
-    def test_yaml_has_required_top_level_keys(self):
+    def test_yaml_has_required_top_level_keys(self) -> None:
         import yaml
         with open(REPO_ROOT / "flow-doctor.yaml") as f:
             cfg = yaml.safe_load(f)
@@ -180,7 +182,7 @@ class TestFlowDoctorYamlSchema:
         assert cfg["flow_name"] == "data-collector"
         assert cfg["repo"] == "nousergon/nousergon-data"
 
-    def test_diagnosis_enabled_requires_explicit_provider(self):
+    def test_diagnosis_enabled_requires_explicit_provider(self) -> None:
         """A config that enables diagnosis must name its provider.
 
         flow-doctor 0.15.0 made an unset ``diagnosis.provider`` a loud
@@ -221,7 +223,7 @@ class TestFlowDoctorYamlSchema:
                 "diagnosis.provider='openai_compat' requires diagnosis.base_url"
             )
 
-    def test_auto_fix_diagnosis_provider_agrees(self):
+    def test_auto_fix_diagnosis_provider_agrees(self) -> None:
         """fix/cli.py's FixGenerator reuses diagnosis.provider/model_group
         verbatim (flow_doctor.fix.cli.generate_fix) — auto_fix.enabled must
         not be on without the same provider contract diagnosis needs.
@@ -239,7 +241,7 @@ class TestFlowDoctorYamlSchema:
             "'openai_compat', same as diagnosis above."
         )
 
-    def test_yaml_has_email_and_github_notify_channels(self):
+    def test_yaml_has_email_and_github_notify_channels(self) -> None:
         import yaml
         with open(REPO_ROOT / "flow-doctor.yaml") as f:
             cfg = yaml.safe_load(f)
@@ -247,7 +249,50 @@ class TestFlowDoctorYamlSchema:
         assert "email" in types, "email channel required for ops alerts"
         assert "github" in types, "github issue channel required for diagnosis"
 
-    def test_yaml_has_per_day_caps(self):
+    def test_yaml_notifier_routing(self) -> None:
+        import yaml
+        with open(REPO_ROOT / "flow-doctor.yaml") as f:
+            cfg = yaml.safe_load(f)
+
+        telegram = [n for n in cfg["notify"] if n.get("type") == "telegram"]
+        assert telegram == [{
+            "type": "telegram",
+            "bot_token": "${TELEGRAM_BOT_TOKEN}",
+            "chat_id": "${TELEGRAM_CHAT_ID}",
+            "message_thread_id": "${FLOW_DOCTOR_TELEGRAM_THREAD_CRITICAL}",
+            "parse_mode": "Markdown",
+            "disable_notification": False,
+            "notify_on": ["critical"],
+        }]
+
+        non_telegram = [n for n in cfg["notify"] if n.get("type") != "telegram"]
+        assert non_telegram == [
+            {
+                "type": "email",
+                "sender": "${EMAIL_SENDER}",
+                "recipients": "${EMAIL_RECIPIENTS}",
+                "smtp_host": "smtp.gmail.com",
+                "smtp_port": 587,
+                "smtp_password": "${GMAIL_APP_PASSWORD}",
+            },
+            {
+                "type": "github",
+                "repo": "nousergon/nousergon-data",
+                "token": "${FLOW_DOCTOR_GITHUB_TOKEN}",
+                "notify_on_category": ["CODE", "CONFIG"],
+                "auto_create_issue": True,
+                "auto_fix_pr": True,
+                "fix_label": "flow-doctor:fix",
+            },
+            {
+                "type": "s3",
+                "bucket": "alpha-engine-research",
+                "subsystem": "data_pipeline",
+                "default_root_cause_category": "code_bug",
+            },
+        ]
+
+    def test_yaml_has_per_day_caps(self) -> None:
         import yaml
         with open(REPO_ROOT / "flow-doctor.yaml") as f:
             cfg = yaml.safe_load(f)
@@ -255,7 +300,7 @@ class TestFlowDoctorYamlSchema:
         for key in ("max_alerts_per_day", "max_issues_per_day", "max_diagnosed_per_day"):
             assert key in rl, f"rate_limits.{key} required (Anthropic-cost cap)"
 
-    def test_yaml_github_notifier_category_gated_same_repo(self):
+    def test_yaml_github_notifier_category_gated_same_repo(self) -> None:
         """config#1696 — narrow auto_fix_pr eligibility; keep repo local."""
         import yaml
         with open(REPO_ROOT / "flow-doctor.yaml") as f:
@@ -274,7 +319,9 @@ class TestSetupLoggingAttach:
     calls are never invoked. Verifies wiring shape only.
     """
 
-    def test_disabled_attaches_no_flow_doctor_handler(self, monkeypatch, reset_root_logger):
+    def test_disabled_attaches_no_flow_doctor_handler(
+        self, monkeypatch: pytest.MonkeyPatch, reset_root_logger: None
+    ) -> None:
         monkeypatch.setenv("FLOW_DOCTOR_ENABLED", "0")
         from nousergon_lib.logging import setup_logging
         setup_logging(
@@ -288,8 +335,11 @@ class TestSetupLoggingAttach:
         assert attached == [], "FlowDoctorHandler should NOT attach when DISABLED"
 
     def test_enabled_attaches_flow_doctor_handler(
-        self, stub_flow_doctor_env, reset_root_logger, temp_flow_doctor_yaml
-    ):
+        self,
+        stub_flow_doctor_env: None,
+        reset_root_logger: None,
+        temp_flow_doctor_yaml: str,
+    ) -> None:
         from nousergon_lib.logging import setup_logging, get_flow_doctor
         setup_logging(
             "data-collector-test-enabled",
@@ -305,8 +355,11 @@ class TestSetupLoggingAttach:
         assert get_flow_doctor() is not None, "shared singleton not populated"
 
     def test_exclude_patterns_plumbed_to_handler(
-        self, stub_flow_doctor_env, reset_root_logger, temp_flow_doctor_yaml
-    ):
+        self,
+        stub_flow_doctor_env: None,
+        reset_root_logger: None,
+        temp_flow_doctor_yaml: str,
+    ) -> None:
         from nousergon_lib.logging import setup_logging
         patterns = [r"polygon transient 5\d\d", r"yfinance possibly delisted"]
         setup_logging(
@@ -344,7 +397,7 @@ class TestEntrypointModuleTopWiring:
     # test_lambda_handler_calls_setup_logging_at_module_top removed:
     # lambda/handler.py was deleted (alpha-engine-config-I10779, D15L retired).
 
-    def test_weekly_collector_calls_setup_logging_at_module_top(self):
+    def test_weekly_collector_calls_setup_logging_at_module_top(self) -> None:
         text = (REPO_ROOT / "weekly_collector.py").read_text()
         setup_idx = self._index_of("setup_logging(", text)
         main_def_idx = self._index_of("def main()", text)
@@ -362,7 +415,7 @@ class TestEntrypointModuleTopWiring:
             "duplicate setup_logging call inside main() — should only run once"
         )
 
-    def test_rag_preflight_calls_setup_logging_at_module_top(self):
+    def test_rag_preflight_calls_setup_logging_at_module_top(self) -> None:
         text = (REPO_ROOT / "rag" / "preflight.py").read_text()
         setup_idx = self._index_of("setup_logging(", text)
         main_def_idx = self._index_of("def main()", text)
