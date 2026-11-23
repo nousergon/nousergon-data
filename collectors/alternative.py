@@ -61,6 +61,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import boto3
+from botocore.exceptions import ClientError  # pyright: ignore[reportMissingTypeStubs]  # botocore ships no stubs; matches universe_returns.py
 
 from collectors.yahoo_session import YahooAuthError
 from dates import FutureBarError, assert_no_bar_after, clip_to_trading_day, history_window
@@ -1172,6 +1173,11 @@ def _assert_scope_stable(
     )
 
 
+#: S3 error codes that mean the object is genuinely absent, as opposed to an
+#: access, transport or service failure (alpha-engine-config-I11069).
+_S3_NOT_FOUND_CODES: frozenset[str] = frozenset({"404", "NoSuchKey", "NotFound"})
+
+
 def _load_promoted_tickers(
     s3: Any, bucket: str, signals_key: str | None, run_date: str  # pyright: ignore[reportExplicitAny]  # untyped SDK object
 ) -> list[str]:
@@ -1195,6 +1201,33 @@ def _load_promoted_tickers(
     try:
         obj = s3.get_object(Bucket=bucket, Key=signals_key)
         signals = json.loads(obj["Body"].read())
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") not in _S3_NOT_FOUND_CODES:  # pyright: ignore[reportUnknownMemberType]
+            raise RuntimeError(
+                f"Failed to load promoted tickers from s3://{bucket}/{signals_key}: {exc}"
+            ) from exc
+        # Genuine absence of the dated file: try the previous trading days.
+        # Any other failure on a fallback day raises rather than skipping it.
+        for days_back in range(1, 8):
+            dt = date.fromisoformat(run_date) - timedelta(days=days_back)
+            try_key = f"signals/{dt}/signals.json"
+            try:
+                obj = s3.get_object(Bucket=bucket, Key=try_key)
+                signals = json.loads(obj["Body"].read())
+                logger.info("Using signals from %s (fallback)", dt)
+                break
+            except ClientError as fallback_exc:
+                if fallback_exc.response.get("Error", {}).get("Code") in _S3_NOT_FOUND_CODES:  # pyright: ignore[reportUnknownMemberType]
+                    continue
+                raise RuntimeError(
+                    f"Failed to load promoted tickers from s3://{bucket}/{try_key}: {fallback_exc}"
+                ) from fallback_exc
+            except Exception as fallback_exc:
+                raise RuntimeError(
+                    f"Failed to load promoted tickers from s3://{bucket}/{try_key}: {fallback_exc}"
+                ) from fallback_exc
+        else:
+            return []
     except Exception as exc:
         raise RuntimeError(
             f"Failed to load promoted tickers from s3://{bucket}/{signals_key}: {exc}"

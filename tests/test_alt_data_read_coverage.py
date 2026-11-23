@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 
 import pytest
+from botocore.exceptions import ClientError
 
 from features.compute import (
     AlternativeCoverageError,
@@ -104,7 +105,8 @@ class FakeS3:
             return {"Body": _Body(json.dumps({"date": "2026-07-30"}).encode())}
         if Key == f"{PREFIX}manifest.json":
             if self.omit_manifest:
-                raise KeyError(Key)
+                # Genuine absence, as S3 reports it (alpha-engine-config-I11069).
+                raise ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
             return {
                 "Body": _Body(
                     json.dumps({
