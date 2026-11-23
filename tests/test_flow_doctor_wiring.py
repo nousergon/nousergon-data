@@ -17,8 +17,8 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Iterator
 from pathlib import Path
+from typing import Any, Generator
 
 import pytest
 
@@ -26,7 +26,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 @pytest.fixture
-def stub_flow_doctor_env(monkeypatch: pytest.MonkeyPatch) -> None:
+def stub_flow_doctor_env(monkeypatch: Any) -> None:
     """Populate the env vars that flow-doctor.yaml's ${VAR} refs resolve.
 
     flow_doctor.init() substitutes these at load time. Stubs are non-empty
@@ -50,7 +50,7 @@ def stub_flow_doctor_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("EMAIL_RECIPIENTS", "test@example.com")
     monkeypatch.setenv("GMAIL_APP_PASSWORD", "stub-password")
     monkeypatch.setenv("FLOW_DOCTOR_GITHUB_TOKEN", "stub-token")
-    # config#645: flow-doctor.yaml carries the CRITICAL Telegram notifier.
+    # config#645: flow-doctor.yaml carries the critical Telegram notifier.
     # flow-doctor fails loud on an unresolved ${VAR},
     # so the wiring tests must seed them (mirrors the runtime, where the box
     # resolves them from SSM /alpha-engine/TELEGRAM_* + /alpha-engine/FLOW_DOCTOR_TELEGRAM_THREAD_*).
@@ -82,7 +82,7 @@ def temp_flow_doctor_yaml(tmp_path: Path) -> str:
 
 
 @pytest.fixture
-def reset_root_logger() -> Iterator[None]:
+def reset_root_logger() -> Generator[None, None, None]:
     """Snapshot + restore root logger handlers around each test."""
     root = logging.getLogger()
     saved = list(root.handlers)
@@ -124,7 +124,7 @@ class TestFlowDoctorYamlPresence:
         assert resolved.is_file(), f"Lambda handler resolves to {resolved}"
 
     def test_yaml_path_resolved_by_lambda_handler_under_lambda_runtime(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         # Lambda flattens lambda/handler.py to /var/task/handler.py, so
         # the original two-dirs-up resolution would land at /var/ — wrong.
@@ -249,14 +249,14 @@ class TestFlowDoctorYamlSchema:
         assert "github" in types, "github issue channel required for diagnosis"
 
     def test_yaml_notification_channels(self) -> None:
-        """Only critical reports page Telegram; other sinks stay intact."""
+        """Only critical reports page Telegram; other sinks retain their wiring."""
         import yaml
 
         with open(REPO_ROOT / "flow-doctor.yaml") as f:
             cfg = yaml.safe_load(f)
 
-        telegram = [n for n in cfg["notify"] if n.get("type") == "telegram"]
-        assert telegram == [
+        notifiers = cfg["notify"]
+        assert [n for n in notifiers if n["type"] == "telegram"] == [
             {
                 "type": "telegram",
                 "bot_token": "${TELEGRAM_BOT_TOKEN}",
@@ -267,9 +267,7 @@ class TestFlowDoctorYamlSchema:
                 "notify_on": ["critical"],
             }
         ]
-
-        non_telegram = [n for n in cfg["notify"] if n.get("type") != "telegram"]
-        assert non_telegram == [
+        assert [n for n in notifiers if n["type"] in {"email", "github", "s3"}] == [
             {
                 "type": "email",
                 "sender": "${EMAIL_SENDER}",
@@ -323,7 +321,7 @@ class TestSetupLoggingAttach:
     """
 
     def test_disabled_attaches_no_flow_doctor_handler(
-        self, monkeypatch: pytest.MonkeyPatch, reset_root_logger: None
+        self, monkeypatch: Any, reset_root_logger: Any
     ) -> None:
         monkeypatch.setenv("FLOW_DOCTOR_ENABLED", "0")
         from nousergon_lib.logging import setup_logging
@@ -339,8 +337,8 @@ class TestSetupLoggingAttach:
 
     def test_enabled_attaches_flow_doctor_handler(
         self,
-        stub_flow_doctor_env: None,
-        reset_root_logger: None,
+        stub_flow_doctor_env: Any,
+        reset_root_logger: Any,
         temp_flow_doctor_yaml: str,
     ) -> None:
         from nousergon_lib.logging import setup_logging, get_flow_doctor
@@ -359,8 +357,8 @@ class TestSetupLoggingAttach:
 
     def test_exclude_patterns_plumbed_to_handler(
         self,
-        stub_flow_doctor_env: None,
-        reset_root_logger: None,
+        stub_flow_doctor_env: Any,
+        reset_root_logger: Any,
         temp_flow_doctor_yaml: str,
     ) -> None:
         from nousergon_lib.logging import setup_logging
