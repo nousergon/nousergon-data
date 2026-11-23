@@ -132,7 +132,20 @@ _FUNCTION_TIMEOUTS_SEC = CODIFIED_FUNCTION_TIMEOUTS_SEC
 # they leave when I10655 deletes the weekly machine. If it still exists on Mon
 # 11-23 the weekly trigger is still off, and the answer is the deletion, not
 # another date.
-_KNOWN_UNBOUND_EXPIRY = "2026-11-22"
+#
+# Deadline moved 2026-11-22 -> 2026-12-07 (alpha-engine-config-I14262, red on
+# every pull request from Mon 2026-11-23: this test is calendar-driven, main
+# had no push that day, so main stayed green while each new head failed).
+# Measured 2026-11-23: 37 nousergon-data pull requests were open and the Codex
+# redo lane spent three attempts apiece on drafts whose only red was this
+# assertion (nousergon-data-PR2557 is one), then parked them. The note above
+# still holds: the answer is the deletion of ne-weekly-freshness-pipeline
+# (alpha-engine-config-I10655, still open, an irreversible delete that is
+# Brian's to rule). He is away Tue 11-24 to Fri 11-27 and reviews on Mon
+# 2026-12-07; that sitting is this date. Nothing was measured anew: the weekly
+# trigger alpha-engine-saturday was DISABLED on 2026-10-28 and the seven
+# entries are unchanged, so no budget could be chosen honestly here either.
+_KNOWN_UNBOUND_EXPIRY = "2026-12-07"
 
 _KNOWN_UNBOUND: frozenset[tuple[str, str]] = frozenset(
     {
