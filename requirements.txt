@@ -24,7 +24,13 @@ lxml>=6.1.3
 edgartools>=6.3.0
 voyageai>=0.6.0
 jsonschema>=4.26.0
-arcticdb>=6.28.3
+# Ceiling added 2026-11-23 (alpha-engine-config-I14262). arcticdb 7.0.0 was
+# published 2026-11-23 09:05Z and this floor took it the same day: a
+# static-schema update with a new column no longer names
+# StreamDescriptorMismatch in its DataError, which daily_append and the
+# migration framework key on (three tests red on every head). A major
+# version of the feature store is adopted on purpose, measured, not by drift.
+arcticdb>=6.28.3,<7
 # flow-doctor is pulled in transitively via nousergon-lib[flow-doctor].
 # NOTE: the extra MUST be hyphenated — setuptools normalizes the lib's
 # `flow_doctor` extra to `Provides-Extra: flow-doctor`; older pip doesn't
