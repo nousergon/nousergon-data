@@ -201,16 +201,23 @@ def _exited(name, ts, output):
     }
 
 
-def test_collect_state_duration_samples_extracts_poll_status():
+@pytest.mark.parametrize(
+    ("state_name", "poll_key"),
+    [
+        ("PollMorningEnrichSpot", "morning_enrich_poll"),
+        ("PollMorningArcticAppendSpot", "arctic_append_poll"),
+    ],
+)
+def test_collect_state_duration_samples_extracts_poll_status(state_name, poll_key):
     from datetime import datetime, timedelta, timezone
 
     base = datetime(2026, 7, 5, 12, 0, 0, tzinfo=timezone.utc)
     events = [
-        _entered("PollMorningArcticAppendSpot", base),
+        _entered(state_name, base),
         _exited(
-            "PollMorningArcticAppendSpot",
+            state_name,
             base + timedelta(seconds=930),
-            {"arctic_append_poll": {"Status": "Failed"}},
+            {poll_key: {"Status": "Failed"}},
         ),
     ]
 
@@ -225,11 +232,11 @@ def test_collect_state_duration_samples_extracts_poll_status():
     samples = collect_state_duration_samples(
         sf_client,
         "arn:aws:states:us-east-1:711398986525:stateMachine:ne-preopen-trading-pipeline",
-        ["PollMorningArcticAppendSpot"],
+        [state_name],
         fetch_history=fake_fetch,
     )
-    assert len(samples["PollMorningArcticAppendSpot"]) == 1
-    sample = samples["PollMorningArcticAppendSpot"][0]
+    assert len(samples[state_name]) == 1
+    sample = samples[state_name][0]
     assert sample["duration_sec"] == pytest.approx(930.0)
     assert sample["poll_status"] == "Failed"
 
@@ -708,6 +715,25 @@ def test_cache_file_round_trip_and_version_invalidation(tmp_path, monkeypatch):
     assert fc.load_sample_cache(path) == {}
 
 
+def test_cache_without_execution_data_is_invalidated(tmp_path):
+    path = tmp_path / "samples.json"
+    path.write_text(
+        _json.dumps(
+            {
+                "version": "1:d808783925f2",
+                "executions": {
+                    "machine:execution": {
+                        "durations": {"PollMorningEnrichSpot": 100},
+                        "poll_status": {},
+                    }
+                },
+            }
+        )
+    )
+
+    assert fc.load_sample_cache(str(path)) == {}
+
+
 def test_unreadable_cache_is_a_full_reread_not_an_error(tmp_path):
     path = tmp_path / "samples.json"
     path.write_text("{not json")
@@ -720,4 +746,4 @@ def test_default_fetch_asks_for_the_largest_history_page():
     events, truncated = fc._default_fetch_history(sf_client, "arn:exec")
     assert events == [] and truncated is False
     assert sf_client.get_execution_history.call_args.kwargs["maxResults"] == 1000
-    assert sf_client.get_execution_history.call_args.kwargs["includeExecutionData"] is False
+    assert sf_client.get_execution_history.call_args.kwargs["includeExecutionData"] is True

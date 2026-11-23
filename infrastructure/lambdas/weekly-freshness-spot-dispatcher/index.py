@@ -424,6 +424,38 @@ pip install --upgrade pip -q || fail "pip upgrade failed"
 if [ -f requirements.txt ]; then
   pip install -q -r requirements.txt || fail "dashboard requirements install failed"
 fi
+# Runtime backstop for ssm_log_capture --correlation-id. Keep this floor in
+# one place: requirements.txt remains the authoritative exact version to
+# install, while this assertion diagnoses a stale or otherwise malformed venv.
+.venv/bin/python - requirements.txt <<'PY' || fail "krepis floor assertion failed"
+import importlib.metadata
+import pathlib
+import re
+import sys
+
+from pip._vendor.packaging.version import Version
+
+required = Version("0.18.8")
+requirements_path = pathlib.Path(sys.argv[1])
+requirements = requirements_path.read_text(encoding="utf-8")
+# The live pin carries extras (krepis[flow-doctor, openai]==X), so allow them.
+pin_match = re.search(r"(?im)^krepis(?:\\[[^\\]]*\\])?\\s*==\\s*([^\\s;#]+)", requirements)
+pin = pin_match.group(1) if pin_match else "<no exact pin>"
+try:
+    installed = importlib.metadata.version("krepis")
+except importlib.metadata.PackageNotFoundError:
+    installed = "<not installed>"
+
+if installed == "<not installed>" or Version(installed) < required:
+    print(
+        "krepis bootstrap precondition failed: "
+        f"installed={{installed}}; required>={{required}}; "
+        f"alpha-engine-dashboard/requirements.txt pin={{pin}}; "
+        "the dashboard venv is built per boot from that file",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+PY
 chown -R ec2-user:ec2-user /home/ec2-user/alpha-engine-dashboard/.venv || fail "venv chown failed"
 deactivate
 # A SECOND venv, for alpha-engine-data's own code (alpha-engine-config-I7427).
@@ -528,7 +560,10 @@ def _terminate_instance(instance_id: str) -> None:
     spot_dispatch.terminate_on_failure(instance_id, region=REGION, label="weekly-freshness")
 
 
-def handler(event: dict[str, object], context: object) -> dict[str, object]:  # noqa: ARG001 — Lambda contract
+def handler(
+    event: dict[str, object] | None,
+    context: object,
+) -> dict[str, object]:  # noqa: ARG001 — Lambda contract
     """Step Function handler — launch the weekly pipeline's launcher spot box.
 
     `event` carries `{"force_on_demand": bool}` (defaults False). BOTH SF

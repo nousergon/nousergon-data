@@ -222,3 +222,10 @@ class TestLineageIdentity:
         assert out["launched"] is False
         assert out["reason"] == "invalid_event"
         sd.launch_with_fallback.assert_not_called()
+
+
+def test_dispatch_run_id_export_is_shell_safe_and_optional(index_mod):
+    index, _ = index_mod
+    command = index._bootstrap_command("drain-x", "false", dispatch_run_id="ledger/it's-safe.json")
+    assert "export OVERSEER_DISPATCH_RUN_ID='ledger/it'\"'\"'s-safe.json'" in command
+    assert "export OVERSEER_DISPATCH_RUN_ID=''" in index._bootstrap_command("drain-x", "false")
