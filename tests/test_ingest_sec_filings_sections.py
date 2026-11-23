@@ -197,6 +197,23 @@ def test_a_20f_maps_its_own_item_names_onto_the_corpus_labels():
     assert "history and development" not in sections[RISK]
 
 
+def test_a_roman_numeral_item_heading_yields_the_business_section():
+    html = f"""
+    <html><body>
+    <div>ITEM I. BUSINESS</div>
+    {_para("the customer platform and subscription products", 10)}
+    <div>ITEM II. PROPERTIES</div>
+    {_para("the company's offices", 4)}
+    </body></html>
+    """
+
+    business = _extract_sections(html, form_type="10-K")[BUSINESS]
+
+    assert business.startswith("ITEM I. BUSINESS")
+    assert "customer platform" in business
+    assert "company's offices" not in business
+
+
 def test_inline_xbrl_parses_without_the_xml_as_html_warning():
     from bs4 import XMLParsedAsHTMLWarning
 
