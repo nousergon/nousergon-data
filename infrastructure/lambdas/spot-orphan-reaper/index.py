@@ -66,6 +66,7 @@ import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from typing import Any, Protocol, cast
 
 import boto3
 from nousergon_lib.telegram import send_message
@@ -192,7 +193,7 @@ _SCAN_SCOPES: tuple[tuple[str, dict], ...] = (
 )
 
 
-def _scan_spot_instances(ec2) -> list[dict]:
+def _scan_spot_instances(ec2: Any) -> list[dict[str, Any]]:  # pyright: ignore[reportExplicitAny]  # untyped boto3 client (no stubs)
     """List running alpha-engine run boxes: every spot instance, plus every
     on-demand instance the launcher chokepoint tagged ``LaunchMarket=on-demand``.
 
@@ -269,7 +270,7 @@ IMPAIRED_REAP_GRACE_SECONDS = int(os.environ.get("IMPAIRED_REAP_GRACE_SECONDS", 
 _STATUS_BATCH = 100  # DescribeInstanceStatus accepts at most 100 InstanceIds
 
 
-def _impaired_since(ec2, instance_ids: list[str]) -> dict[str, datetime]:
+def _impaired_since(ec2: Any, instance_ids: list[str]) -> dict[str, datetime]:  # pyright: ignore[reportExplicitAny]  # untyped boto3 client (no stubs)
     """``{instance_id: ImpairedSince}`` for boxes whose instance status check
     reports ``impaired``. Never raises: a failed call returns what it has."""
     out: dict[str, datetime] = {}
@@ -306,15 +307,11 @@ def _impaired_since(ec2, instance_ids: list[str]) -> dict[str, datetime]:
 # eval-judge box) are all polled to completion by the SF itself.
 #
 # Scoped to the state machines named here, never to any execution-id tag:
-# other definitions' launches may outlive their execution by design. The grace
-# leaves room for an operator to look at a failed box before it goes.
+# other definitions' launches may outlive their execution by design.
 FINISHED_REAP_STATE_MACHINES = frozenset({"ne-weekly-freshness-pipeline"})
 REHEARSAL_EXECUTION_PREFIX = "rehearsal-"
-FINISHED_EXECUTION_REAP_GRACE_SECONDS = int(os.environ.get(
-    "FINISHED_EXECUTION_REAP_GRACE_SECONDS",
-    os.environ.get("REHEARSAL_REAP_GRACE_SECONDS", "3600"),
-))
 _EXECUTION_LIVE_STATUSES = frozenset({"RUNNING", "PENDING_REDRIVE"})
+_EXECUTION_TERMINAL_STATUSES = frozenset({"FAILED", "ABORTED", "TIMED_OUT", "SUCCEEDED"})
 
 
 def _early_reap_candidate(execution_arn: str) -> bool:
@@ -328,27 +325,38 @@ def _early_reap_candidate(execution_arn: str) -> bool:
     )
 
 
-def _execution_finished(sfn, execution_arn: str, now: datetime) -> bool:
-    """True iff ``execution_arn`` names an early-reap candidate execution that
-    stopped more than FINISHED_EXECUTION_REAP_GRACE_SECONDS ago.
+class _StepFunctionsClient(Protocol):
+    def describe_execution(self, *, executionArn: str) -> dict[str, object]: ...
+
+
+class _CloudWatchClient(Protocol):
+    def put_metric_data(self, *, Namespace: str, MetricData: list[dict[str, object]]) -> object: ...
+
+
+def _terminal_execution(
+    sfn: _StepFunctionsClient, execution_arn: str, now: datetime,
+) -> tuple[str, int] | None:
+    """Return terminal status and age for an eligible execution, else ``None``.
 
     Fails SAFE, the opposite direction from _completion_marker_exists: any
     error (AccessDenied before the role carries states:DescribeExecution, a
-    throttle, a deleted execution) returns False, so the box keeps its own
+    throttle, a deleted execution) returns ``None``, so the box keeps its own
     watchdog-deadline. Reaping early on a guess could end a live run."""
     if not _early_reap_candidate(execution_arn):
-        return False
+        return None
     try:
         desc = sfn.describe_execution(executionArn=execution_arn)
     except Exception as exc:  # noqa: BLE001 — fail-safe, see docstring
         logger.warning("describe_execution failed for %s (keeping deadline): %s", execution_arn, exc)
-        return False
-    if desc.get("status") in _EXECUTION_LIVE_STATUSES:
-        return False
+        return None
+    status = desc.get("status")
+    if not isinstance(status, str):
+        return None
+    if status in _EXECUTION_LIVE_STATUSES or status not in _EXECUTION_TERMINAL_STATUSES:
+        return None
     stopped = desc.get("stopDate")
-    if stopped is None:
-        return False
-    return (now - stopped).total_seconds() >= FINISHED_EXECUTION_REAP_GRACE_SECONDS
+    age_seconds = max(0, int((now - stopped).total_seconds())) if isinstance(stopped, datetime) else 0
+    return status, age_seconds
 
 
 def _completion_key(kind: WatchKind, watch_tags: dict[str, str]) -> str:
@@ -361,7 +369,7 @@ def _completion_key(kind: WatchKind, watch_tags: dict[str, str]) -> str:
     return f"{kind.completion_prefix}{'-'.join(parts)}.json"
 
 
-def _completion_marker_exists(s3, kind: WatchKind, watch_tags: dict[str, str]) -> bool:
+def _completion_marker_exists(s3: Any, kind: WatchKind, watch_tags: dict[str, str]) -> bool:  # pyright: ignore[reportExplicitAny]  # untyped boto3 client (no stubs)
     """True iff the sibling run script wrote its S3 completion marker for
     this instance's discriminator tags before the reaper's fleet-wide age cap
     fired.
@@ -439,7 +447,7 @@ def _notify_incomplete_reap(
 # alpha-engine-config-I11569 / I11108 deliverable 4 made ending a finished weekly
 # run's box the reaper's DESIGNED teardown: the weekly launcher is not
 # self-terminating (13h watchdog), so a box whose execution has stopped is ended
-# an hour later on purpose. That is not an orphan. It used to be counted on
+# on the first reaper scan. That is not an orphan. It used to be counted on
 # ``spot_orphans_terminated`` all the same, and ``alpha-engine-weekly-freshness-
 # spot-reaped`` pages on any non-zero point of that series ("the watchdog-deadline
 # tag should make this impossible"), so every finished weekly run paged an hour
@@ -448,9 +456,12 @@ def _notify_incomplete_reap(
 # ``spot_orphans_terminated`` is only a box that outlived its own deadline.
 ORPHAN_METRIC = "spot_orphans_terminated"
 FINISHED_BOX_METRIC = "finished_run_boxes_ended"
+SCAN_COUNT_METRIC = "orphan_reaper_instances_scanned"
+REAP_COUNT_METRIC = "orphan_reaper_instances_reaped"
+OLDEST_TERMINAL_AGE_METRIC = "orphan_reaper_oldest_terminal_execution_age"
 
 
-def _emit_metric(cw, name: str, count: int, metric_name: str = ORPHAN_METRIC) -> None:
+def _emit_metric(cw: Any, name: str, count: int, metric_name: str = ORPHAN_METRIC) -> None:  # pyright: ignore[reportExplicitAny]  # untyped boto3 client (no stubs)
     """Emit one CloudWatch metric data point per terminated instance group."""
     if count == 0:
         return
@@ -491,7 +502,28 @@ def _log_scan_counts(scanned: dict[str, int], terminated: dict[str, int]) -> Non
     }, sort_keys=True))
 
 
-def handler(event: dict, context) -> dict:
+def _emit_scan_metrics(
+    cw: _CloudWatchClient, scanned: int, reaped: int, oldest_terminal_age: int,
+) -> None:
+    """Emit every scan's outcome, including explicit zeros."""
+    try:
+        cw.put_metric_data(
+            Namespace="AlphaEngine/Infra",
+            MetricData=[
+                {"MetricName": SCAN_COUNT_METRIC, "Value": float(scanned), "Unit": "Count"},
+                {"MetricName": REAP_COUNT_METRIC, "Value": float(reaped), "Unit": "Count"},
+                {
+                    "MetricName": OLDEST_TERMINAL_AGE_METRIC,
+                    "Value": float(oldest_terminal_age),
+                    "Unit": "Seconds",
+                },
+            ],
+        )
+    except Exception as exc:  # noqa: BLE001 — observability must not block reaping
+        logger.warning("CloudWatch scan metrics failed: %s", exc)
+
+
+def handler(event: dict, context: object) -> dict[str, object]:
     """Hourly orphan scan + termination.
 
     Returns a summary dict for CloudWatch Logs grep + observability.
@@ -521,11 +553,14 @@ def handler(event: dict, context) -> dict:
     terminated: list[str] = []
     per_name_terminated: dict[str, int] = {}
     per_name_finished: dict[str, int] = {}
+    terminal_execution_ages: list[int] = []
     terminated_by_market: dict[str, int] = {}
     incomplete_reaps: dict[str, list[str]] = {wk.result_key: [] for wk in WATCH_KINDS}
 
     for inst in instances:
-        age = now - inst["launch_time"]
+        typed_inst = cast(dict[str, object], inst)
+        age = now - cast(datetime, typed_inst["launch_time"])
+        execution_status: str | None = None
         # ── Effective per-instance reap threshold ─────────────────────────────
         # If the launcher stamped a watchdog-deadline tag (ISO8601 UTC), use that
         # as the per-box deadline + GRACE. Otherwise fall back to the global cap
@@ -548,26 +583,29 @@ def handler(event: dict, context) -> dict:
             effective_threshold = threshold
 
         reap_reason = "deadline"
-        impaired_since = impaired.get(inst["instance_id"])
-        if age <= effective_threshold and impaired_since is not None and (
+        execution_id = cast(str, typed_inst.get("execution_id", ""))
+        if _early_reap_candidate(execution_id):
+            if sfn is None:
+                sfn = boto3.client("stepfunctions", region_name=REGION)
+            terminal = _terminal_execution(cast(_StepFunctionsClient, sfn), execution_id, now)
+            if terminal is not None:
+                execution_status, terminal_age = terminal
+                terminal_execution_ages.append(terminal_age)
+                reap_reason = (
+                    "rehearsal-finished"
+                    if execution_id.rsplit(":", 1)[-1].startswith(REHEARSAL_EXECUTION_PREFIX)
+                    else "execution-finished"
+                )
+
+        impaired_since = impaired.get(cast(str, typed_inst["instance_id"]))
+        if execution_status is not None:
+            pass
+        elif age <= effective_threshold and impaired_since is not None and (
             now - impaired_since >= impaired_grace
         ):
             reap_reason = "impaired"
         elif age <= effective_threshold:
-            execution_id = inst.get("execution_id", "")
-            if not _early_reap_candidate(execution_id):
-                continue
-            if sfn is None:
-                sfn = boto3.client("stepfunctions", region_name=REGION)
-            if not _execution_finished(sfn, execution_id, now):
-                continue
-            # Kept distinct so rehearsal reaps read the same in the log as
-            # they did under I11569.
-            reap_reason = (
-                "rehearsal-finished"
-                if execution_id.rsplit(":", 1)[-1].startswith(REHEARSAL_EXECUTION_PREFIX)
-                else "execution-finished"
-            )
+            continue
         orphans.append({
             "instance_id": inst["instance_id"],
             "name": inst["name"],
@@ -577,6 +615,7 @@ def handler(event: dict, context) -> dict:
             "market": inst["market"],
             "watchdog_deadline": watchdog_deadline_str or None,
             "reap_reason": reap_reason,
+            "execution_status": execution_status,
         })
         if DRY_RUN:
             logger.warning(
@@ -601,9 +640,12 @@ def handler(event: dict, context) -> dict:
             series[inst["name"]] = series.get(inst["name"], 0) + 1
             terminated_by_market[inst["market"]] = terminated_by_market.get(inst["market"], 0) + 1
             logger.warning(
-                "Terminated orphan %s (%s, market=%s, reason=%s, age=%ds, reap_after=%ds, type=%s)",
-                inst["instance_id"], inst["name"], inst["market"], reap_reason, int(age.total_seconds()),
-                int(effective_threshold.total_seconds()), inst["instance_type"],
+                "Terminated orphan %s (%s, market=%s, reason=%s, execution_status=%s, "
+                "age=%ds, reap_after=%ds, type=%s)",
+                inst["instance_id"], inst["name"], inst["market"], reap_reason,
+                execution_status,
+                int(age.total_seconds()), int(effective_threshold.total_seconds()),
+                cast(str, typed_inst["instance_type"]),
             )
             # WATCH_KINDS migration (additive — every other tag's reap path
             # above is unchanged): a WATCH_KINDS box reaped by the fleet-wide
@@ -626,6 +668,10 @@ def handler(event: dict, context) -> dict:
     for name, count in per_name_finished.items():
         _emit_metric(cw, name, count, FINISHED_BOX_METRIC)
     _log_scan_counts(scanned_by_market, terminated_by_market)
+    _emit_scan_metrics(
+        cast(_CloudWatchClient, cw), len(cast(list[object], instances)), len(terminated),
+        max(terminal_execution_ages, default=0),
+    )
 
     return {
         "scanned": len(instances),
