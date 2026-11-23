@@ -16,7 +16,6 @@ import importlib.util
 import re
 import sys
 from types import ModuleType
-from typing import Any
 from pathlib import Path
 from unittest.mock import patch
 
@@ -111,30 +110,37 @@ def test_alert_dedup_key_changes_with_the_finding_set(mod: ModuleType) -> None:
     assert key_a != key_b
 
 
-def test_alert_dedups_same_findings_for_24_hours_but_changed_findings_send(mod: ModuleType) -> None:
-    """An unchanged finding is quiet at the next 4-hour tick, while a changed
-    finding set mints a fresh key and sends immediately."""
-    sends = []
-    last_sent = {}
-    now_min = 0
+def test_alert_dedupes_same_findings_for_a_day_but_sends_changes(mod: ModuleType) -> None:
+    """An unchanged finding waits a day to re-page; changed drift pages now."""
+    now_minute = 0
+    sent_at: dict[str, int] = {}
+    sends: list[str] = []
 
-    def deduping_publish(message: str, **kwargs: Any) -> None:
-        key = kwargs["dedup_key"]
-        window = kwargs["dedup_window_min"]
-        if key not in last_sent or now_min - last_sent[key] >= window:
+    def fake_publish(
+        message: str,
+        *,
+        dedup_key: str,
+        dedup_window_min: int,
+        **_kwargs: object,
+    ) -> None:
+        previous = sent_at.get(dedup_key)
+        if previous is None or now_minute - previous >= dedup_window_min:
+            sent_at[dedup_key] = now_minute
             sends.append(message)
-            last_sent[key] = now_min
 
-    with patch("krepis.alerts.publish") as mock_publish:
-        mock_publish.side_effect = deduping_publish
+    changed_findings = [{**SAMPLE_FINDINGS[0], "trigger": "some-other-schedule"}]
+    with patch("krepis.alerts.publish", side_effect=fake_publish):
         mod.alert_on_findings(SAMPLE_FINDINGS)
-        now_min = 4 * 60
+        now_minute = 4 * 60
         mod.alert_on_findings(SAMPLE_FINDINGS)
-        changed = [{**SAMPLE_FINDINGS[0], "trigger": "some-other-schedule"}]
-        mod.alert_on_findings(changed)
+        assert len(sends) == 1
 
-    assert len(sends) == 2
-    assert mock_publish.call_args_list[0].kwargs["dedup_window_min"] == 24 * 60
+        mod.alert_on_findings(changed_findings)
+        assert len(sends) == 2
+
+        now_minute = 24 * 60
+        mod.alert_on_findings(SAMPLE_FINDINGS)
+        assert len(sends) == 3
 
 
 # --- CLI wiring --------------------------------------------------------------
