@@ -16,6 +16,7 @@ import importlib.util
 import re
 import sys
 from pathlib import Path
+from types import ModuleType
 from unittest.mock import patch
 
 import pytest
@@ -27,7 +28,7 @@ WORKFLOW = REPO_ROOT / ".github" / "workflows" / "pause-check-alert.yml"
 DRIFT_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "sf-arn-drift-check.yml"
 
 
-def _load_module():
+def _load_module() -> ModuleType:
     spec = importlib.util.spec_from_file_location("automation_pause_alert_test", MODULE_PATH)
     mod = importlib.util.module_from_spec(spec)
     sys.modules["automation_pause_alert_test"] = mod
@@ -36,7 +37,7 @@ def _load_module():
 
 
 @pytest.fixture(scope="module")
-def mod():
+def mod() -> ModuleType:
     return _load_module()
 
 
@@ -52,7 +53,7 @@ SAMPLE_FINDINGS = [
 
 # --- alert_on_findings() ----------------------------------------------------
 
-def test_alert_publishes_at_error_severity(mod):
+def test_alert_publishes_at_error_severity(mod: ModuleType) -> None:
     """error/critical is the only severity that reliably phone-pushes with no
     other consumer watching the channel (alpha-engine-config-I7857)."""
     with patch("krepis.alerts.publish") as mock_publish:
@@ -63,7 +64,7 @@ def test_alert_publishes_at_error_severity(mod):
     assert kwargs["source"] == "test-source"
 
 
-def test_default_source_is_stable_and_registered(mod):
+def test_default_source_is_stable_and_registered(mod: ModuleType) -> None:
     """The default source is a repo-relative literal with an alert_classes row.
 
     It used to default to ``__file__``, which in CI is the runner's absolute
@@ -86,7 +87,7 @@ def test_default_source_is_stable_and_registered(mod):
     )
 
 
-def test_alert_message_names_every_finding(mod):
+def test_alert_message_names_every_finding(mod: ModuleType) -> None:
     with patch("krepis.alerts.publish") as mock_publish:
         mod.alert_on_findings(SAMPLE_FINDINGS)
     (message,), kwargs = mock_publish.call_args
@@ -95,7 +96,7 @@ def test_alert_message_names_every_finding(mod):
     assert "paused on 2026-08-07 but live state is ENABLED" in message
 
 
-def test_alert_dedup_key_changes_with_the_finding_set(mod):
+def test_alert_dedup_key_changes_with_the_finding_set(mod: ModuleType) -> None:
     """A different finding set must mint a different dedup key, or a NEW
     drift collapses into an unresolved OLD one's dedup window and never
     pages."""
@@ -109,25 +110,49 @@ def test_alert_dedup_key_changes_with_the_finding_set(mod):
     assert key_a != key_b
 
 
-def test_alert_dedup_window_is_shorter_than_the_schedule_cadence(mod):
-    """The dedup window must not outlive the workflow's own schedule tick, or
-    an unresolved drift silently stops re-paging even though the manifest
-    still disagrees with live AWS."""
-    with patch("krepis.alerts.publish") as mock_publish:
+def test_alert_dedupes_unchanged_findings_for_24_hours(mod: ModuleType) -> None:
+    """A 4-hour rerun is quiet, while changed drift pages immediately."""
+    sent: list[str] = []
+    last_sent: dict[str, int] = {}
+    windows: list[int] = []
+    now = 0
+
+    def publish(
+        message: str,
+        *,
+        severity: str,
+        source: str,
+        dedup_key: str,
+        dedup_window_min: int,
+    ) -> None:
+        del severity, source
+        windows.append(dedup_window_min)
+        if dedup_key not in last_sent or now - last_sent[dedup_key] >= dedup_window_min:
+            sent.append(message)
+            last_sent[dedup_key] = now
+
+    changed_findings = [{**SAMPLE_FINDINGS[0], "trigger": "some-other-schedule"}]
+    with patch("krepis.alerts.publish", side_effect=publish):
         mod.alert_on_findings(SAMPLE_FINDINGS)
-    window = mock_publish.call_args.kwargs["dedup_window_min"]
-    assert window < 4 * 60, "dedup window must stay under the 4-hour schedule cadence"
+        now = 4 * 60
+        mod.alert_on_findings(SAMPLE_FINDINGS)
+        mod.alert_on_findings(changed_findings)
+
+    assert len(sent) == 2
+    assert windows == [1440, 1440, 1440]
+    assert "alpha-engine-alert-drain-2200utc" in sent[0]
+    assert "some-other-schedule" in sent[1]
 
 
 # --- CLI wiring --------------------------------------------------------------
 
-def test_alert_on_fail_requires_check(mod):
+def test_alert_on_fail_requires_check(mod: ModuleType) -> None:
     with pytest.raises(SystemExit):
         with patch.object(sys, "argv", ["automation_pause.py", "--enforce", "--alert-on-fail"]):
             mod.main()
 
 
-def test_check_without_findings_never_calls_publish(mod):
+def test_check_without_findings_never_calls_publish(mod: ModuleType) -> None:
     """A clean run must not import/call krepis at all — the whole point of
     the lazy import is that plain --check keeps needing nothing beyond the
     stdlib."""
@@ -138,7 +163,7 @@ def test_check_without_findings_never_calls_publish(mod):
     mock_publish.assert_not_called()
 
 
-def test_check_with_findings_and_alert_on_fail_calls_publish(mod):
+def test_check_with_findings_and_alert_on_fail_calls_publish(mod: ModuleType) -> None:
     with patch.object(mod, "check", return_value=SAMPLE_FINDINGS):
         with patch.object(sys, "argv", ["automation_pause.py", "--check", "--alert-on-fail"]):
             with patch("krepis.alerts.publish") as mock_publish:
@@ -146,7 +171,7 @@ def test_check_with_findings_and_alert_on_fail_calls_publish(mod):
     mock_publish.assert_called_once()
 
 
-def test_check_with_findings_and_no_alert_flag_never_calls_publish(mod):
+def test_check_with_findings_and_no_alert_flag_never_calls_publish(mod: ModuleType) -> None:
     """--alert-on-fail must be opt-in — sf-arn-drift-check.yml's existing
     bare `--check` step must not start paging as a side effect of this
     change."""
@@ -159,12 +184,12 @@ def test_check_with_findings_and_no_alert_flag_never_calls_publish(mod):
 
 # --- the workflow itself ------------------------------------------------------
 
-def test_the_workflow_exists_and_runs_check_alert_on_fail():
+def test_the_workflow_exists_and_runs_check_alert_on_fail() -> None:
     text = WORKFLOW.read_text(encoding="utf-8")
     assert "automation_pause.py --check --alert-on-fail" in text
 
 
-def test_the_check_step_carries_no_if_gate():
+def test_the_check_step_carries_no_if_gate() -> None:
     """The reachability regression test_ci_runs_the_pause_check exists to
     prevent, applied to this workflow's own step."""
     text = WORKFLOW.read_text(encoding="utf-8")
@@ -173,7 +198,7 @@ def test_the_check_step_carries_no_if_gate():
     assert "if:" not in step.split("- name:")[-1]
 
 
-def test_the_workflow_has_its_own_schedule_independent_of_the_daily_sweep():
+def test_the_workflow_has_its_own_schedule_independent_of_the_daily_sweep() -> None:
     """Deliverable 1 requires its OWN schedule, cadence in hours — not a line
     riding inside sf-arn-drift-check.yml's daily cron."""
     text = WORKFLOW.read_text(encoding="utf-8")
@@ -197,14 +222,14 @@ def test_the_workflow_has_its_own_schedule_independent_of_the_daily_sweep():
     )
 
 
-def test_the_workflow_installs_krepis_before_calling_alert_on_fail():
+def test_the_workflow_installs_krepis_before_calling_alert_on_fail() -> None:
     text = WORKFLOW.read_text(encoding="utf-8")
     assert "pip install \"krepis" in text
     run_call_idx = text.index("run: python3 infrastructure/automation_pause.py")
     assert text.index("pip install \"krepis") < run_call_idx
 
 
-def test_the_workflow_is_not_a_pull_request_check():
+def test_the_workflow_is_not_a_pull_request_check() -> None:
     """The `on:` trigger block carries no pull_request key — comments
     mentioning the term (explaining why not) are expected and fine."""
     text = WORKFLOW.read_text(encoding="utf-8")
@@ -212,7 +237,7 @@ def test_the_workflow_is_not_a_pull_request_check():
     assert "pull_request" not in on_block
 
 
-def test_deliverable_two_already_runs_enforce_alarms_only_on_a_schedule():
+def test_deliverable_two_already_runs_enforce_alarms_only_on_a_schedule() -> None:
     """Deliverable 2 (scheduled --enforce --alarms-only) is not new: it
     already runs unconditionally on sf-arn-drift-check.yml's daily cron
     trigger, independent of the groom. This test pins that it stays wired so
