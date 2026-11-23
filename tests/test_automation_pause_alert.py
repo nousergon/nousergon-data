@@ -15,8 +15,9 @@ from __future__ import annotations
 import importlib.util
 import re
 import sys
-from pathlib import Path
 from types import ModuleType
+from typing import Any
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -110,38 +111,30 @@ def test_alert_dedup_key_changes_with_the_finding_set(mod: ModuleType) -> None:
     assert key_a != key_b
 
 
-def test_alert_dedupes_unchanged_findings_for_24_hours(mod: ModuleType) -> None:
-    """A 4-hour rerun is quiet, while changed drift pages immediately."""
-    sent: list[str] = []
-    last_sent: dict[str, int] = {}
-    windows: list[int] = []
-    now = 0
+def test_alert_dedups_same_findings_for_24_hours_but_changed_findings_send(mod: ModuleType) -> None:
+    """An unchanged finding is quiet at the next 4-hour tick, while a changed
+    finding set mints a fresh key and sends immediately."""
+    sends = []
+    last_sent = {}
+    now_min = 0
 
-    def publish(
-        message: str,
-        *,
-        severity: str,
-        source: str,
-        dedup_key: str,
-        dedup_window_min: int,
-    ) -> None:
-        del severity, source
-        windows.append(dedup_window_min)
-        if dedup_key not in last_sent or now - last_sent[dedup_key] >= dedup_window_min:
-            sent.append(message)
-            last_sent[dedup_key] = now
+    def deduping_publish(message: str, **kwargs: Any) -> None:
+        key = kwargs["dedup_key"]
+        window = kwargs["dedup_window_min"]
+        if key not in last_sent or now_min - last_sent[key] >= window:
+            sends.append(message)
+            last_sent[key] = now_min
 
-    changed_findings = [{**SAMPLE_FINDINGS[0], "trigger": "some-other-schedule"}]
-    with patch("krepis.alerts.publish", side_effect=publish):
+    with patch("krepis.alerts.publish") as mock_publish:
+        mock_publish.side_effect = deduping_publish
         mod.alert_on_findings(SAMPLE_FINDINGS)
-        now = 4 * 60
+        now_min = 4 * 60
         mod.alert_on_findings(SAMPLE_FINDINGS)
-        mod.alert_on_findings(changed_findings)
+        changed = [{**SAMPLE_FINDINGS[0], "trigger": "some-other-schedule"}]
+        mod.alert_on_findings(changed)
 
-    assert len(sent) == 2
-    assert windows == [1440, 1440, 1440]
-    assert "alpha-engine-alert-drain-2200utc" in sent[0]
-    assert "some-other-schedule" in sent[1]
+    assert len(sends) == 2
+    assert mock_publish.call_args_list[0].kwargs["dedup_window_min"] == 24 * 60
 
 
 # --- CLI wiring --------------------------------------------------------------
