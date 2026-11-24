@@ -153,6 +153,6 @@ if $SMOKE; then
   RESP=$(mktemp)
   INVOKE_STDOUT=$(aws lambda invoke --function-name "${FUNCTION_NAME}" --cli-binary-format raw-in-base64-out --payload '{}' --region "${REGION}" "${RESP}")
   cat "${RESP}"; echo ""
-  assert_no_function_error "${INVOKE_STDOUT}" "${RESP}"
-  assert_json_response_field_present "${RESP}" marker_key; rm -f "${RESP}"
+  assert_no_function_error "${INVOKE_STDOUT}" "${RESP}"; rm -f "${RESP}"
+  assert_json_response_has_field "${RESP}" "marker_key" "sentinel must write its live verdict marker"
 fi

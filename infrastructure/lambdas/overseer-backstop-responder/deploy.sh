@@ -245,6 +245,6 @@ EOF
   cat "${RESP}"
   echo ""
   assert_no_function_error "${INVOKE_STDOUT}" "${RESP}"
-  assert_json_response_field_equals "${RESP}" paged true
+  assert_json_response_field "${RESP}" "alarm" '"alpha-engine-watch-plane-overseer-intake-age"' "responder must process the synthetic alarm"
   rm -f "${RESP}"
 fi

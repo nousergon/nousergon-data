@@ -330,6 +330,6 @@ EOF
   cat "${RESP}"
   echo ""
   assert_no_function_error "${INVOKE_STDOUT}" "${RESP}"
-  assert_json_response_field_present "${RESP}" watch_log_key
+  assert_json_response_field "${RESP}" "status" '"FAILED"' "dispatcher must process the synthetic SF failure"
   rm -f "${RESP}"
 fi

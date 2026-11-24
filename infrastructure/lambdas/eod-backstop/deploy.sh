@@ -337,7 +337,7 @@ if $SMOKE; then
     "${RESP}")
   cat "${RESP}"
   echo ""
-  # SMOKE_SEMANTIC_EXEMPTION: the safe smoke outcome depends on the trading calendar and live EOD state; forcing start_eod would have a real side effect.
   assert_no_function_error "${INVOKE_STDOUT}" "${RESP}"
+  # SMOKE_SEMANTIC_EXEMPTION: started_eod requires a trading day with no current or completed EOD; smoke must not manufacture that live recovery condition.
   rm -f "${RESP}"
 fi

@@ -267,7 +267,7 @@ if $SMOKE; then
   INVOKE_STDOUT=$(aws lambda invoke --function-name "${FUNCTION_NAME}" --cli-binary-format raw-in-base64-out \
     --payload '{}' --region "${REGION}" "${RESP}")
   cat "${RESP}"; echo ""
-  # SMOKE_SEMANTIC_EXEMPTION: the empty payload is intentionally not an EC2 reclaim event, so no reclaim can be exercised on demand.
   assert_no_function_error "${INVOKE_STDOUT}" "${RESP}"
+  # SMOKE_SEMANTIC_EXEMPTION: reclaim success requires a real EC2 reclaim EventBridge event; the empty smoke payload can only exercise the documented no-op path.
   rm -f "${RESP}"
 fi
