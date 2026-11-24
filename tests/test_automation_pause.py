@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: ANN001, ANN002, ANN003, ANN201, ANN202, ANN204, ANN205, ANN206
 """The scheduled-automation pause must stay a record, not a comment.
 
 Brian ruling 2026-08-07: every scheduled AWS trigger disabled except the weekly
@@ -954,8 +955,7 @@ def classified_world(module, monkeypatch, request):
         # fix is to stub the enumeration rather than each view of it.
         monkeypatch.setattr(
             module, "_live_alarm_actions",
-            lambda: {n: {"enabled": e, "breaching": True, "backstop": False}
-                     for n, e in live.items()})
+            lambda: {n: {"enabled": e, "breaching": True} for n, e in live.items()})
     return live
 
 
@@ -1127,20 +1127,32 @@ def test_an_undeclared_breaching_alarm_is_a_finding(module, monkeypatch,
     assert ("alpha-engine-brand-new-probe-dead", "alarm-undeclared") in kinds
 
 
-@pytest.mark.parametrize("action_field", ["aa", "oa"])
+@pytest.mark.real_alarm_scan
+@pytest.mark.parametrize("action_field", ["AlarmActions", "OKActions"])
 def test_an_undeclared_not_breaching_backstop_alarm_is_a_finding(
         module, monkeypatch, action_field):
-    """A backstop route pages on transitions, including an OKActions-only route."""
-    row = {"n": "alpha-engine-new-transition-page", "e": True,
-           "b": "notBreaching", "aa": [], "oa": []}
-    row[action_field] = [
-        "arn:aws:sns:us-east-1:123456789012:alpha-engine-alarm-backstop"]
-    monkeypatch.setattr(module, "_live_alarm_actions", lambda: {
-        row["n"]: {"enabled": True, "breaching": False,
-                   "backstop": module._routes_to_backstop(row)}})
-    findings = module.alarm_coverage_findings()
-    assert ("alpha-engine-new-transition-page", "alarm-undeclared") in {
-        (finding["trigger"], finding["kind"]) for finding in findings}
+    """A backstop route pages on transitions even when missing data is benign."""
+    source = {
+        action_field: [
+            "arn:aws:sns:us-east-1:123456789012:alpha-engine-alarm-backstop"
+        ]
+    }
+
+    def fake_aws(args):
+        query = args[args.index("--query") + 1]
+        assert "AlarmActions" in query and "OKActions" in query
+        actions = source.get("AlarmActions", []) + source.get("OKActions", [])
+        row = {
+            "n": "alpha-engine-brand-new-transition-alarm",
+            "e": True,
+            "b": "notBreaching",
+            "p": any("alpha-engine-alarm-backstop" in action for action in actions),
+        }
+        return 0, json.dumps({"a": [row], "t": None}), ""
+
+    monkeypatch.setattr(module, "_aws", fake_aws)
+    kinds = {(f["trigger"], f["kind"]) for f in module.alarm_coverage_findings()}
+    assert ("alpha-engine-brand-new-transition-alarm", "alarm-undeclared") in kinds
 
 
 def test_a_hand_muted_armed_alarm_is_a_finding(module, monkeypatch, classified_world):
@@ -1172,10 +1184,8 @@ def test_describe_alarms_pagination_is_followed(module, monkeypatch):
     network.
     """
     pages = [
-        ('{"a": [{"n": "a1", "e": true, "b": "breaching", "aa": [], "oa": []}], '
-         '"t": "tok"}', None),
-        ('{"a": [{"n": "a2", "e": false, "b": "breaching", "aa": [], "oa": []}], '
-         '"t": null}', "tok"),
+        ('{"a": [{"n": "a1", "e": true, "b": "breaching"}], "t": "tok"}', None),
+        ('{"a": [{"n": "a2", "e": false, "b": "breaching"}], "t": null}', "tok"),
     ]
     seen: list[str | None] = []
 
@@ -1186,7 +1196,7 @@ def test_describe_alarms_pagination_is_followed(module, monkeypatch):
         return 0, body, ""
 
     monkeypatch.setattr(module, "_aws", fake_aws)
-    assert module._live_pageable_alarms() == {"a1": True, "a2": False}
+    assert module._live_breaching_alarms() == {"a1": True, "a2": False}
     assert seen == [None, "tok"], "the second page was never requested"
 
 

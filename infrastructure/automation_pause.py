@@ -159,7 +159,6 @@ import subprocess
 import sys
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import cast
 
 MANIFEST = Path(__file__).parent.resolve() / "automation_pause.json"
 
@@ -618,17 +617,8 @@ def _alarm_actions_enabled(name: str) -> bool | None:
     return out == "True"
 
 
-def _routes_to_backstop(alarm: dict[str, object]) -> bool:
-    actions = alarm.get("aa"), alarm.get("oa")
-    return any(
-        isinstance(action, str) and "alpha-engine-alarm-backstop" in action
-        for group in actions if isinstance(group, list)
-        for action in cast(list[object], group)
-    )
-
-
 def _live_alarm_actions() -> dict[str, dict[str, bool]]:
-    """``{alarm name: {"enabled": ActionsEnabled, "breaching": bool}}`` for EVERY live alarm.
+    """Live action state and completeness attributes for every alarm.
 
     One enumeration, two populations, because the manifest is graded against
     both and two independent scans of the same account can disagree with each
@@ -654,7 +644,8 @@ def _live_alarm_actions() -> dict[str, dict[str, bool]]:
             "cloudwatch", "describe-alarms", "--max-items", "100",
             "--query",
             "{a: MetricAlarms[].{n: AlarmName, e: ActionsEnabled, "
-            "b: TreatMissingData, aa: AlarmActions, oa: OKActions}, t: NextToken}",
+            "b: TreatMissingData, p: contains(to_string([AlarmActions, OKActions]), "
+            "'alpha-engine-alarm-backstop')}, t: NextToken}",
             "--output", "json",
         ]
         if token:
@@ -662,30 +653,29 @@ def _live_alarm_actions() -> dict[str, dict[str, bool]]:
         rc, out, err = _aws(args)
         if rc != 0:
             raise RuntimeError(f"aws cloudwatch describe-alarms: {err}")
-        page = cast(dict[str, object], json.loads(out or "{}"))
-        rows = page.get("a")
-        for row_value in cast(list[object], rows) if isinstance(rows, list) else []:
-            row = cast(dict[str, object], row_value)
-            name = row.get("n")
-            if not isinstance(name, str):
-                continue
-            alarms[name] = {
+        page = json.loads(out or "{}")
+        for row in page.get("a") or []:
+            alarms[row["n"]] = {
                 "enabled": bool(row["e"]),
                 "breaching": row.get("b") == "breaching",
-                "backstop": _routes_to_backstop(row),
+                "paging": row["p"] is True if "p" in row else False,
             }
-        next_token = page.get("t")
-        token = next_token if isinstance(next_token, str) else None
+        token = page.get("t")
         if not token:
             return alarms
 
 
-def _live_pageable_alarms() -> dict[str, bool]:
-    """Alarms completeness must classify: silence-latching or backstop-routed."""
+def _live_breaching_alarms() -> dict[str, bool]:  # pyright: ignore[reportUnusedFunction]
+    """``{alarm name: ActionsEnabled}`` for every live alarm that latches on silence."""
+    return {n: v["enabled"] for n, v in _live_alarm_actions().items() if v["breaching"]}
+
+
+def _live_graded_alarms() -> dict[str, bool]:
+    """Alarms that can page: silence-latching or routed to the backstop topic."""
     return {
-        name: alarm["enabled"]
-        for name, alarm in _live_alarm_actions().items()
-        if alarm["breaching"] or alarm.get("backstop", False)
+        name: attributes["enabled"]
+        for name, attributes in _live_alarm_actions().items()
+        if attributes["breaching"] or attributes.get("paging", False)
     }
 
 
@@ -1030,8 +1020,8 @@ def alarm_coverage_findings() -> list[dict]:
     """Is every silence-latching alarm CLASSIFIED — not merely every listed one?
 
     ``alarm_findings()`` above grades the entries that exist. This grades the
-    ones that do not: any live alarm with ``TreatMissingData=breaching`` or an
-    AlarmActions/OKActions route to ``alpha-engine-alarm-backstop`` in
+    ones that do not: any live alarm with ``TreatMissingData=breaching`` or
+    whose AlarmActions/OKActions route to ``alpha-engine-alarm-backstop`` in
     neither ``paused_alarms`` nor ``armed_alarms``, and any ``armed_alarms``
     entry that has been silenced or has vanished. Without this, the manifest can
     only ever be as complete as whatever was firing on the day someone wrote it.
@@ -1043,7 +1033,7 @@ def alarm_coverage_findings() -> list[dict]:
     # operator runs the delete it is still live (and still muted); afterwards
     # it is gone. Both states are the declaration holding, not a finding.
     declared_retired = retired_alarm_names()
-    live = _live_pageable_alarms()
+    live = _live_graded_alarms()
 
     # ── an UNDECLARED mute, of any alarm (alpha-engine-config-I8047) ────────
     #
@@ -1075,8 +1065,9 @@ def alarm_coverage_findings() -> list[dict]:
         out.append({
             "trigger": name, "surface": "cloudwatch", "kind": "alarm-undeclared",
             "detail": (
-                "it can latch ALARM on silence or route a transition to the "
-                "alarm backstop, but it appears in neither paused_alarms nor "
+                "it can page (by latching ALARM on silence or routing a state "
+                "transition to alpha-engine-alarm-backstop), but it appears in "
+                "neither paused_alarms nor "
                 "armed_alarms. Classify it: add it to paused_alarms with the "
                 "trigger(s) it watches if it is quiet because they are paused, "
                 "or to armed_alarms with a one-line reason if it watches "
@@ -1090,9 +1081,9 @@ def alarm_coverage_findings() -> list[dict]:
             out.append({
                 "trigger": name, "surface": "cloudwatch", "kind": "armed-missing-in-aws",
                 "detail": (
-                    "declared in armed_alarms but no live alarm of that name is "
-                    "breaching or routes to the alarm backstop — it was deleted, "
-                    "renamed, or its routing changed, and whatever it detected is "
+                    "declared in armed_alarms but no live alarm of that name can page "
+                    "through the graded population — it was deleted, renamed, or its "
+                    "routing/missing-data treatment changed, and whatever it detected is "
                     "now undetected. Remove or correct the entry."
                 ),
             })

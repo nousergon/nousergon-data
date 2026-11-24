@@ -301,10 +301,10 @@
       "reason": "daily freshness of the router degraded-mode drill heartbeat; running."
     },
     "alpha-engine-director-plan-latency": {
-      "reason": "Director plan-LLM latency threshold on the weekly pipeline (alpha-engine-config-I7311/I8118). TreatMissingData=notBreaching because absence belongs to the separate no-datapoint detector, but this alarm's backstop action still pages when measured latency crosses the threshold; the Director stage is running, so it remains armed."
+      "reason": "ARMED (alpha-engine-config-I7360). Director plan-LLM latency alarm for the running weekly pipeline. TreatMissingData=notBreaching because alpha-engine-director-plan-no-datapoint owns absence, but this alarm routes its state transitions to alpha-engine-alarm-backstop and can therefore page."
     },
     "alpha-engine-watch-plane-overseer-intake-dlq-age": {
-      "reason": "Oldest-message age on the overseer intake DLQ against its 14-day retention (alpha-engine-config-I8111/I8120). TreatMissingData=notBreaching because an empty SQS queue emits no age metric, but its backstop action pages before queued messages expire. Brian's I8120 ruling keeps observation armed while alert-drain is paused; only redrive is reactivation-gated."
+      "reason": "ARMED (alpha-engine-config-I7360, I8111/I8120). ApproximateAgeOfOldestMessage on the overseer intake DLQ warns before its 14-day retention expires. TreatMissingData=notBreaching is required because SQS emits no age metric for an empty queue, but its backstop route can page. Brian ruled that a pause suspends action, not observation, so it remains armed while redrive is paused."
     },
     "crucible-v2-sweep-missing": {
       "reason": "Crucible v2 sweep-liveness alarm, alarms to SNS crucible-v2-pages, TreatMissingData=breaching. Verified live 2026-09-04: State=OK, ActionsEnabled=true. ARMED - Crucible v2 build infrastructure, live and genuinely running, out of scope for the 2026-08-07 v1 pause for the same reason as the crucible-v2/* Scheduler schedules it watches (crucible-v2/heartbeat et al. in not_paused above). Found 2026-09-04 by automation_pause.py's alarm-undeclared check, added by PR1637 the same day. alpha-engine-config-I9994."
