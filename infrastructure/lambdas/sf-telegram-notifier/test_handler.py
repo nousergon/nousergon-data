@@ -5,6 +5,8 @@ Telegram API. Each test asserts the exact (text, disable_notification) tuple
 the handler hands to the primitive, plus the return value shape.
 """
 
+# ruff: noqa: ANN001, ANN002, ANN003, ANN201, ANN202, ANN204
+
 from __future__ import annotations
 
 import io
@@ -15,6 +17,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+import nousergon_lib.pipeline_status as _pipeline_status_mod
 
 # Stub `nousergon_lib.telegram` + `nousergon_lib.flow_doctor_fleet` before
 # importing the handler so test environments without the lib installed (CI
@@ -44,9 +47,11 @@ _fleet_mod.PIPELINE_OBSERVER_TELEGRAM_TOPICS = (
     _FleetTelegramTopic.OPS_HEALTH,
 )
 _lib_pkg.flow_doctor_fleet = _fleet_mod
+_lib_pkg.pipeline_status = _pipeline_status_mod
 sys.modules["nousergon_lib"] = _lib_pkg
 sys.modules["nousergon_lib.telegram"] = _telegram_mod
 sys.modules["nousergon_lib.flow_doctor_fleet"] = _fleet_mod
+sys.modules["nousergon_lib.pipeline_status"] = _pipeline_status_mod
 
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -194,6 +199,61 @@ def test_succeeded_long_duration_formats_hours_and_minutes():
     index.handler(event, None)
     text = _telegram_mod.send_message.call_args.args[0]
     assert "Duration: 4h 12m" in text
+
+
+def _state_entered(name: str) -> dict:
+    return {"type": "PassStateEntered", "stateEnteredEventDetails": {"name": name}}
+
+
+def test_short_completed_weekly_execution_keeps_success_headline(reset_send_message):
+    completed_states = (
+        "WaitForCollectionManifests",
+        "RAGIngestion",
+        "Scanner",
+        "SignalsEnvelope",
+        "PredictorTraining",
+        "DataPhase2",
+        "EvalRollingMean",
+        "Backtester",
+        "ParityParallel",
+        "PitParityCompare",
+        "ModelZooSelect",
+        "ModelZooTrainMap",
+        "EvaluatorDiagnostics",
+        "EvaluatorOptimize",
+        "ReportCard",
+        "Director",
+    )
+    reset_send_message.get_execution_history.return_value = {
+        "events": [_state_entered(name) for name in completed_states]
+    }
+    index.handler(_event("SUCCEEDED", stopDate=1_700_000_003_000), None)
+
+    headline = _telegram_mod.send_message.call_args.args[0].splitlines()[0]
+    assert headline.startswith("✅ *Weekly Freshness SF — SUCCEEDED*")
+
+
+def test_long_declared_weekly_gate_out_has_skipped_headline(reset_send_message):
+    reset_send_message.get_execution_history.return_value = {
+        "events": [
+            _state_entered("InitializeInput"),
+            _state_entered("WeeklyRunDaySkip"),
+        ]
+    }
+    index.handler(_event("SUCCEEDED", stopDate=1_700_000_900_000), None)
+
+    headline = _telegram_mod.send_message.call_args.args[0].splitlines()[0]
+    assert headline == "⏭️ *Weekly Freshness SF — SKIPPED — not a run day*"
+    assert "Duration: 15m" in _telegram_mod.send_message.call_args.args[0]
+
+
+def test_unavailable_weekly_history_does_not_claim_gate_out(reset_send_message):
+    reset_send_message.get_execution_history.side_effect = RuntimeError("history unavailable")
+    index.handler(_event("SUCCEEDED"), None)
+
+    headline = _telegram_mod.send_message.call_args.args[0].splitlines()[0]
+    assert headline.startswith("✅ *Weekly Freshness SF — SUCCEEDED*")
+    assert "SKIPPED" not in headline
 
 
 def test_failed_fetches_and_includes_cause(reset_send_message):
