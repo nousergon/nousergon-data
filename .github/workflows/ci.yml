@@ -160,7 +160,7 @@ jobs:
         run: |
           set -euo pipefail
           pip install --quiet basedpyright==1.40.2 ruff==0.14.14
-          basedpyright --pythonpath "$(command -v python)"
+          basedpyright --baselinemode=auto --pythonpath "$(command -v python)"
           if ! git diff --quiet -- .basedpyright/baseline.json; then
             echo "::warning::type errors were fixed but .basedpyright/baseline.json was not shrunk; run basedpyright locally and commit the smaller baseline."
             git checkout -- .basedpyright/baseline.json
