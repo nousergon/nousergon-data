@@ -221,47 +221,59 @@ def test_self_heal_backfills_pstg_via_yfinance_and_invokes_per_ticker_backfill()
     )
 
 
-def test_self_heal_refetches_full_history_when_adjusted_overlap_changes():
-    """A dividend adjustment visible on the overlap must restate old rows."""
+def test_self_heal_refetches_history_when_dividend_changes_overlap() -> None:
+    """A dividend in the append window restates the overlapping adjusted close.
+
+    The overlap mismatch must turn the append into a full-history refresh so
+    pre-dividend rows and newly appended rows cannot land on different scales.
+    """
     from weekly_collector import _self_heal_chronic_polygon_gaps
 
     universe_lib = _stub_universe_lib({"PSTG": "2026-05-05"})
     existing = pd.DataFrame(
-        {"Open": 100.0, "High": 101.0, "Low": 99.0, "Close": 100.0, "Volume": 1_000},
-        index=pd.DatetimeIndex(["2026-05-02", "2026-05-05"]),
-    )
-    incremental = pd.DataFrame(
         {
-            "Open": [99.5, 101.0], "High": [100.5, 102.0],
-            "Low": [98.5, 100.0], "Close": [99.5, 101.0], "Volume": [1_000, 1_100],
+            "Open": [99.0, 100.0, 101.0],
+            "High": [100.0, 101.0, 102.0],
+            "Low": [98.0, 99.0, 100.0],
+            "Close": [99.0, 100.0, 101.0],
+            "Volume": [1_000, 1_000, 1_000],
+        },
+        index=pd.DatetimeIndex(["2026-05-01", "2026-05-04", "2026-05-05"]),
+    )
+    s3 = _stub_s3_with_pcache({"PSTG": existing})
+    overlap_fetch = pd.DataFrame(
+        {
+            "Open": [100.0, 102.0], "High": [101.0, 103.0],
+            "Low": [99.0, 101.0], "Close": [100.0, 102.0],
+            "Volume": [1_000, 1_200],
         },
         index=pd.DatetimeIndex(["2026-05-05", "2026-05-06"]),
     )
-    full = pd.DataFrame(
-        {
-            "Open": [99.5, 99.5, 101.0], "High": [100.5, 100.5, 102.0],
-            "Low": [98.5, 98.5, 100.0], "Close": [99.5, 99.5, 101.0],
-            "Volume": [1_000, 1_000, 1_100],
-        },
-        index=pd.DatetimeIndex(["2026-05-02", "2026-05-05", "2026-05-06"]),
-    )
-    s3 = _stub_s3_with_pcache({"PSTG": existing})
+    restated = existing.copy()
+    restated[["Open", "High", "Low", "Close"]] *= 100.0 / 101.0
+    restated = pd.concat([restated, overlap_fetch.loc[[pd.Timestamp("2026-05-06")]]])
+    yf_download = MagicMock(side_effect=[overlap_fetch, restated])
 
     with patch("weekly_collector.boto3.client", return_value=s3), \
          patch("store.arctic_store.get_universe_lib", return_value=universe_lib), \
-         patch("yfinance.download", side_effect=[incremental, full]) as download, \
+         patch("yfinance.download", yf_download), \
          patch("builders.backfill.backfill"):
         result = _self_heal_chronic_polygon_gaps(
-            bucket="test-bucket", target_date="2026-05-06", chronic_tickers=["PSTG"]
+            bucket="test-bucket",
+            target_date="2026-05-06",
+            chronic_tickers=["PSTG"],
         )
 
-    assert len(result["healed"]) == 1
-    assert download.call_count == 2
-    assert download.call_args_list[1].kwargs["period"] == "max"
-    written = pd.read_parquet(io.BytesIO(
-        s3.written["reference/price_cache/PSTG.parquet"]
-    ))
-    assert written.loc[pd.Timestamp("2026-05-02"), "Close"] == 99.5
+    assert yf_download.call_count == 2
+    assert yf_download.call_args_list[0].kwargs["start"] == "2026-05-05"
+    assert yf_download.call_args_list[1].kwargs["start"] == "2026-05-01"
+    written = pd.read_parquet(
+        io.BytesIO(s3.written["reference/price_cache/PSTG.parquet"])
+    )
+    assert written.loc[pd.Timestamp("2026-05-01"), "Close"] == pytest.approx(
+        restated.loc[pd.Timestamp("2026-05-01"), "Close"]
+    )
+    assert result["healed"][0]["rows_added"] == 1
 
 
 def test_self_heal_dry_run_skips_writes_and_backfill_invocation():
