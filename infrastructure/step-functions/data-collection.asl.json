@@ -13,24 +13,45 @@
         "verify_units.$": "$.verify_units",
         "started_at.$": "$$.Execution.StartTime"
       },
-      "Next": "TradingDayCheck"
+      "Next": "ResolveDataRevision"
+    },
+    "ResolveDataRevision": {
+      "Type": "Task",
+      "Comment": "Resolve the data repository branch once per execution. Every workload and its on-demand retry receives this immutable commit; resolution failure fails loud through NotifyFailure.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {"FunctionName": "${DispatcherFunctionArn}", "Payload": {"action": "resolve-data-revision"}},
+      "ResultSelector": {"sha.$": "$.Payload.data_revision.sha"},
+      "ResultPath": "$.data_revision",
+      "Retry": [{"ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"], "IntervalSeconds": 5, "MaxAttempts": 3, "BackoffRate": 2}],
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure"}],
+      "Next": "CheckRequireTradingDay"
+    },
+    "CheckRequireTradingDay": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.require_trading_day",
+          "BooleanEquals": true,
+          "Next": "TradingDayCheck"
+        }
+      ],
+      "Default": "RunWorkloads"
     },
     "TradingDayCheck": {
       "Type": "Task",
-      "Comment": "Resolve the data repository branch once per execution. Every workload attempt receives this immutable commit; resolution failure fails the execution rather than silently using a later branch head.",
+      "Comment": "The dispatcher answers from krepis.trading_calendar for today's America/New_York date. It launches nothing for this action.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "${DispatcherFunctionArn}",
         "Payload": {
-          "action": "prepare-execution"
+          "action": "trading-day-check"
         }
       },
       "ResultSelector": {
-        "code_sha.$": "$.Payload.code_sha",
         "date.$": "$.Payload.trading_day.date",
         "is_trading_day.$": "$.Payload.trading_day.is_trading_day"
       },
-      "ResultPath": "$.preparation",
+      "ResultPath": "$.trading_day",
       "Retry": [
         {
           "ErrorEquals": [
@@ -51,24 +72,13 @@
           "Next": "NotifyFailure"
         }
       ],
-      "Next": "CheckRequireTradingDay"
-    },
-    "CheckRequireTradingDay": {
-      "Type": "Choice",
-      "Choices": [
-        {
-          "Variable": "$.require_trading_day",
-          "BooleanEquals": true,
-          "Next": "IsTradingDay"
-        }
-      ],
-      "Default": "RunWorkloads"
+      "Next": "IsTradingDay"
     },
     "IsTradingDay": {
       "Type": "Choice",
       "Choices": [
         {
-          "Variable": "$.preparation.is_trading_day",
+          "Variable": "$.trading_day.is_trading_day",
           "BooleanEquals": true,
           "Next": "RunWorkloads"
         }
@@ -88,7 +98,7 @@
         "workload.$": "$$.Map.Item.Value",
         "execution_id.$": "$$.Execution.Id",
         "pipeline_role.$": "$.collection",
-        "code_sha.$": "$.preparation",
+        "data_revision.$": "$.data_revision.sha",
         "force_on_demand": false,
         "attempts": 0
       },
@@ -107,7 +117,7 @@
                 "workload.$": "$.workload",
                 "execution_id.$": "$.execution_id",
                 "pipeline_role.$": "$.pipeline_role",
-                "code_sha.$": "$.code_sha",
+                "data_revision.$": "$.data_revision",
                 "force_on_demand.$": "$.force_on_demand"
               }
             },
@@ -233,7 +243,7 @@
               "workload.$": "$.workload",
               "execution_id.$": "$.execution_id",
               "pipeline_role.$": "$.pipeline_role",
-              "code_sha.$": "$.code_sha",
+              "data_revision.$": "$.data_revision",
               "force_on_demand": true,
               "attempts.$": "States.MathAdd($.attempts, 1)"
             },
