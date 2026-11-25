@@ -11,6 +11,10 @@ Usage:
     python -m builders.daily_append --dry-run                # compute but skip write
 """
 
+# Legacy ArcticDB/SDK seams in this module are dynamically typed.
+# ruff: noqa: ANN001, ANN201, ANN202, ANN204
+
+
 from __future__ import annotations
 
 import argparse
@@ -50,6 +54,7 @@ from features.compute import (
     _load_sub_sector_etf_map,
     _load_cached_fundamentals,
     _load_cached_alternative,
+    assert_alternative_arctic_coverage,
 )
 from arcticdb.version_store.library import ReadRequest, UpdatePayload, WritePayload
 from arcticdb_ext.version_store import DataError
@@ -2018,6 +2023,7 @@ def _daily_append_impl(
     )
     fundamentals = _load_cached_fundamentals(s3, bucket, date_str)
     alt_data = _load_cached_alternative(s3, bucket)
+    assert_alternative_arctic_coverage(alt_data)
 
     if not dry_run:
         universe_lib = get_universe_lib(bucket)

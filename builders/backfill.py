@@ -16,6 +16,10 @@ Usage:
     python -m builders.backfill --validate               # backfill + spot-check validation
 """
 
+# Legacy ArcticDB/SDK seams in this module are dynamically typed.
+# ruff: noqa: ANN001, ANN201, ANN202, ANN204
+
+
 from __future__ import annotations
 
 import argparse
@@ -54,6 +58,7 @@ from features.compute import (
     _load_sector_map,
     _load_cached_fundamentals,
     _load_cached_alternative,
+    assert_alternative_arctic_coverage,
     make_source_series,
 )
 from corporate_actions import CorporateActionAuditError
@@ -1131,6 +1136,7 @@ def backfill(
 
     fundamentals = _load_cached_fundamentals(s3, bucket, today_str)
     alt_data = _load_cached_alternative(s3, bucket)
+    assert_alternative_arctic_coverage(alt_data)
 
     # Defense-in-depth: refuse to write if planned data is older than what
     # ArcticDB has. Skipped on per-ticker invocations (those route through

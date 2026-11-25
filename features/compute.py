@@ -1480,6 +1480,10 @@ class AlternativeLoad(dict):
     """
 
     short: bool = False
+    #: Producer count from ``manifest.json``.  ArcticDB writers use this to
+    #: distinguish a tolerable partial read from a load that must not be
+    #: written (alpha-engine-config-I13104).
+    manifest_count: int | None = None
     #: Features in :data:`UNPUBLISHED_FIELD_GRACE` whose producer field NO
     #: loaded payload carries (alpha-engine-config-I13143): the partition
     #: predates the producer, so the column cannot vary yet.
@@ -1646,6 +1650,7 @@ def _load_cached_alternative(
             )
 
         expected = _expected_alternative_count(s3, bucket, prefix)
+        alt_data.manifest_count = expected
         if expected is None:
             log.warning(
                 "Alternative data: no readable manifest at %smanifest.json — "
@@ -1692,6 +1697,31 @@ def _load_cached_alternative(
             f"({type(exc).__name__}: {exc}). Every alternative feature would be "
             "0.0 for the whole universe and indistinguishable from a genuine zero."
         ) from exc
+
+
+ALTERNATIVE_ARCTIC_MAX_SHORTFALL_PCT = 2
+
+
+def assert_alternative_arctic_coverage(alt_data: AlternativeLoad) -> None:
+    """Refuse an ArcticDB write when a short load misses over 2% of its manifest.
+
+    Snapshot publication retains its existing row-level NaN behaviour.  This
+    guard is called only by feature writers whose neutral defaults would
+    otherwise conceal the missing payloads from predictor inputs.
+    """
+    expected = alt_data.manifest_count
+    if not alt_data.short or expected is None:
+        return
+    missing = max(expected - len(alt_data), 0)
+    shortfall_pct = 100.0 * missing / expected if expected else 0.0
+    message = (
+        "Alternative data coverage SHORT before ArcticDB feature write: "
+        f"loaded {len(alt_data)} of {expected}; {missing} missing "
+        f"({shortfall_pct:.1f}%)."
+    )
+    if expected > 0 and missing * 100 > expected * ALTERNATIVE_ARCTIC_MAX_SHORTFALL_PCT:
+        raise AlternativeCoverageError(message)
+    log.error("%s Existing feature defaults will be preserved.", message)
 
 
 def _expected_alternative_count(

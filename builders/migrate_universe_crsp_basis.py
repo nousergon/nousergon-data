@@ -110,6 +110,10 @@ Usage::
     python -m builders.migrate_universe_crsp_basis --reconcile-start 2020-01-01
 """
 
+# Legacy ArcticDB/SDK seams in this module are dynamically typed.
+# ruff: noqa: ANN001, ANN201, ANN202, ANN204
+
+
 from __future__ import annotations
 
 import argparse
@@ -130,7 +134,11 @@ import numpy as np
 import pandas as pd
 
 import corporate_actions as ca
-from features.compute import DEFAULT_BUCKET
+from features.compute import (
+    DEFAULT_BUCKET,
+    AlternativeLoad,
+    assert_alternative_arctic_coverage,
+)
 from store.arctic_store import (
     TOTAL_RETURN_COL,
     get_scratch_universe_lib,
@@ -1915,6 +1923,8 @@ def migrate_universe_crsp_basis(
             from features.compute import _load_cached_alternative
 
             alt_data = _load_cached_alternative(s3, bucket)
+        if isinstance(alt_data, AlternativeLoad):
+            assert_alternative_arctic_coverage(alt_data)
     macro = macro or {}
     sector_map = sector_map or {}
     fundamentals = fundamentals or {}
