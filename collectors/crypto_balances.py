@@ -28,7 +28,7 @@ import urllib.parse
 import urllib.request
 from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 logger = logging.getLogger("crypto_balances")
 
@@ -276,7 +276,7 @@ def collect(
     eth_token_fetcher: Callable[[str], list[dict]] | None = None,
     now: datetime | None = None,
     dry_run: bool = False,
-) -> dict:
+) -> dict[str, object]:
     """Read the wallet-address universe, fetch balances + prices, write ``crypto/holdings.json``.
 
     Returns a small status dict. ``s3_client`` + the fetchers are injectable for tests.
@@ -290,10 +290,15 @@ def collect(
         s3_client = boto3.client("s3")
 
     universe = _read_json(s3_client, bucket, WALLET_ADDRESSES_KEY)
-    addresses = (universe or {}).get("addresses", [])
+    if universe is None:
+        logger.warning("[crypto_balances] wallet-address input unreadable — nothing to do")
+        return {"status": "skipped", "reason": "wallet-address input unreadable"}
+
+    typed_universe = cast(dict[str, object], universe)
+    addresses = cast(list[dict[str, object]], typed_universe.get("addresses", []))
     if not addresses:
         logger.info("[crypto_balances] no wallet addresses published — nothing to do")
-        return {"status": "skipped", "reason": "no addresses"}
+        return {"status": "skipped", "reason": "no addresses configured"}
 
     chains_present = {str(a.get("chain", "")).upper() for a in addresses}
     try:

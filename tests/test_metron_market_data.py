@@ -9,6 +9,7 @@ the dry-run no-write path, and the fail-soft empty-universe skip.
 from __future__ import annotations
 
 import json
+import logging
 from datetime import date, datetime, timedelta, timezone
 from unittest import mock
 from unittest.mock import MagicMock
@@ -147,6 +148,18 @@ def test_missing_universe_object_fail_soft_skips():
                          close_source=lambda s: {}, fx_source=lambda c: {})
     assert result["status"] == "skipped"
     s3.put_object.assert_not_called()
+
+
+def test_denied_symbol_read_warns_with_s3_key(caplog):
+    s3 = MagicMock()
+    s3.get_object.side_effect = PermissionError("access denied")
+    key = f"{mmd.CLOSE_HISTORY_PREFIX}DENIED.json"
+
+    with caplog.at_level(logging.WARNING, logger=mmd.__name__):
+        assert mmd._read_json(s3, "market-bucket", key) is None
+
+    assert "access denied" in caplog.text
+    assert f"s3://market-bucket/{key}" in caplog.text
 
 
 def test_dry_run_writes_nothing():

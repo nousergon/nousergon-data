@@ -1428,12 +1428,13 @@ def _write_json(
 
 def _read_json(s3_client: Any, bucket: str, key: str) -> dict | None:
     """Read+parse ``s3://bucket/key`` → dict, or ``None`` on any miss (NoSuchKey, parse
-    error, no creds). Fail-soft so a derived collector (technicals reads back close_history;
-    medians reads back the universe) degrades to a coverage gap rather than aborting."""
+    error, no creds). Fail-soft so derived collectors can continue; the warning records
+    failures for callers that do not report the resulting coverage gap."""
     try:
         obj = s3_client.get_object(Bucket=bucket, Key=key)
         return json.loads(obj["Body"].read())
-    except Exception:
+    except Exception as exc:
+        logger.warning("failed to read s3://%s/%s: %s", bucket, key, exc)
         return None
 
 
