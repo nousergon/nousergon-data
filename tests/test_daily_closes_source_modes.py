@@ -100,6 +100,32 @@ def test_yfinance_only_skips_polygon_entirely():
     assert result["polygon"] == 0
 
 
+def test_yfinance_only_treats_bare_two_as_equity():
+    """A bare TWO ticker is the equity, never the similarly named FRED series."""
+    s3 = _no_existing_parquet_s3()
+
+    def fake_yf(tickers, _date, records_out):
+        assert tickers == ["TWO"]
+        records_out.append({
+            "ticker": "TWO", "date": "2026-04-23",
+            "Open": 10.0, "High": 10.5, "Low": 9.9, "Close": 10.3,
+            "Adj_Close": 10.3, "Volume": 1_000_000, "VWAP": None,
+        })
+        return 1
+
+    with patch("collectors.daily_closes.boto3.client", return_value=s3), \
+         patch("collectors.daily_closes._fetch_fred_closes") as fred_spy, \
+         patch("collectors.daily_closes._fetch_yfinance_closes", side_effect=fake_yf) as yf_spy:
+        result = daily_closes.collect(
+            bucket="b", tickers=["TWO"], run_date="2026-04-23",
+            source="yfinance_only", dry_run=True,
+        )
+
+    fred_spy.assert_not_called()
+    yf_spy.assert_called_once()
+    assert result["yfinance"] == 1
+
+
 def test_yfinance_only_hard_fails_below_coverage_threshold():
     """yfinance_only must hard-fail if yfinance returns fewer stocks than threshold."""
     s3 = _no_existing_parquet_s3()
@@ -161,35 +187,6 @@ def test_polygon_only_does_not_call_yfinance_for_equities():
     yf_spy.assert_not_called()
     assert result["polygon"] == 2
     assert result["yfinance"] == 0
-
-
-def test_polygon_only_treats_bare_two_as_equity():
-    """A bare TWO is the equity, not the similarly named FRED macro series."""
-    s3 = _no_existing_parquet_s3()
-    mock_pg_client = MagicMock()
-    mock_pg_client.get_grouped_daily.return_value = {
-        "TWO": {
-            "open": 10,
-            "high": 11,
-            "low": 9,
-            "close": 10.5,
-            "volume": 1_000_000,
-            "vwap": 10.25,
-        },
-    }
-
-    with patch("collectors.daily_closes.boto3.client", return_value=s3), \
-         patch("polygon_client.polygon_client", return_value=mock_pg_client), \
-         patch("collectors.daily_closes._fetch_fred_closes") as fred_spy, \
-         patch("collectors.daily_closes._fetch_yfinance_closes") as yf_spy:
-        result = daily_closes.collect(
-            bucket="b", tickers=["TWO"], run_date="2026-04-23",
-            source="polygon_only", dry_run=True,
-        )
-
-    fred_spy.assert_not_called()
-    yf_spy.assert_not_called()
-    assert result["polygon"] == 1
 
 
 def test_polygon_only_hard_fails_on_empty_polygon_response():
