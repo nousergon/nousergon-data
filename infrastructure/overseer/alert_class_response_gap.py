@@ -24,9 +24,9 @@ A class is PAGEABLE here when:
     ``playbook:<name>``, which is already routed to an automated T2 agent
     and so is not in the third state this detector is for.
 
-The detector applies to every alert class. The backlog found by the
-alpha-engine-config-I8991 sweep is tracked for migration to autonomy by
-alpha-engine-config-I8996.
+The check is unconditional: every pageable class must carry one of the two
+disposition fields. This prevents a missing or removed ruling from silently
+reopening the gap.
 
 Usage:
   python infrastructure/overseer/alert_class_response_gap.py \\
@@ -38,21 +38,34 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import cast
+from typing import NotRequired, Required, TypedDict, cast
 
 import yaml
 
+# Kept as an explicit empty register so callers can assert that no legacy
+# exception has been reintroduced. The detector itself has no carve-out.
 GRANDFATHERED_CLASSES: frozenset[str] = frozenset()
 
 _PAGEABLE_SEVERITIES = frozenset({"error", "critical", "dynamic"})
 _PAGEABLE_RESPONSES = frozenset({"drain-queue", "operator"})
-AlertClass = dict[str, object]
+
+
+AlertClass = TypedDict(
+    "AlertClass",
+    {
+        "class": Required[str],
+        "severities": NotRequired[list[str]],
+        "response": NotRequired[str],
+        "operator_reason": NotRequired[str],
+        "migration_issue": NotRequired[str],
+    },
+)
 
 
 def is_pageable(alert_class: AlertClass) -> bool:
     """True when this row's severities/response combination can reach a
     human page with no automated disposition guaranteed."""
-    severities = set(cast(list[str], alert_class.get("severities", [])))
+    severities = set(alert_class.get("severities", []))
     response = alert_class.get("response", "")
     return bool(severities & _PAGEABLE_SEVERITIES) and response in _PAGEABLE_RESPONSES
 
@@ -64,7 +77,7 @@ def has_disposition_field(alert_class: AlertClass) -> bool:
 def find_new_gaps(alert_classes: list[AlertClass]) -> list[str]:
     """Return every pageable class that lacks a disposition field."""
     return sorted(
-        cast(str, c["class"])
+        c["class"]
         for c in alert_classes
         if is_pageable(c) and not has_disposition_field(c)
     )
@@ -91,9 +104,7 @@ def main(argv: list[str] | None = None) -> int:
     alert_classes = _load_alert_classes(args.playbooks)
 
     new_gaps = find_new_gaps(alert_classes)
-    ok = True
     if new_gaps:
-        ok = False
         print(
             "overseer-policy.md invariant 4 violated — pageable alert_classes row(s) "
             "with neither operator_reason nor migration_issue (alpha-engine-config-I8991):",
@@ -101,10 +112,10 @@ def main(argv: list[str] | None = None) -> int:
         )
         for name in new_gaps:
             print(f"  - {name}", file=sys.stderr)
-    if ok:
-        print(f"alert_class_response_gap: OK ({len(alert_classes)} classes checked)")
-        return 0
-    return 1
+        return 1
+
+    print(f"alert_class_response_gap: OK ({len(alert_classes)} classes checked)")
+    return 0
 
 
 if __name__ == "__main__":
