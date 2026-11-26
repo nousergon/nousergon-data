@@ -60,10 +60,12 @@ import argparse
 import json
 import logging
 import sys
-from typing import Any
+from typing import Protocol, TypedDict, cast
 
-import boto3
-from botocore.exceptions import ClientError
+import boto3  # pyright: ignore[reportMissingTypeStubs] -- boto3 ships no type information
+from botocore.exceptions import (  # pyright: ignore[reportMissingTypeStubs] -- botocore ships no type information
+    ClientError,
+)
 
 logger = logging.getLogger("dlq_redrive")
 
@@ -73,20 +75,65 @@ DEFAULT_DEST_NAME = "nousergon-overseer-intake"
 _RUNNING_STATUSES = {"RUNNING"}
 
 
+class _QueueUrlResponse(TypedDict):
+    QueueUrl: str
+
+
+class _QueueAttributesResponse(TypedDict):
+    Attributes: dict[str, str]
+
+
+class _MoveTask(TypedDict, total=False):
+    Status: str
+    ApproximateNumberOfMessagesMoved: int
+    ApproximateNumberOfMessagesToMove: int
+
+
+class _MoveTasksResponse(TypedDict):
+    Results: list[_MoveTask]
+
+
+class _StartMoveTaskResponse(TypedDict):
+    TaskHandle: str | None
+
+
+class RedriveSummary(TypedDict, total=False):
+    action: str
+    status: str
+    messages_moved: int
+    messages_to_move: int
+    reason: str
+    dlq_depth: int
+    task_handle: str | None
+    dlq_depth_at_start: int
+
+
+class _SqsClient(Protocol):
+    def get_queue_url(self, *, QueueName: str) -> _QueueUrlResponse: ...  # noqa: N803
+
+    def get_queue_attributes(  # noqa: N802
+        self, *, QueueUrl: str, AttributeNames: list[str]  # noqa: N803
+    ) -> _QueueAttributesResponse: ...
+
+    def list_message_move_tasks(self, *, SourceArn: str) -> _MoveTasksResponse: ...  # noqa: N803
+
+    def start_message_move_task(self, **kwargs: str | int) -> _StartMoveTaskResponse: ...
+
+
 class DlqRedriveError(RuntimeError):
     """Raised on any unexpected SQS condition. Fail-loud by default — a
     swallowed error here reproduces the exact invisible-failure class
     alpha-engine-config-I8111 closes."""
 
 
-def _queue_url(sqs, name: str) -> str:
+def _queue_url(sqs: _SqsClient, name: str) -> str:
     try:
         return sqs.get_queue_url(QueueName=name)["QueueUrl"]
     except ClientError as exc:
         raise DlqRedriveError(f"get_queue_url({name}) failed: {exc}") from exc
 
 
-def _queue_arn(sqs, queue_url: str) -> str:
+def _queue_arn(sqs: _SqsClient, queue_url: str) -> str:
     try:
         attrs = sqs.get_queue_attributes(QueueUrl=queue_url, AttributeNames=["QueueArn"])
         return attrs["Attributes"]["QueueArn"]
@@ -96,7 +143,7 @@ def _queue_arn(sqs, queue_url: str) -> str:
         ) from exc
 
 
-def _queue_depth(sqs, queue_url: str) -> int:
+def _queue_depth(sqs: _SqsClient, queue_url: str) -> int:
     try:
         attrs = sqs.get_queue_attributes(
             QueueUrl=queue_url, AttributeNames=["ApproximateNumberOfMessages"]
@@ -106,7 +153,7 @@ def _queue_depth(sqs, queue_url: str) -> int:
     return int(attrs.get("ApproximateNumberOfMessages", "0"))
 
 
-def _active_move_task(sqs, dlq_arn: str) -> dict[str, Any] | None:
+def _active_move_task(sqs: _SqsClient, dlq_arn: str) -> _MoveTask | None:
     try:
         tasks = sqs.list_message_move_tasks(SourceArn=dlq_arn).get("Results", [])
     except ClientError as exc:
@@ -117,8 +164,10 @@ def _active_move_task(sqs, dlq_arn: str) -> dict[str, Any] | None:
     return None
 
 
-def _start_redrive(sqs, dlq_arn: str, dest_arn: str, max_per_second: int | None) -> dict[str, Any]:
-    kwargs: dict[str, Any] = {"SourceArn": dlq_arn, "DestinationArn": dest_arn}
+def _start_redrive(
+    sqs: _SqsClient, dlq_arn: str, dest_arn: str, max_per_second: int | None
+) -> _StartMoveTaskResponse:
+    kwargs: dict[str, str | int] = {"SourceArn": dlq_arn, "DestinationArn": dest_arn}
     if max_per_second:
         kwargs["MaxNumberOfMessagesPerSecond"] = max_per_second
     try:
@@ -140,11 +189,11 @@ def _start_redrive(sqs, dlq_arn: str, dest_arn: str, max_per_second: int | None)
 
 
 def redrive(
-    sqs,
+    sqs: _SqsClient,
     dlq_name: str = DEFAULT_DLQ_NAME,
     dest_name: str = DEFAULT_DEST_NAME,
     max_per_second: int | None = None,
-) -> dict[str, Any]:
+) -> RedriveSummary:
     """Deliverable 1 + 3. Returns a summary dict; never raises on the
     expected "nothing to do" / "already running" paths — only on a genuine
     SQS failure (DlqRedriveError)."""
@@ -197,7 +246,12 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     args = _build_parser().parse_args(argv)
-    sqs = boto3.client("sqs", region_name=args.region)
+    sqs = cast(
+        _SqsClient,
+        boto3.client(  # pyright: ignore[reportUnknownMemberType] -- boto3 has no bundled types
+            "sqs", region_name=args.region
+        ),
+    )
     result = redrive(sqs, args.dlq_name, args.dest_name, args.max_per_second)
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
