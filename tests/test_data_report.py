@@ -738,6 +738,65 @@ def test_the_headline_carries_the_count():
     assert "1 failed run(s) whose log does not resolve" in message
 
 
+def test_a_matching_issue_has_the_seed_resolution_in_both_renderings():
+    row = report_module.UnresolvedLog("D17", "k", "local:x", "why")
+    inputs = _inputs_with_logs([row])
+
+    update = report_module.render_full_update(inputs, now=NOW)
+    message = report_module.render_message(inputs, now=NOW, update_url="https://example/u")
+
+    for document in (update, message):
+        assert "Resolution: alpha-engine-config#11353" in document
+
+
+def test_an_unmatched_problem_says_none_tracked_yet_in_both_renderings():
+    inputs = _inputs(_live_shaped_store())
+
+    update = report_module.render_full_update(inputs, now=NOW)
+    message = report_module.render_message(inputs, now=NOW, update_url="https://example/u")
+
+    for document in (update, message):
+        assert "Resolution: none tracked yet" in document
+
+
+def test_the_s3_registry_takes_precedence_in_both_renderings():
+    store = _live_shaped_store(
+        **{
+            report_module.RESOLUTIONS_S3_KEY: {
+                "entries": [
+                    {
+                        "match": "unresolved_log:*",
+                        "ref": "nousergon-data#1445901",
+                        "plan": "live plan",
+                    }
+                ]
+            }
+        }
+    )
+    row = report_module.UnresolvedLog("D17", "k", "local:x", "why")
+    inputs = dataclasses.replace(_inputs(store), unresolved_logs=(row,))
+
+    update = report_module.render_full_update(inputs, now=NOW)
+    message = report_module.render_message(inputs, now=NOW, update_url="https://example/u")
+
+    for document in (update, message):
+        assert "Resolution: nousergon-data#1445901 — live plan" in document
+        assert "Resolution: alpha-engine-config#11353" not in document
+
+
+def test_an_unavailable_registry_falls_back_to_the_seed_in_both_renderings():
+    row = report_module.UnresolvedLog("D17", "k", "local:x", "why")
+    inputs = dataclasses.replace(
+        _inputs(_live_shaped_store()), unresolved_logs=(row,)
+    )
+
+    update = report_module.render_full_update(inputs, now=NOW)
+    message = report_module.render_message(inputs, now=NOW, update_url="https://example/u")
+
+    for document in (update, message):
+        assert "Resolution: alpha-engine-config#11353" in document
+
+
 # ── one message per market close (Brian 2026-10-21) ──────────────────────────
 
 

@@ -1,0 +1,11 @@
+{
+  "schema": "weekly-issue-resolutions-1",
+  "_doc": "Bundled fallback for data_gate.report. Entries use weekly_run_report.py's ordered fnmatch and issue-reference format; the live weekly registry is overlaid ahead of these entries.",
+  "entries": [
+    {
+      "match": "unresolved_log:*",
+      "ref": "alpha-engine-config#11353",
+      "plan": "ship failed-run logs to durable S3 storage"
+    }
+  ]
+}
