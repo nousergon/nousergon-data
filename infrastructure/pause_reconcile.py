@@ -86,9 +86,9 @@ import time
 from datetime import UTC, datetime
 from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Protocol, TypedDict, cast
 
-import boto3
+import boto3  # pyright: ignore[reportMissingTypeStubs]  # boto3 ships without inline types
 import yaml
 
 HERE = Path(__file__).parent.resolve()
@@ -98,7 +98,61 @@ import automation_pause as ap  # noqa: E402
 # Manifest JSON, registry YAML and AWS CLI/boto3 responses are untyped JSON.
 JsonDict = dict[str, Any]  # pyright: ignore[reportExplicitAny]  # raw manifest / registry / AWS response JSON
 
-REGION = ap.REGION
+
+class AlarmEntry(TypedDict):
+    """The fields consumed from an ``automation_pause`` alarm declaration."""
+
+    name: str
+    watches: list[str]
+    issue: str | None
+    re_exam: str | None
+    reason: str
+
+
+class AutomationPause(Protocol):
+    """Typed surface this module consumes from the legacy manifest helper."""
+
+    REGION: str
+
+    def load_manifest(self, path: Path = ...) -> JsonDict: ...
+    def kept_names(self, manifest: JsonDict | None = None) -> set[str]: ...
+    def paused_names(self, manifest: JsonDict | None = None) -> set[str]: ...
+    def alarm_entries(self, manifest: JsonDict | None = None) -> list[AlarmEntry]: ...
+    def alarm_justified(
+        self, entry: AlarmEntry, manifest: JsonDict | None = None,
+    ) -> bool: ...
+    def declaration_findings(self, manifest: JsonDict | None = None) -> list[JsonDict]: ...
+
+
+class FleetCheckResult(Protocol):
+    STATUS_OK: str
+    STATUS_ATTENTION: str
+    STATUS_ERROR: str
+
+    def build(
+        self, *, check_id: str, label: str, status: str, summary: str,
+        cadence_minutes: int | None, findings: list[JsonDict] | None = None,
+        deep_link: str | None = None, now: datetime | None = None,
+    ) -> JsonDict: ...
+
+    def emit(self, envelope: JsonDict, *, dry_run: bool = False) -> str | None: ...
+
+
+class PutObject(Protocol):
+    def __call__(
+        self, *, Bucket: str, Key: str, Body: bytes, ContentType: str,
+    ) -> object: ...
+
+
+_ap = cast(AutomationPause, ap)
+_alarm_actions_enabled = cast(
+    Callable[[str], bool | None], getattr(ap, "_alarm_actions_enabled"),
+)
+_live_alarm_actions = cast(
+    Callable[[], dict[str, dict[str, bool]]], getattr(ap, "_live_alarm_actions"),
+)
+
+REGION = _ap.REGION
 REGISTRY_BUCKET = "alpha-engine-research"
 REGISTRY_PREFIX = "ops/registry/observability.d/"
 
@@ -439,11 +493,23 @@ def trigger_targets(trigger: JsonDict) -> list[str]:
     through because `get-schedule` resolves only within one group."""
     if trigger["surface"] == "events":
         got = _aws_json(["events", "list-targets-by-rule", "--rule", trigger["name"]])
-        return [t["Arn"] for t in got.get("Targets", [])]
+        targets = cast(object, got.get("Targets"))
+        if not isinstance(targets, list):
+            return []
+        arns: list[str] = []
+        for raw_target in cast(list[object], targets):
+            target = cast(dict[object, object], raw_target)
+            arn = target.get("Arn")
+            if isinstance(arn, str):
+                arns.append(arn)
+        return arns
     got = _aws_json(["scheduler", "get-schedule", "--name", trigger["name"],
                      "--group-name", trigger.get("group") or DEFAULT_SCHEDULE_GROUP])
-    arn = (got.get("Target") or {}).get("Arn")
-    return [arn] if arn else []
+    target = cast(object, got.get("Target"))
+    if not isinstance(target, dict):
+        return []
+    arn = cast(dict[object, object], target).get("Arn")
+    return [arn] if isinstance(arn, str) and arn else []
 
 
 # ── register 2: the published observability registry ─────────────────────────
@@ -463,10 +529,14 @@ def load_registry(local_dir: Path | None = None) -> dict[str, JsonDict]:
         blobs = _fetch_registry_from_s3()
     rows: dict[str, JsonDict] = {}
     for name, text in blobs.items():
-        row = yaml.safe_load(text)
-        if not isinstance(row, dict) or not row.get("component_id"):
+        raw_row = cast(object, yaml.safe_load(text))
+        if not isinstance(raw_row, dict):
             raise RuntimeError(f"registry object {name} has no component_id")
-        rows[row["component_id"]] = row
+        row = cast(JsonDict, raw_row)
+        component_id = row.get("component_id")
+        if not isinstance(component_id, str) or not component_id:
+            raise RuntimeError(f"registry object {name} has no component_id")
+        rows[component_id] = row
     if not rows:
         raise RuntimeError(
             f"the published registry at s3://{REGISTRY_BUCKET}/{REGISTRY_PREFIX} is "
@@ -567,7 +637,7 @@ def reconcile(
     reaches the exit code.
     """
     m: JsonDict
-    m = manifest if manifest is not None else ap.load_manifest()
+    m = manifest if manifest is not None else _ap.load_manifest()
     reg = rows if rows is not None else load_registry()
     trigs = triggers if triggers is not None else live_triggers()
     targets_of = targets_of or trigger_targets
@@ -580,7 +650,7 @@ def reconcile(
 
     def _ran(cid: str, arn: str) -> float:
         return executions_of(arn) if _is_state_machine(arn) else invocations_of(cid)
-    alarm_actions_of = alarm_actions_of or ap._alarm_actions_enabled
+    alarm_actions_of = alarm_actions_of or _alarm_actions_enabled
     if alarm_breaching_of is None:
         # One bulk read, cached for every entry this call grades — not one
         # `describe-alarms` per alarm. `.get(name)` is None for an alarm that
@@ -592,7 +662,7 @@ def reconcile(
         def _default_breaching_of(name: str) -> bool:
             nonlocal _live_cache
             if _live_cache is None:
-                _live_cache = ap._live_alarm_actions()
+                _live_cache = _live_alarm_actions()
             row = _live_cache.get(name)
             return row["breaching"] if row is not None else True
 
@@ -600,8 +670,8 @@ def reconcile(
     is_ephemeral = is_ephemeral or is_ephemeral_one_shot
     noted = noted if noted is not None else []
 
-    paused = ap.paused_names(m)          # paused + pending
-    kept = ap.kept_names(m)
+    paused = _ap.paused_names(m)          # paused + pending
+    kept = _ap.kept_names(m)
     findings: list[JsonDict] = []
 
     # ── direction A: a live trigger nobody's register accounts for ──────────
@@ -855,9 +925,9 @@ def reconcile(
     # RE-DERIVED here from `m` and `paused_names(m)`, never trusted from a
     # cached field, so an un-pause (a trigger's entry removed from `paused`)
     # changes what this direction reports on its very next read.
-    for entry in ap.alarm_entries(m):
-        name = cast(str, entry["name"])
-        justified = ap.alarm_justified(entry, m)
+    for entry in _ap.alarm_entries(m):
+        name = entry["name"]
+        justified = _ap.alarm_justified(entry, m)
         live = alarm_actions_of(name)
         if live is None:
             findings.append({
@@ -896,7 +966,7 @@ def reconcile(
     # The declaration's own shape, offline (alpha-engine-config-I8047). Kept in
     # `automation_pause` and merely re-exported into this verdict rather than
     # re-derived: a second copy of the grammar is a second place to loosen it.
-    findings.extend(ap.declaration_findings(m))  # pyright: ignore[reportUnknownArgumentType]  # automation_pause returns bare list[dict]
+    findings.extend(_ap.declaration_findings(m))
 
     return sorted(findings, key=lambda f: (f["kind"], f["trigger"]))
 
@@ -913,7 +983,7 @@ def declared_alarm_gaps(manifest: JsonDict | None = None) -> list[JsonDict]:
     one thing worth knowing while the 2026-08-07/08-12 pause holds.
     """
     m: JsonDict
-    m = manifest if manifest is not None else ap.load_manifest()
+    m = manifest if manifest is not None else _ap.load_manifest()
     return [
         {
             "id": entry["name"], "kind": "declared-silenced-alarm",
@@ -924,8 +994,8 @@ def declared_alarm_gaps(manifest: JsonDict | None = None) -> list[JsonDict]:
                 f"{entry['re_exam'] or '<UNDATED>'}. {entry['reason']}"
             ),
         }
-        for entry in ap.alarm_entries(m)
-        if ap.alarm_justified(entry, m)
+        for entry in _ap.alarm_entries(m)
+        if _ap.alarm_justified(entry, m)
     ]
 
 
@@ -1045,7 +1115,9 @@ def publish(findings: list[JsonDict], checked: int, dry_run: bool = False,
     render, because a declared gap that is invisible unless something is ALSO
     broken is an omission, not a declaration.
     """
-    from nousergon_lib import fleet_check_result as fcr
+    from nousergon_lib import fleet_check_result
+
+    fcr = cast(FleetCheckResult, fleet_check_result)
 
     gaps = declared_gaps or []
     status = fcr.STATUS_OK if not findings else fcr.STATUS_ATTENTION
@@ -1093,7 +1165,9 @@ def publish_error(error: str, dry_run: bool = False) -> str | None:
     currently unknown. A blind detector reporting `attention` would understate
     it; reporting `ok` would be a lie.
     """
-    from nousergon_lib import fleet_check_result as fcr
+    from nousergon_lib import fleet_check_result
+
+    fcr = cast(FleetCheckResult, fleet_check_result)
 
     env = fcr.build(
         check_id=CHECK_ID, label=CHECK_LABEL, status=fcr.STATUS_ERROR,
@@ -1131,7 +1205,7 @@ def publish_paused_lanes(manifest: JsonDict | None = None, dry_run: bool = False
     """
     generated_at = datetime.now(UTC).isoformat()
     try:
-        paused = sorted(ap.paused_names(manifest))
+        paused = sorted(_ap.paused_names(manifest))
         body = {
             "schema_version": PAUSED_LANES_SCHEMA_VERSION,
             "generated_at": generated_at,
@@ -1141,7 +1215,9 @@ def publish_paused_lanes(manifest: JsonDict | None = None, dry_run: bool = False
         if dry_run:
             logger.info("[dry-run] would publish %s (%d paused lane(s))", uri, len(paused))
             return None
-        boto3.client("s3").put_object(
+        client_factory = cast(Callable[[str], object], getattr(boto3, "client"))
+        put_object = cast(PutObject, getattr(client_factory("s3"), "put_object"))
+        put_object(
             Bucket=REGISTRY_BUCKET, Key=PAUSED_LANES_KEY,
             Body=json.dumps(body, indent=2).encode(),
             ContentType="application/json",
