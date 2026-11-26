@@ -1698,6 +1698,17 @@ alert_classes:
     # ruling, not an incident.
     tier: notify-silent
     chat: order-book
+  - class: crucible_v2_daily_notice
+    source: "crucible-v2/daily"
+    severities: [info]
+    intake: bus
+    response: drain-queue
+    tier: notify-silent
+    chat: order-book
+    operator_reason: >-
+      Daily v2 pipelines summary, informational by construction
+      (crucible/daily_notice.py: "It is not a page"); a failed or absent run
+      pages through crucible_v2_absence/failure and the sweep.
   - class: crucible_v2_market_open_close
     # alpha-engine-config-I12024 (Brian 2026-11-10: "I want to receive Telegram
     # alerts when the market opens and when the market closes, along with the
