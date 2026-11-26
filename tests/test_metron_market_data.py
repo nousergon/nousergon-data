@@ -17,6 +17,18 @@ from unittest.mock import MagicMock
 from collectors import metron_market_data as mmd
 
 
+def test_read_json_denied_logs_s3_key(caplog) -> None:
+    s3 = MagicMock()
+    s3.get_object.side_effect = PermissionError("AccessDenied")
+    key = f"{mmd.CLOSE_HISTORY_PREFIX}DENIED.json"
+
+    with caplog.at_level(logging.WARNING):
+        assert mmd._read_json(s3, "market-bucket", key) is None
+
+    assert f"s3://market-bucket/{key}" in caplog.text
+    assert "AccessDenied" in caplog.text
+
+
 def _universe_s3(
     universe: dict | None, heartbeat_ts: str | None = None, watchlist: dict | None = None,
     eod_closes: dict | None = None, close_history: dict[str, dict] | None = None,
@@ -148,18 +160,6 @@ def test_missing_universe_object_fail_soft_skips():
                          close_source=lambda s: {}, fx_source=lambda c: {})
     assert result["status"] == "skipped"
     s3.put_object.assert_not_called()
-
-
-def test_denied_symbol_read_warns_with_s3_key(caplog):
-    s3 = MagicMock()
-    s3.get_object.side_effect = PermissionError("access denied")
-    key = f"{mmd.CLOSE_HISTORY_PREFIX}DENIED.json"
-
-    with caplog.at_level(logging.WARNING, logger=mmd.__name__):
-        assert mmd._read_json(s3, "market-bucket", key) is None
-
-    assert "access denied" in caplog.text
-    assert f"s3://market-bucket/{key}" in caplog.text
 
 
 def test_dry_run_writes_nothing():

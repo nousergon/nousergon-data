@@ -112,26 +112,26 @@ def test_no_addresses_skips_without_write():
     s3 = _s3(_universe())
     r = cb.collect(s3_client=s3, now=_NOW)
     assert r == {"status": "skipped", "reason": "no addresses configured"}
-    s3.put_object.assert_not_called()
+    assert s3.put_object.call_count == 0
 
 
 def test_missing_universe_artifact_skips():
     s3 = _s3(None)
     r = cb.collect(s3_client=s3, now=_NOW)
     assert r == {"status": "skipped", "reason": "wallet-address input unreadable"}
-    s3.put_object.assert_not_called()
+    assert s3.put_object.call_count == 0
 
 
 def test_malformed_universe_artifact_skips_as_unreadable():
     s3 = MagicMock()
     body = MagicMock()
-    body.read.return_value = b"not json"
+    body.read.return_value = b"not JSON"
     s3.get_object.return_value = {"Body": body}
 
     r = cb.collect(s3_client=s3, now=_NOW)
 
     assert r == {"status": "skipped", "reason": "wallet-address input unreadable"}
-    s3.put_object.assert_not_called()
+    assert s3.put_object.call_count == 0
 
 
 def test_all_failed_does_not_write():

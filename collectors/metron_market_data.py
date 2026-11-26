@@ -1428,13 +1428,14 @@ def _write_json(
 
 def _read_json(s3_client: Any, bucket: str, key: str) -> dict | None:
     """Read+parse ``s3://bucket/key`` → dict, or ``None`` on any miss (NoSuchKey, parse
-    error, no creds). Fail-soft so derived collectors can continue; the warning records
-    failures for callers that do not report the resulting coverage gap."""
+    error, no creds). Fail-soft so a derived collector (technicals reads back close_history;
+    medians reads back the universe) degrades rather than aborting. Callers that do not
+    report a coverage gap record the failure through this function's warning."""
     try:
         obj = s3_client.get_object(Bucket=bucket, Key=key)
         return json.loads(obj["Body"].read())
     except Exception as exc:
-        logger.warning("failed to read s3://%s/%s: %s", bucket, key, exc)
+        logger.warning("[metron_market_data] failed to read s3://%s/%s: %s", bucket, key, exc)
         return None
 
 
@@ -1564,8 +1565,8 @@ def _grade_cardinality(
     bucket: str,
     run_date: str,
     *,
-    denominator,
-    covered,
+    denominator: Any,  # pyright: ignore[reportExplicitAny]
+    covered: Any,  # pyright: ignore[reportExplicitAny]
     closes_key: str | None,
     write_failure: str | None = None,
 ) -> dict:
@@ -1669,7 +1670,11 @@ D20_SPINE_WINDOW_SESSIONS = 5
 D20_MAX_BAR_LAG_SESSIONS = 1
 
 
-def _grade_spine_window(s3_client: Any, bucket: str, run_date: str, *, denominator) -> dict:
+def _grade_spine_window(
+    s3_client: Any,  # pyright: ignore[reportExplicitAny]
+    bucket: str, run_date: str, *,
+    denominator: Any,  # pyright: ignore[reportExplicitAny]
+) -> dict[str, object]:
     """D20's spine-window reading, as one manifest guard entry (`alpha-engine-config-I10780`).
 
     Reads BACK the last :data:`D20_SPINE_WINDOW_SESSIONS` published
@@ -2735,7 +2740,7 @@ def _news_sentiment(yf_symbols: list[str]) -> dict[str, dict]:
     sub = df[df["ticker"].isin(want)]
     for sym, rows in sub.groupby("ticker"):
         row = rows.sort_values("aggregate_date").iloc[-1]  # most recent date wins
-        def _num(col):
+        def _num(col: str) -> float | None:
             v = row.get(col)
             try:
                 f = float(v)
@@ -3875,7 +3880,11 @@ def collect_intraday(
             "indices": len(indices), "fund_proxies": len(fund_proxies), "ratings": len(ratings)}
 
 
-def _record_intraday_run(ctx, bucket: str, result: dict) -> None:
+def _record_intraday_run(
+    ctx: Any,  # pyright: ignore[reportExplicitAny]
+    bucket: str,
+    result: dict[str, Any],  # pyright: ignore[reportExplicitAny]
+) -> None:
     """Record what this D37 run read and published, with measured counts.
 
     The two keys the descriptor declares are recorded separately: the quotes
@@ -3938,7 +3947,7 @@ def main(argv: list[str] | None = None) -> int:
         # manifest prefix — ~288 records per day, not ~1.
         captured: dict = {}
 
-        def _intraday_body(run_ctx) -> dict:
+        def _intraday_body(run_ctx: object) -> dict[str, Any]:  # pyright: ignore[reportExplicitAny]
             intra = collect_intraday(bucket=args.bucket, dry_run=args.dry_run, force=args.force,
                                      require_heartbeat=args.require_heartbeat)
             captured["result"] = intra
@@ -3973,7 +3982,7 @@ def main(argv: list[str] | None = None) -> int:
                         "(alpha-engine-config-I10831)."
                     )
                 raise run_manifest.NotApplicable("outside_session_window", skip_reason)
-            _record_intraday_run(run_ctx, args.bucket, intra)
+            _record_intraday_run(run_ctx, args.bucket, intra)  # pyright: ignore[reportUnknownArgumentType]
             if status not in ("ok", "ok_dry_run"):
                 # A non-ok collector status has FAILED — recorded as such while
                 # the caller's exit-code contract stays exactly what it was

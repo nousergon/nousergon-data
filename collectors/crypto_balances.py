@@ -247,11 +247,23 @@ _BALANCE_FETCHERS: dict[str, Callable[..., float]] = {
 # ── S3 helpers ──────────────────────────────────────────────────────────────────────────
 
 
-def _read_json(s3_client: Any, bucket: str, key: str) -> dict | None:
+def _read_json(
+    s3_client: Any,  # pyright: ignore[reportExplicitAny]
+    bucket: str,
+    key: str,
+    *,
+    read_status: dict[str, bool] | None = None,
+) -> dict[str, Any] | None:  # pyright: ignore[reportExplicitAny]
+    """Return the parsed object, optionally recording whether its input was readable."""
     try:
         obj = s3_client.get_object(Bucket=bucket, Key=key)
-        return json.loads(obj["Body"].read())
+        result = cast(dict[str, Any], json.loads(obj["Body"].read()))  # pyright: ignore[reportExplicitAny]
+        if read_status is not None:
+            read_status["readable"] = True
+        return result
     except Exception:
+        if read_status is not None:
+            read_status["readable"] = False
         return None
 
 
@@ -276,7 +288,7 @@ def collect(
     eth_token_fetcher: Callable[[str], list[dict]] | None = None,
     now: datetime | None = None,
     dry_run: bool = False,
-) -> dict[str, object]:
+) -> dict:
     """Read the wallet-address universe, fetch balances + prices, write ``crypto/holdings.json``.
 
     Returns a small status dict. ``s3_client`` + the fetchers are injectable for tests.
@@ -289,16 +301,15 @@ def collect(
         import boto3
         s3_client = boto3.client("s3")
 
-    universe = _read_json(s3_client, bucket, WALLET_ADDRESSES_KEY)
-    if universe is None:
+    read_status: dict[str, bool] = {}
+    universe = _read_json(s3_client, bucket, WALLET_ADDRESSES_KEY, read_status=read_status)
+    if not read_status.get("readable", False):
         logger.warning("[crypto_balances] wallet-address input unreadable — nothing to do")
-        return {"status": "skipped", "reason": "wallet-address input unreadable"}
-
-    typed_universe = cast(dict[str, object], universe)
-    addresses = cast(list[dict[str, object]], typed_universe.get("addresses", []))
+        return {"status": "skipped", "reason": "wallet-address input unreadable"}  # pyright: ignore[reportUnknownVariableType]
+    addresses = (universe or {}).get("addresses", [])
     if not addresses:
         logger.info("[crypto_balances] no wallet addresses published — nothing to do")
-        return {"status": "skipped", "reason": "no addresses configured"}
+        return {"status": "skipped", "reason": "no addresses configured"}  # pyright: ignore[reportUnknownVariableType]
 
     chains_present = {str(a.get("chain", "")).upper() for a in addresses}
     try:
