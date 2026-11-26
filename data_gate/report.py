@@ -57,9 +57,8 @@ import json
 import os
 import pathlib
 import re
-from collections.abc import Mapping
-from dataclasses import dataclass, field
-from typing import Any, Protocol, cast, runtime_checkable
+from dataclasses import dataclass
+from typing import Any, Mapping, cast
 from zoneinfo import ZoneInfo
 
 from nousergon_lib.gates import LADDER_KEY, gate_prefix
@@ -87,86 +86,6 @@ from nousergon_lib.trading_calendar import (  # pyright: ignore[reportAttributeA
 )
 
 from data_gate.read import BOARD_KEY
-
-RESOLUTIONS_S3_KEY = "ops/daily-summaries/weekly-issue-resolutions.json"
-RESOLUTIONS_FILE = pathlib.Path(__file__).with_name("weekly_issue_resolutions.json")
-NO_RESOLUTION = "none tracked yet"
-_ISSUE_REF_RE = re.compile(r"^[A-Za-z0-9_.-]+#[0-9]+$")
-
-
-@dataclass(frozen=True)
-class Resolution:
-    """A tracked issue and the plan recorded for it in the shared registry."""
-
-    ref: str
-    plan: str
-
-
-class _RegistryStore(Protocol):
-    def get_bytes(self, key: str) -> bytes: ...
-
-
-class _RegistryBody(Protocol):
-    def read(self) -> bytes: ...
-
-
-class _RegistryClient(Protocol):
-    def get_object(self, *, Bucket: str, Key: str) -> Mapping[str, _RegistryBody]: ...
-
-
-@runtime_checkable
-class _BucketRegistryStore(Protocol):
-    bucket: str
-    client: _RegistryClient
-
-
-def _parse_resolutions(document: object) -> dict[str, Resolution]:
-    """Parse the weekly registry format, preserving its first-match order."""
-    resolutions: dict[str, Resolution] = {}
-    entries = cast(dict[str, object], document).get("entries") if isinstance(document, dict) else None
-    if not isinstance(entries, list):
-        return resolutions
-    for entry in cast(list[object], entries):
-        if not isinstance(entry, dict):
-            continue
-        typed_entry = cast(dict[str, object], entry)
-        pattern, ref = typed_entry.get("match"), typed_entry.get("ref")
-        if isinstance(pattern, str) and isinstance(ref, str) and _ISSUE_REF_RE.fullmatch(ref):
-            resolutions.setdefault(pattern, Resolution(ref, str(typed_entry.get("plan") or "")))
-    return resolutions
-
-
-def _read_resolutions(store: _RegistryStore) -> dict[str, Resolution]:
-    """Load the bundled seed, overlaid by the shared bucket-root registry."""
-    try:
-        seed = _parse_resolutions(json.loads(RESOLUTIONS_FILE.read_bytes()))
-    except (OSError, ValueError):
-        seed = {}
-    try:
-        if isinstance(store, _BucketRegistryStore):
-            body = store.client.get_object(
-                Bucket=store.bucket, Key=RESOLUTIONS_S3_KEY
-            )["Body"].read()
-        else:
-            body = store.get_bytes(RESOLUTIONS_S3_KEY)
-        overlay = _parse_resolutions(json.loads(body))
-    except Exception:  # noqa: BLE001 - the bundled seed is the required fallback
-        overlay = {}
-    for pattern, resolution in seed.items():
-        overlay.setdefault(pattern, resolution)
-    return overlay
-
-
-def _resolution_line(resolutions: Mapping[str, Resolution], key: str) -> str:
-    for pattern, resolution in resolutions.items():
-        if fnmatch.fnmatchcase(key, pattern):
-            plan = f" — {resolution.plan}" if resolution.plan else ""
-            return f"Resolution: {resolution.ref}{plan}"
-    return f"Resolution: {NO_RESOLUTION}"
-
-
-def _empty_resolutions() -> dict[str, Resolution]:
-    return {}
 
 __all__ = [
     "BOARD_CONSOLE_PATH",
@@ -268,6 +187,12 @@ STALE_AFTER = dt.timedelta(hours=26)
 #: prefix. :func:`wire_budget` subtracts that prefix from the SAME formatter
 #: krepis prepends, so this is a budget for the body alone.
 MESSAGE_MAX_CHARS = 1200
+
+RESOLUTIONS_FILE = pathlib.Path(__file__).with_name("weekly_issue_resolutions.json")
+RESOLUTIONS_S3_BUCKET = "alpha-engine-research"
+RESOLUTIONS_S3_KEY = "ops/daily-summaries/weekly-issue-resolutions.json"
+NO_RESOLUTION = "none tracked yet"
+_REF_RE = re.compile(r"^[A-Za-z0-9_.-]+#\d+$")
 
 #: Rendered instead of a fraction when the denominator is zero. `0/0` reads as
 #: "nothing outstanding" — it is the shape of a green number — when what it
@@ -443,8 +368,52 @@ class DataReportInputs:
     #: Why the check above could not be completed, per prefix. A blind check
     #: renders as BLIND, never as a clean row.
     unresolved_log_problems: tuple[str, ...] = ()
-    #: Shared weekly issue registry, with live S3 patterns before seed patterns.
-    resolutions: Mapping[str, Resolution] = field(default_factory=_empty_resolutions)
+    #: Ordered registry patterns overlaid from S3 on the bundled seed.
+    resolutions: tuple[tuple[str, str], ...] = ()
+
+
+def _parse_resolutions(document: object) -> list[tuple[str, str]]:
+    """Valid ``(fnmatch pattern, issue reference)`` rows, in file order."""
+    if not isinstance(document, dict):
+        return []
+    entries = cast(Mapping[str, object], document).get("entries")
+    if not isinstance(entries, list):
+        return []
+    parsed: list[tuple[str, str]] = []
+    for entry in cast(list[object], entries):
+        if not isinstance(entry, dict):
+            continue
+        typed_entry = cast(Mapping[str, object], entry)
+        pattern, ref = typed_entry.get("match"), typed_entry.get("ref")
+        if isinstance(pattern, str) and isinstance(ref, str) and _REF_RE.fullmatch(ref):
+            parsed.append((pattern, ref))
+    return parsed
+
+
+def _load_resolutions(
+    store: Any,  # pyright: ignore[reportExplicitAny] - local and S3 stores share no protocol
+) -> tuple[tuple[str, str], ...]:
+    """Bundled registry with a best-effort, first-precedence S3 overlay."""
+    seed = _parse_resolutions(json.loads(RESOLUTIONS_FILE.read_text(encoding="utf-8")))
+    overlay: list[tuple[str, str]] = []
+    try:
+        if hasattr(store, "client") and hasattr(store, "bucket"):
+            raw = store.client.get_object(Bucket=store.bucket, Key=RESOLUTIONS_S3_KEY)["Body"].read()
+        else:
+            raw = store.get_bytes(RESOLUTIONS_S3_KEY)
+        overlay = _parse_resolutions(json.loads(raw))
+    except Exception:  # noqa: BLE001 - this optional overlay must fall back to the seed
+        pass
+    overlay_patterns = {pattern for pattern, _ in overlay}
+    return tuple(overlay + [row for row in seed if row[0] not in overlay_patterns])
+
+
+def _resolution(inputs: DataReportInputs, key: str) -> str:
+    """First registry reference matching ``key``, or the explicit fallback."""
+    return next(
+        (ref for pattern, ref in inputs.resolutions if fnmatch.fnmatchcase(key, pattern)),
+        NO_RESOLUTION,
+    )
 
 
 def read_inputs(
@@ -475,7 +444,7 @@ def read_inputs(
     unresolved_logs, unresolved_log_problems = read_unresolved_logs(
         store, trading_day=trading_day
     )
-    resolutions = _read_resolutions(store)
+    resolutions = _load_resolutions(store)
 
     ladder = read_required(reads, LADDER_KEY)
     board = read_required(reads, BOARD_KEY)
@@ -753,7 +722,7 @@ def render_full_update(inputs: DataReportInputs, *, now: dt.datetime) -> str:
     # First, before anything it would qualify. A staleness notice below the
     # numbers is read after the numbers have already been believed.
     if inputs.staleness_line:
-        lines += [f"**{inputs.staleness_line}**", _resolution_line(inputs.resolutions, "stale:ladder"), ""]
+        lines += [f"**{inputs.staleness_line}**", ""]
 
     lines += [
         f"## data collection — {inputs.trading_day.isoformat()} "
@@ -775,8 +744,7 @@ def render_full_update(inputs: DataReportInputs, *, now: dt.datetime) -> str:
     if not rows:
         lines.append(
             "| _no phase row on the ladder_ | | | "
-            "_the ladder is not being rendered — a defect in the gate reader_ | "
-            f"{_resolution_line(inputs.resolutions, 'ladder:no_phases')} |"
+            "_the ladder is not being rendered — a defect in the gate reader_ | |"
         )
     for row in rows:
         gate = row.get("gate")
@@ -784,7 +752,11 @@ def render_full_update(inputs: DataReportInputs, *, now: dt.datetime) -> str:
         history = f"ABSENT — {absent}" if absent else "present"
         if not gate:
             history = "n/a — this rung declares no gate"
-        resolution = _resolution_line(inputs.resolutions, f"history_absent:{gate}") if absent else ""
+        resolution = (
+            f"Resolution: {_resolution(inputs, f'history_absent:{gate}')}"
+            if absent and gate
+            else "n/a"
+        )
         lines.append(
             "| {} | {} | {} | {} | {} |".format(
                 _md_cell(row.get("phase", "?")),
@@ -817,17 +789,19 @@ def render_full_update(inputs: DataReportInputs, *, now: dt.datetime) -> str:
             + "; ".join(inputs.unresolved_log_problems[:4])
             + "**"
         )
-        lines.append(_resolution_line(inputs.resolutions, "unresolved_log_check:blind"))
     if inputs.unresolved_logs:
-        lines += ["| unit | manifest | log_location | why | resolution |", "| --- | --- | --- | --- | --- |"]
+        lines += [
+            "| unit | manifest | log_location | why | resolution |",
+            "| --- | --- | --- | --- | --- |",
+        ]
         for row in inputs.unresolved_logs:
             lines.append(
-                "| {} | `{}` | `{}` | {} | {} |".format(
+                "| {} | `{}` | `{}` | {} | Resolution: {} |".format(
                     _md_cell(row.unit_id),
                     _md_cell(row.manifest_key),
                     _md_cell(row.log_location or "(none)"),
                     _md_cell(row.reason),
-                    _md_cell(_resolution_line(inputs.resolutions, f"unresolved_log:{row.unit_id}")),
+                    _resolution(inputs, f"unresolved_log:{row.unit_id}"),
                 )
             )
     elif not inputs.unresolved_log_problems:
@@ -839,18 +813,15 @@ def render_full_update(inputs: DataReportInputs, *, now: dt.datetime) -> str:
     lines += ["", "### what moved since the previous dated reading", ""]
     if inputs.moved_absent:
         lines.append(f"- **{inputs.moved_absent}**")
-        lines.append(f"- {_resolution_line(inputs.resolutions, 'movement:absent')}")
     if inputs.moved is not None:
         if inputs.moved.cannot_say:
             lines.append(f"- **cannot say: {inputs.moved.cannot_say}**")
-            lines.append(f"- {_resolution_line(inputs.resolutions, 'movement:cannot_say')}")
         elif not inputs.moved.lines:
             lines.append("- no clause changed state between the two readings")
         else:
             lines += [f"- {line.lstrip('- ')}" for line in inputs.moved.lines]
     elif not inputs.moved_absent:
         lines.append("- **cannot say: movement was not computed**")
-        lines.append(f"- {_resolution_line(inputs.resolutions, 'movement:not_computed')}")
 
     lines += [
         "",
@@ -886,7 +857,6 @@ def render_message(inputs: DataReportInputs, *, now: dt.datetime, update_url: st
     lines: list[str] = []
     if inputs.staleness_line:
         lines.append(f"<b>{escape(inputs.staleness_line)}</b>")
-        lines.append(escape(_resolution_line(inputs.resolutions, "stale:ladder")))
 
     lines += [
         f"<b>data collection — {escape(inputs.trading_day.isoformat())}</b>",
@@ -899,10 +869,8 @@ def render_message(inputs: DataReportInputs, *, now: dt.datetime, update_url: st
 
     if inputs.moved_absent:
         lines.append(escape(inputs.moved_absent))
-        lines.append(escape(_resolution_line(inputs.resolutions, "movement:absent")))
     elif inputs.moved is not None and inputs.moved.cannot_say:
         lines.append(escape(f"cannot say what moved: {inputs.moved.cannot_say}"))
-        lines.append(escape(_resolution_line(inputs.resolutions, "movement:cannot_say")))
     elif inputs.moved is not None:
         count = inputs.moved.count
         lines.append(
@@ -913,16 +881,16 @@ def render_message(inputs: DataReportInputs, *, now: dt.datetime, update_url: st
             )
         )
 
+    headline_resolution_keys: list[str] = []
     for gate, reason in sorted(inputs.history_absent.items()):
         lines.append(escape(f"ABSENT: {gate} — {reason}"))
-        lines.append(escape(_resolution_line(inputs.resolutions, f"history_absent:{gate}")))
+        headline_resolution_keys.append(f"history_absent:{gate}")
 
     # `alpha-engine-config-I11353`. A COUNT in the headline, the rows in the
     # full update — but never silence: a failed run nobody can post-mortem is
     # exactly the thing a reader must learn without opening anything.
     if inputs.unresolved_log_problems:
         lines.append(escape("BLIND: the failed-run log check could not be completed"))
-        lines.append(escape(_resolution_line(inputs.resolutions, "unresolved_log_check:blind")))
     elif inputs.unresolved_logs:
         lines.append(
             escape(
@@ -930,8 +898,16 @@ def render_message(inputs: DataReportInputs, *, now: dt.datetime, update_url: st
                 "— not post-mortemable"
             )
         )
-        for row in inputs.unresolved_logs:
-            lines.append(escape(_resolution_line(inputs.resolutions, f"unresolved_log:{row.unit_id}")))
+        headline_resolution_keys.extend(
+            f"unresolved_log:{row.unit_id}" for row in inputs.unresolved_logs
+        )
+
+    seen_resolutions: set[str] = set()
+    for key in headline_resolution_keys:
+        ref = _resolution(inputs, key)
+        if ref not in seen_resolutions:
+            lines.append(escape(f"Resolution: {ref}"))
+            seen_resolutions.add(ref)
 
     lines.append(f'<a href="{escape(update_url)}">full update</a>')
     console = _console_link(inputs)
@@ -952,7 +928,7 @@ def render_message(inputs: DataReportInputs, *, now: dt.datetime, update_url: st
 
 
 def render_history_body(
-    rows: list[tuple[str, dict[str, object] | None, str | None]],
+    rows: Any,  # pyright: ignore[reportExplicitAny] - library accepts tracker row objects
     *,
     console_url: str | None = None,
 ) -> str:
@@ -1040,19 +1016,19 @@ def _put(store: Any, key: str, payload: str) -> None:
     store.put_bytes(key, payload.encode("utf-8"))
 
 
-def _history_rows(store: Any) -> list[tuple[str, dict[str, object] | None, str | None]]:
+def _history_rows(store: Any) -> list[tuple[str, dict | None, str | None]]:
     """Every filed `history_row.json`, oldest first, with its read problem.
 
     An unreadable row is carried as a row WITH a problem rather than dropped:
     a history index that silently omits the days it could not parse renders a
     gap as continuity.
     """
-    rows: list[tuple[str, dict[str, object] | None, str | None]] = []
+    rows: list[tuple[str, dict | None, str | None]] = []
     for key in sorted(store.list_keys(f"{RUNS_PREFIX}/")):
         if not key.endswith("/history_row.json"):
             continue
         try:
-            rows.append((key, cast(dict[str, object], json.loads(store.get_bytes(key))), None))
+            rows.append((key, json.loads(store.get_bytes(key)), None))
         except Exception as exc:  # noqa: BLE001 - recorded as the row's own problem
             rows.append((key, None, f"{type(exc).__name__}: {exc}"))
     return rows

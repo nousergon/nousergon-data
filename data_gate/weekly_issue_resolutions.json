@@ -1,11 +1,16 @@
 {
   "schema": "weekly-issue-resolutions-1",
-  "_doc": "Bundled fallback for data_gate.report. Entries use weekly_run_report.py's ordered fnmatch and issue-reference format; the live weekly registry is overlaid ahead of these entries.",
+  "_doc": "Seed registry for data_gate.report. Patterns use ordered fnmatch matching; the live S3 registry overlays this seed.",
   "entries": [
     {
       "match": "unresolved_log:*",
       "ref": "alpha-engine-config#11353",
-      "plan": "ship failed-run logs to durable S3 storage"
+      "plan": "make failed-run logs durable and readable for post-mortems"
+    },
+    {
+      "match": "history_absent:*",
+      "ref": "alpha-engine-config#10952",
+      "plan": "keep absent dated gate history explicit in the daily report"
     }
   ]
 }
