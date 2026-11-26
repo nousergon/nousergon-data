@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+from types import ModuleType
+from typing import Any
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -27,7 +29,7 @@ TIERS = {"page", "notify-silent", "tracked-only", "dynamic"}
 
 
 @pytest.fixture(scope="module")
-def publish_mod():
+def publish_mod() -> ModuleType:
     """Load `publish_alert_tier_registry.py` as a module (no package init)."""
     spec = importlib.util.spec_from_file_location(
         "publish_alert_tier_registry", OVERSEER / "publish_alert_tier_registry.py",
@@ -41,7 +43,9 @@ class _NoSuchKey(Exception):
     pass
 
 
-def _fake_s3(get_object_side_effect=None, get_object_return=None):
+def _fake_s3(
+    get_object_side_effect: Any = None, get_object_return: Any = None,
+) -> MagicMock:
     s3 = MagicMock()
     s3.exceptions.NoSuchKey = _NoSuchKey
     if get_object_side_effect is not None:
@@ -54,11 +58,11 @@ def _fake_s3(get_object_side_effect=None, get_object_return=None):
 
 
 @pytest.fixture(scope="module")
-def rows() -> list[dict]:
+def rows() -> list[dict[str, Any]]:
     return yaml.safe_load(PLAYBOOKS.read_text())["alert_classes"]
 
 
-def test_every_alert_class_declares_a_tier(rows):
+def test_every_alert_class_declares_a_tier(rows: list[dict[str, Any]]) -> None:
     missing = [r["class"] for r in rows if "tier" not in r]
     assert missing == [], (
         "alert_classes rows with no `tier`: "
@@ -69,7 +73,7 @@ def test_every_alert_class_declares_a_tier(rows):
     assert bad == []
 
 
-def test_dynamic_tier_is_only_used_where_severity_is_a_runtime_fact(rows):
+def test_dynamic_tier_is_only_used_where_severity_is_a_runtime_fact(rows: list[dict[str, Any]]) -> None:
     """`dynamic` says the seriousness varies with the observed facts.
 
     observability-policy.md 7.1 — derived where derivable. A row whose
@@ -99,7 +103,7 @@ CHAT_TIER = {
 }
 
 
-def test_every_alert_class_declares_its_chat_class_and_the_tier_follows(rows):
+def test_every_alert_class_declares_its_chat_class_and_the_tier_follows(rows: list[dict[str, Any]]) -> None:
     """§7.2b: every row says which of the four chat classes it is, or `none`.
 
     This replaces the 2026-09 guard that refused a critical-only class at
@@ -118,7 +122,7 @@ def test_every_alert_class_declares_its_chat_class_and_the_tier_follows(rows):
     assert wrong == [], f"tier disagrees with chat class: {wrong}"
 
 
-def test_the_daily_digests_are_the_only_scheduled_chat_messages(rows):
+def test_the_daily_digests_are_the_only_scheduled_chat_messages(rows: list[dict[str, Any]]) -> None:
     """§7.2b: the order-book rows and the pipelines rows are the only
     notify-silent (non-email) rows; anything else there is a chat message
     outside the four classes. The v2 market open/close notices are order-book
@@ -127,12 +131,13 @@ def test_the_daily_digests_are_the_only_scheduled_chat_messages(rows):
     from them (same issue, Brian 2026-11-11)."""
     silent = sorted(r["class"] for r in rows
                     if r["tier"] == "notify-silent" and r["class"] != "fleet_email_digests")
-    assert silent == sorted(["crucible_v2_morning_report", "crucible_v2_market_open_close",
+    assert silent == sorted(["crucible_v2_daily_notice", "crucible_v2_morning_report",
+                             "crucible_v2_market_open_close",
                              "crucible_v2_session_watchdog",
                              "data_collection_daily_report", "sf_completion_telegram"])
 
 
-def test_page_after_consecutive_is_a_positive_integer(rows):
+def test_page_after_consecutive_is_a_positive_integer(rows: list[dict[str, Any]]) -> None:
     for r in rows:
         if "page_after_consecutive" in r:
             assert isinstance(r["page_after_consecutive"], int)
@@ -143,7 +148,7 @@ def test_page_after_consecutive_is_a_positive_integer(rows):
             )
 
 
-def test_published_document_matches_the_consumer_contract():
+def test_published_document_matches_the_consumer_contract() -> None:
     """The producer and `krepis.alert_tiers` resolve ONE bucket/object pair."""
     import importlib.util
 
@@ -186,7 +191,7 @@ def test_published_document_matches_the_consumer_contract():
         assert mod.SCHEMA_VERSION == krepis_tiers.SUPPORTED_SCHEMA_VERSION
 
 
-def test_muted_topics_block_is_published(publish_mod):
+def test_muted_topics_block_is_published(publish_mod: ModuleType) -> None:
     """alpha-engine-config-I10382 — the declared muted-sibling map.
 
     krepis reads this key off the SAME published document as `entries`
@@ -215,7 +220,7 @@ def test_muted_topics_block_is_published(publish_mod):
     json.loads(json.dumps(doc))
 
 
-def test_crucible_v2_pages_has_a_declared_muted_sibling(publish_mod):
+def test_crucible_v2_pages_has_a_declared_muted_sibling(publish_mod: ModuleType) -> None:
     """Closes-when clause of alpha-engine-config-I10382: a tracked-only
     emission passing `sns_topic_arn` for `crucible-v2-pages` must resolve a
     zero-subscriber sibling through this registry, not a name guess."""
@@ -223,7 +228,7 @@ def test_crucible_v2_pages_has_a_declared_muted_sibling(publish_mod):
     assert doc["muted_topics"]["crucible-v2-pages"] == "crucible-v2-pages-muted"
 
 
-def test_heartbeat_republishes_on_a_clean_compare(publish_mod):
+def test_heartbeat_republishes_on_a_clean_compare(publish_mod: ModuleType) -> None:
     """alpha-engine-config-I10710: a clean compare must WRITE, not just read.
 
     The schedule arm's freshness SLA is derived from its own daily cadence,
@@ -243,7 +248,7 @@ def test_heartbeat_republishes_on_a_clean_compare(publish_mod):
     )
 
 
-def test_heartbeat_fails_loud_and_does_not_overwrite_real_drift(publish_mod):
+def test_heartbeat_fails_loud_and_does_not_overwrite_real_drift(publish_mod: ModuleType) -> None:
     """A genuine out-of-band mismatch must still fail — and never get papered
     over by an unconditional republish, or the drift arm's one guarantee
     (alpha-engine-config-I6751) is gone."""
@@ -257,7 +262,7 @@ def test_heartbeat_fails_loud_and_does_not_overwrite_real_drift(publish_mod):
     )
 
 
-def test_heartbeat_fails_loud_on_a_missing_object(publish_mod):
+def test_heartbeat_fails_loud_on_a_missing_object(publish_mod: ModuleType) -> None:
     s3 = _fake_s3()
     s3.get_object.side_effect = _NoSuchKey
     with patch.object(publish_mod.boto3, "client", return_value=s3):
@@ -266,7 +271,7 @@ def test_heartbeat_fails_loud_on_a_missing_object(publish_mod):
     assert s3.put_object.call_count == 0
 
 
-def test_a_tracked_only_row_still_declares_an_intake_or_a_reason(rows):
+def test_a_tracked_only_row_still_declares_an_intake_or_a_reason(rows: list[dict[str, Any]]) -> None:
     """Suppression is a delivery decision, never a recording one (7.2a).
 
     A tracked-only row whose intake is `none` AND which carries no

@@ -29,7 +29,10 @@ from __future__ import annotations
 import json
 import importlib.util
 import re
+import subprocess
+import sys
 from pathlib import Path
+from typing import Any
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SF_JSON = _REPO_ROOT / "infrastructure" / "step_function.json"
@@ -50,7 +53,7 @@ def _repos_the_sf_uses() -> set[str]:
     doc = json.loads(_SF_JSON.read_text(encoding="utf-8"))
     found: set[str] = set()
 
-    def walk(node) -> None:
+    def walk(node: Any) -> None:
         if isinstance(node, dict):
             for key, val in node.items():
                 if key == "commands.$" and isinstance(val, str):
@@ -97,12 +100,52 @@ def _repos_the_bootstrap_clones() -> set[str]:
     }
 
 
-def test_sf_references_at_least_one_repo():
+def _krepis_floor_program() -> str:
+    """Return the no-network Python assertion embedded in the bootstrap."""
+    match = re.search(
+        r"\.venv/bin/python - requirements\.txt <<'PY'.*?\n(.*?)\nPY\n",
+        _bootstrap_script(),
+        re.S,
+    )
+    assert match, "bootstrap has no krepis floor assertion"
+    return match.group(1)
+
+
+def _run_krepis_floor(
+    tmp_path: Path,
+    installed: str | None,
+    pin_line: str = "krepis==0.19.0",
+) -> subprocess.CompletedProcess[str]:
+    """Execute the embedded assertion with local-only distribution metadata."""
+    (tmp_path / "requirements.txt").write_text(f"{pin_line}\n", encoding="utf-8")
+    if installed is not None:
+        dist_info = tmp_path / f"krepis-{installed}.dist-info"
+        dist_info.mkdir()
+        (dist_info / "METADATA").write_text(
+            f"Metadata-Version: 2.1\nName: krepis\nVersion: {installed}\n",
+            encoding="utf-8",
+        )
+    program = _krepis_floor_program()
+    if installed is None:
+        program = program.replace(
+            'installed = importlib.metadata.version("krepis")',
+            'raise importlib.metadata.PackageNotFoundError("krepis")',
+        )
+    return subprocess.run(
+        [sys.executable, "-c", program, "requirements.txt"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_sf_references_at_least_one_repo() -> None:
     """Guard the guard — a broken walker must not silently pass."""
     assert _repos_the_sf_uses(), "no alpha-engine-* checkout paths found in the SF"
 
 
-def test_bootstrap_clones_every_repo_the_sf_uses():
+def test_bootstrap_clones_every_repo_the_sf_uses() -> None:
     used = _repos_the_sf_uses()
     cloned = _repos_the_bootstrap_clones()
     missing = used - cloned
@@ -117,7 +160,7 @@ def test_bootstrap_clones_every_repo_the_sf_uses():
     )
 
 
-def test_every_cloned_repo_is_chowned_to_ec2_user():
+def test_every_cloned_repo_is_chowned_to_ec2_user() -> None:
     """A clone the box cannot write to is as broken as a missing one.
 
     The bootstrap runs as root; every stage runs as ec2-user and does a
@@ -133,3 +176,42 @@ def test_every_cloned_repo_is_chowned_to_ec2_user():
         f"{sorted(missing)} cloned but never chowned to ec2-user — stages run as "
         f"ec2-user and `git pull` needs write access"
     )
+
+
+def test_krepis_floor_accepts_installed_version_at_floor(tmp_path: Path) -> None:
+    result = _run_krepis_floor(tmp_path, "0.18.8")
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_krepis_floor_fails_loudly_for_old_installation(tmp_path: Path) -> None:
+    result = _run_krepis_floor(tmp_path, "0.18.7")
+
+    assert result.returncode != 0
+    assert "installed=0.18.7" in result.stderr
+    assert "required>=0.18.8" in result.stderr
+    assert "alpha-engine-dashboard/requirements.txt pin=0.19.0" in result.stderr
+    assert "venv is built per boot from that file" in result.stderr
+
+
+def test_krepis_floor_fails_loudly_when_installation_is_missing(
+    tmp_path: Path,
+) -> None:
+    result = _run_krepis_floor(tmp_path, None)
+
+    assert result.returncode != 0
+    assert "installed=<not installed>" in result.stderr
+    assert "required>=0.18.8" in result.stderr
+    assert "alpha-engine-dashboard/requirements.txt pin=0.19.0" in result.stderr
+    assert "venv is built per boot from that file" in result.stderr
+
+
+def test_krepis_floor_reports_a_pin_that_carries_extras(tmp_path: Path) -> None:
+    """crucible-dashboard pins ``krepis[flow-doctor, openai]==X``; the
+    diagnostic must still name that pin rather than ``<no exact pin>``."""
+    result = _run_krepis_floor(
+        tmp_path, "0.18.7", pin_line="krepis[flow-doctor, openai]==0.59.111"
+    )
+
+    assert result.returncode != 0
+    assert "alpha-engine-dashboard/requirements.txt pin=0.59.111" in result.stderr

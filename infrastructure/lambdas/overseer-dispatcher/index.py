@@ -62,6 +62,7 @@ import urllib.request
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import boto3
 import yaml
@@ -240,14 +241,9 @@ def _escalate(playbook: str, reason: str, detail: str, payload: dict) -> dict:
     return {"p1": p1, "paged": paged}
 
 
-def _write_ledger(record: dict) -> str | None:
+def _write_ledger(key: str, record: dict[str, object]) -> str | None:
     """Best-effort dispatch-ledger write. Secondary surface — a ledger outage
     must never affect the dispatch; recording surface: this WARNING + logs."""
-    now = datetime.now(timezone.utc)
-    key = (
-        f"{LEDGER_PREFIX}/{now:%Y-%m-%d}/"
-        f"{now:%H%M%S}-{record.get('playbook', 'unknown')}-{uuid.uuid4().hex[:8]}.json"
-    )
     try:
         boto3.client("s3", region_name=REGION).put_object(
             Bucket=LEDGER_BUCKET,
@@ -261,7 +257,7 @@ def _write_ledger(record: dict) -> str | None:
         return None
 
 
-def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
+def handler(event: dict[str, Any], context: object) -> dict[str, Any]:  # pyright: ignore[reportExplicitAny]  # raw Lambda event / verdict JSON  # noqa: ARG001 — Lambda contract
     """Route a dispatch request to its playbook's executor. Clean-JSON
     contract: anticipated failures return ``routed: false`` verdicts (and
     escalate where the failure means lost coverage), never raise."""
@@ -312,6 +308,14 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
 
     function_name = spec["executor_function"]
     executor_payload = _stringify_bools(payload)
+    dispatched_at = datetime.now(timezone.utc)
+    dispatch_run_id = (
+        f"{LEDGER_PREFIX}/{dispatched_at:%Y-%m-%d}/"
+        f"{dispatched_at:%H%M%S}-{playbook_name}-{uuid.uuid4().hex[:8]}.json"
+    )
+    # This router owns the ledger identity: never let a caller point telemetry
+    # at an unrelated object.
+    executor_payload["dispatch_run_id"] = dispatch_run_id
     # config-I3293 — the registry is the SSoT for the agent's model: inject
     # the playbook's declared `model` into the executor payload unless the
     # caller explicitly overrode it (drills/operator invokes may). Executors
@@ -342,7 +346,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         result = {"routed": False, "reason": "executor_invoke_failed",
                   "playbook": playbook_name, "executor_function": function_name,
                   "error": detail, "escalation": escalation}
-        result["ledger_key"] = _write_ledger(
+        result["ledger_key"] = _write_ledger(dispatch_run_id,
             {"playbook": playbook_name, "started_at": started_at,
              "payload": executor_payload, "outcome": result}
         )
@@ -366,7 +370,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         "benign": (not launched) and benign,
         "escalation": escalation,
     }
-    result["ledger_key"] = _write_ledger(
+    result["ledger_key"] = _write_ledger(dispatch_run_id,
         {"playbook": playbook_name, "started_at": started_at,
          "payload": executor_payload, "outcome": {k: result[k] for k in
                                                   ("routed", "verdict", "benign", "escalation")}}
