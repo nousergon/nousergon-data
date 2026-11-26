@@ -36,6 +36,8 @@ Two collection modes (selected via the ``source`` parameter):
 
 Schema: index=ticker (str), columns=[date, Open, High, Low, Close, Adj_Close, Volume, VWAP]
 """
+# This legacy collector predates the repository-wide annotation gate.
+# ruff: noqa: ANN001, ANN201, ANN202
 
 from __future__ import annotations
 
@@ -54,6 +56,7 @@ import numpy as np
 import pandas as pd
 import requests
 
+from collectors.fred_history import FRED_HISTORY_MAP, FRED_ONLY_MACRO_SERIES
 from dates import (
     BAR_PROVISIONAL,
     SETTLED_AFTER_ET,
@@ -194,18 +197,25 @@ def _fred_get_with_retry(params: dict) -> requests.Response:
     resp.raise_for_status()
     return resp
 
-# Map our ArcticDB ticker key (after stripping ^) to FRED series id.
+# Map our caret-prefixed market index keys (after stripping ^) to FRED series id.
 # Both yfinance (^VIX, ^TNX, ...) and FRED (VIXCLS, DGS10, ...) publish
 # these in the same scale (raw index level for VIX/VIX3M, percent for
-# TNX/IRX/TWO/HYOAS), so no conversion is needed before appending to
+# TNX/IRX), so no conversion is needed before appending to
 # ArcticDB.
 #
-# alpha-engine-config-I9286: this used to be a SEPARATE 7-entry literal that
-# had drifted from ``collectors/fred_history.py::FRED_HISTORY_MAP`` (which
-# only carried the 3 FRED-only symbols). Re-exported here as an alias so
-# there is exactly ONE declared ticker -> FRED series id map in the repo —
-# every existing caller of ``_FRED_INDEX_MAP`` in this module is unaffected.
-from collectors.fred_history import FRED_HISTORY_MAP as _FRED_INDEX_MAP
+# The bare FRED-only series are deliberately excluded: they are appended by
+# ``builders/daily_append.py`` and a same-named equity (notably TWO) must stay
+# on the market-data path here.
+_FRED_INDEX_MAP = {
+    ticker: series_id
+    for ticker, series_id in FRED_HISTORY_MAP.items()
+    if ticker not in FRED_ONLY_MACRO_SERIES
+}
+
+
+def _is_fred_index(ticker: str) -> bool:
+    """Whether ``ticker`` is a caret-prefixed index served through FRED."""
+    return ticker.startswith("^") and ticker[1:] in _FRED_INDEX_MAP
 
 
 def _coalesce_by_source_priority(
@@ -493,7 +503,7 @@ def _polygon_date_fully_canonical(
     """
     if "source" not in existing_df.columns:
         return False
-    stock_tickers = [t for t in tickers if t.lstrip("^") not in _FRED_INDEX_MAP]
+    stock_tickers = [t for t in tickers if not _is_fred_index(t)]
     if not stock_tickers:
         return True
     index = set(str(t) for t in existing_df.index)
@@ -1304,7 +1314,7 @@ def collect(
     captured_tickers = {r["ticker"] for r in records}
     fred_missing = [
         t for t in tickers
-        if t.lstrip("^") not in captured_tickers and t.lstrip("^") in _FRED_INDEX_MAP
+        if t.lstrip("^") not in captured_tickers and _is_fred_index(t)
     ]
     fred_count = 0
     if fred_missing:
@@ -1348,7 +1358,7 @@ def collect(
         if source == "polygon_only":
             # Equity universe stays refused; macro FRED-index tickers get the
             # loud yfinance backstop.
-            macro_missing = [t for t in missing if t.lstrip("^") in _FRED_INDEX_MAP]
+            macro_missing = [t for t in missing if _is_fred_index(t)]
             if macro_missing:
                 logger.warning(
                     "polygon_only: FRED did not supply macro ticker(s) %s for %s — "
@@ -1414,7 +1424,7 @@ def collect(
         )
 
     # ── Coverage gates — per-mode hard-fails ─────────────────────────────────
-    n_stock_tickers = sum(1 for t in tickers if t.lstrip("^") not in _FRED_INDEX_MAP)
+    n_stock_tickers = sum(1 for t in tickers if not _is_fred_index(t))
     n_stock_records = sum(
         1 for r in records if r["ticker"] not in _FRED_INDEX_MAP
     )
@@ -1804,7 +1814,7 @@ def _collect_window(
     # resolves) and hand the cache to every per-date call. Only prefetch when
     # the universe actually contains FRED-index tickers — keeps non-macro
     # window callers (and tests) on a zero-FRED-I/O path.
-    fred_tickers = [t for t in tickers if t.lstrip("^") in _FRED_INDEX_MAP]
+    fred_tickers = [t for t in tickers if _is_fred_index(t)]
     fred_window_cache: dict[str, list[tuple[str, float]]] | None = None
     if fred_tickers:
         _oldest = window_dates[-1]  # _previous_business_days returns newest-first
@@ -2140,7 +2150,7 @@ def _fetch_polygon_closes(
     captured = {r["ticker"] for r in records}
     missing_stocks = [
         t for t in tickers
-        if t.lstrip("^") not in captured and t.lstrip("^") not in _FRED_INDEX_MAP
+        if t.lstrip("^") not in captured and not _is_fred_index(t)
     ]
     if missing_stocks:
         recovered = _fetch_polygon_closes_per_ticker(missing_stocks, run_date, records)
@@ -2688,6 +2698,8 @@ def _fetch_fred_window(
 
     cache: dict[str, list[tuple[str, float]]] = {}
     for ticker in tickers:
+        if not _is_fred_index(ticker):
+            continue
         store_ticker = ticker.lstrip("^")
         series_id = _FRED_INDEX_MAP.get(store_ticker)
         if not series_id:
@@ -2730,8 +2742,8 @@ def _fetch_fred_closes(
 ) -> int:
     """Fetch FRED close on-or-before ``date_str`` for index tickers.
 
-    Serves the index/macro symbols not on polygon free tier
-    (VIX, VIX3M, TNX, IRX, TWO, HYOAS, BAA10Y).
+    Serves the caret-prefixed index symbols not on polygon free tier
+    (``^VIX``, ``^VIX3M``, ``^TNX``, and ``^IRX``).
 
     The query is bounded by ``observation_end=date_str`` so per-date calls
     from the windowed-reconciliation loop return that date's actual FRED
@@ -2758,6 +2770,8 @@ def _fetch_fred_closes(
     if window_cache is not None:
         count = 0
         for ticker in tickers:
+            if not _is_fred_index(ticker):
+                continue
             store_ticker = ticker.lstrip("^")
             series = window_cache.get(store_ticker)
             if not series:
@@ -2786,6 +2800,8 @@ def _fetch_fred_closes(
 
     count = 0
     for ticker in tickers:
+        if not _is_fred_index(ticker):
+            continue
         store_ticker = ticker.lstrip("^")
         series_id = _FRED_INDEX_MAP.get(store_ticker)
         if not series_id:
