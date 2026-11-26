@@ -75,6 +75,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import Callable, NotRequired, TypedDict, cast
 
 HERE = Path(__file__).parent.resolve()
 REPO_ROOT = HERE.parent.parent
@@ -105,6 +106,43 @@ _MARKER_RE = re.compile(r"\[wakes:[^\]]*\](?:\s*\[sibling-legs:[^\]]*\])?")
 
 class CouldNotMeasure(RuntimeError):
     """The live comparison could not be performed at all."""
+
+
+class RouterSchedule(TypedDict):
+    """The fields used from a router-targeting Scheduler schedule."""
+
+    name: str
+    playbook: str
+
+
+class ResourceEntry(TypedDict):
+    """The portion of ``trigger_descriptions.resource_index`` used here."""
+
+    wakes: set[str]
+    kinds: set[str]
+
+
+class Finding(TypedDict):
+    """A drift or pending row emitted by :func:`check`."""
+
+    resource: str
+    kind: str
+    detail: str
+    source_file: NotRequired[str]
+    expected: NotRequired[str]
+    actual: NotRequired[str]
+
+
+Registry = dict[str, object]
+Describe = Callable[[str, str], str | None]
+ListRouterSchedules = Callable[[], list[RouterSchedule]]
+
+# trigger_descriptions predates the strict typing rollout. Keep its untyped
+# internals behind this module's precisely typed boundary rather than allowing
+# Unknown to spread through the checker.
+_load_registry = cast(Callable[[], Registry], td.load_registry)
+_resource_index = cast(Callable[[Registry], dict[str, ResourceEntry]], td.resource_index)
+_marker_for = cast(Callable[[Registry, str, str], str], td.marker_for)
 
 
 # ── discovery ────────────────────────────────────────────────────────────────
@@ -174,7 +212,7 @@ def live_description(surface: str, name: str) -> str | None:
     return "" if out in ("", "None") else out
 
 
-def live_router_schedules() -> list[dict]:
+def live_router_schedules() -> list[RouterSchedule]:
     """Every live Scheduler schedule that targets the Overseer router.
 
     ``list-schedules`` does not return Target details, so each candidate needs a
@@ -188,7 +226,7 @@ def live_router_schedules() -> list[dict]:
     if rc != 0:
         _raise_if_unmeasurable(err, "listing schedules")
         raise CouldNotMeasure(f"listing schedules: {err}")
-    found: list[dict] = []
+    found: list[RouterSchedule] = []
     for name in (out.split() if out else []):
         rc, blob, err = _aws([
             "scheduler", "get-schedule", "--name", name,
@@ -198,16 +236,27 @@ def live_router_schedules() -> list[dict]:
             _raise_if_unmeasurable(err, f"reading scheduler:{name}")
             continue
         try:
-            target = json.loads(blob)
+            decoded = cast(object, json.loads(blob))
         except json.JSONDecodeError:
             continue
-        if ROUTER_FUNCTION not in (target.get("Arn") or ""):
+        if not isinstance(decoded, dict):
+            continue
+        target = cast(dict[str, object], decoded)
+        arn = target.get("Arn")
+        if not isinstance(arn, str) or ROUTER_FUNCTION not in arn:
             continue
         try:
-            playbook = (json.loads(target.get("Input") or "{}") or {}).get("playbook")
+            raw_input = target.get("Input")
+            payload = cast(
+                object, json.loads(raw_input if isinstance(raw_input, str) else "{}")
+            )
         except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            playbook = cast(dict[str, object], payload).get("playbook")
+        else:
             playbook = None
-        if playbook:
+        if isinstance(playbook, str) and playbook:
             found.append({"name": name, "playbook": playbook})
     return found
 
@@ -222,18 +271,18 @@ def extract_marker(description: str | None) -> str | None:
 
 
 def check(
-    registry: dict | None = None,
+    registry: Registry | None = None,
     covered: dict[str, str] | None = None,
-    describe=live_description,
-    list_router_schedules=live_router_schedules,
+    describe: Describe = live_description,
+    list_router_schedules: ListRouterSchedules = live_router_schedules,
     source_file: str | None = None,
-) -> tuple[list[dict], list[dict]]:
+) -> tuple[list[Finding], list[Finding]]:
     """``(findings, pending)``. Every collaborator is injected so the whole
     verdict surface is testable without AWS — including, deliberately, the
     failure paths, because a check nobody has watched fail is not a check."""
-    reg = registry if registry is not None else td.load_registry()
+    reg = registry if registry is not None else _load_registry()
     cov = covered if covered is not None else discover_reconciled_triggers()
-    index = td.resource_index(reg)
+    index = _resource_index(reg)
 
     # `--source-file` scopes the run to one deploy script's own resources, and
     # exists to remove a RACE rather than to narrow coverage. Each deploy
@@ -252,8 +301,8 @@ def check(
             )
         index = {k: v for k, v in index.items() if k in cov}
 
-    findings: list[dict] = []
-    pending: list[dict] = []
+    findings: list[Finding] = []
+    pending: list[Finding] = []
 
     for key in sorted(index):
         if key not in cov:
@@ -269,7 +318,7 @@ def check(
             continue
 
         surface, name = key.split(":", 1)
-        expected = td.marker_for(reg, surface, name)
+        expected = _marker_for(reg, surface, name)
         description = describe(surface, name)
 
         if description is None:
@@ -343,7 +392,7 @@ def check(
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     p.add_argument("--json", action="store_true")
     p.add_argument(
         "--source-file",
