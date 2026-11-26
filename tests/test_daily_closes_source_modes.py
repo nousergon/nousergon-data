@@ -14,8 +14,6 @@ These guard against the 2026-04-17 → 2026-04-23 silent-fail incident where
 polygon's 403 caused yfinance to silently substitute, writing VWAP=None
 across the entire universe.
 """
-# This legacy test module predates the repository-wide annotation gate.
-# ruff: noqa: ANN001, ANN003, ANN201, ANN202
 
 from __future__ import annotations
 
