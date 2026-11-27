@@ -184,5 +184,6 @@ if $SMOKE; then
   cat "${RESP}"
   echo ""
   assert_no_function_error "${INVOKE_STDOUT}" "${RESP}"
+  assert_json_response_has_field "${RESP}" "command_id" "substrate gate must issue its probe command"
   rm -f "${RESP}"
 fi

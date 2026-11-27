@@ -218,6 +218,7 @@ if $SMOKE; then
     echo "    dispatcher returned:"
     cat /tmp/thinktank-smoke-out.json; echo
     assert_no_function_error "${INVOKE_STDOUT}" /tmp/thinktank-smoke-out.json
+    assert_json_response_field /tmp/thinktank-smoke-out.json "launched" "true" "Think Tank dispatcher must launch its smoke box"
     echo "    Watch: aws ec2 get-console-output --instance-id <instance_id above> --latest"
     echo "           (the job unit logs to the console; the bootstrap log ships to"
     echo "           s3://alpha-engine-research/_ssm_logs/thinktank-spot/<date>/ on exit)"

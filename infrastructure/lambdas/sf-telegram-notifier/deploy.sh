@@ -340,5 +340,6 @@ EOF
   cat "${RESP}"
   echo ""
   assert_no_function_error "${INVOKE_STDOUT}" "${RESP}"
+  assert_json_response_field "${RESP}" "status" '"SUCCEEDED"' "notifier must process the synthetic SF event"
   rm -f "${RESP}"
 fi

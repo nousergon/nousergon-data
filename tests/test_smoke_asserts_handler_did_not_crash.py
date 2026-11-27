@@ -44,6 +44,7 @@ assertion from it.
 from __future__ import annotations
 
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -59,6 +60,57 @@ DEPLOY_SCRIPTS = sorted(REPO.glob("infrastructure/lambdas/*/deploy.sh"))
 _SMOKE_FLAG = re.compile(r'--smoke\)|"--smoke"')
 
 _ASSERT_CALLS = ("assert_no_function_error", "assert_sf_lambda_task_not_failed")
+_SEMANTIC_ASSERT_CALLS = (
+    "assert_json_response_field",
+    "assert_json_response_has_field",
+)
+_SEMANTIC_EXEMPTION_PREFIX = "SMOKE_SEMANTIC_EXEMPTION:"
+
+# These handlers cannot have their success precondition manufactured safely by
+# deploy.sh.  The exact explanation is pinned so an empty/stale exemption is
+# visible in review, and the companion test below makes every entry retire as
+# soon as its script gains a semantic assertion.
+REASONED_SEMANTIC_EXEMPTIONS: dict[str, str] = {
+    "alert-drain-liveness-probe": (
+        "reclaim success requires a real EC2 reclaim EventBridge event; the empty "
+        "smoke payload can only exercise the documented no-op path."
+    ),
+    "canary-replay-liveness-probe": (
+        "a successful check requires the live scheduled check window and its run "
+        "marker; the read-only smoke cannot create either on demand."
+    ),
+    "eod-backstop": (
+        "started_eod requires a trading day with no current or completed EOD; "
+        "smoke must not manufacture that live recovery condition."
+    ),
+}
+
+# The measured residual from alpha-engine-config-I7535.  This named set may
+# only shrink: scripts outside it already had established, sometimes inline,
+# semantic checks whose spellings predate the shared JSON helpers.
+I7554_RESIDUAL_SCRIPTS: frozenset[str] = frozenset(
+    {
+        "alert-drain-liveness-probe",
+        "arctic-migration-dispatcher",
+        "backstop-telegram-notifier",
+        "canary-replay-dispatcher",
+        "canary-replay-liveness-probe",
+        "changelog-incident-mirror",
+        "eod-backstop",
+        "eod-precondition-probe",
+        "overseer-backstop-responder",
+        "pipeline-watchdog",
+        "preflight-sweep-dispatcher",
+        "saturday-integrity-sentinel",
+        "saturday-sf-watch-dispatcher",
+        "sf-telegram-notifier",
+        "spot-orphan-reaper",
+        "ssm-liveness-poller",
+        "ssm-reachability-probe",
+        "substrate-health-gate",
+        "thinktank-spot-dispatcher",
+    }
+)
 
 # Scripts whose --smoke path recognizes the flag but is exempt from calling
 # the shared assertion. This set may ONLY SHRINK (mirrors
@@ -73,13 +125,13 @@ def _smoke_scripts() -> "list[Path]":
     return [p for p in DEPLOY_SCRIPTS if _SMOKE_FLAG.search(p.read_text())]
 
 
-def test_there_are_smoke_scripts_to_check():
+def test_there_are_smoke_scripts_to_check() -> None:
     """A guard that silently matches nothing is not a guard."""
     assert len(_smoke_scripts()) >= 30
 
 
 @pytest.mark.parametrize("script", _smoke_scripts(), ids=lambda p: p.parent.name)
-def test_smoke_path_sources_the_shared_helper(script: Path):
+def test_smoke_path_sources_the_shared_helper(script: Path) -> None:
     """One assertion, sourced — no script gets its own copy
     (`policy-shared-code`). The grandfather list may only shrink."""
     name = script.parent.name
@@ -94,7 +146,7 @@ def test_smoke_path_sources_the_shared_helper(script: Path):
 
 
 @pytest.mark.parametrize("script", _smoke_scripts(), ids=lambda p: p.parent.name)
-def test_smoke_path_calls_a_crash_assertion(script: Path):
+def test_smoke_path_calls_a_crash_assertion(script: Path) -> None:
     """Sourcing the helper is not enough — it must be CALLED. The grandfather
     list may only shrink."""
     name = script.parent.name
@@ -107,7 +159,7 @@ def test_smoke_path_calls_a_crash_assertion(script: Path):
     )
 
 
-def test_grandfather_list_names_only_real_scripts():
+def test_grandfather_list_names_only_real_scripts() -> None:
     """A stale grandfather entry hides a script that no longer exists, and
     makes the list look smaller than the debt it represents."""
     names = {p.parent.name for p in _smoke_scripts()}
@@ -119,7 +171,7 @@ def test_grandfather_list_names_only_real_scripts():
     )
 
 
-def test_grandfather_list_entries_still_actually_lack_the_check():
+def test_grandfather_list_entries_still_actually_lack_the_check() -> None:
     """The self-retiring half: an entry that stops tripping the gap it names
     must be REMOVED, not left as a permanent exemption nobody re-examines.
     This is what makes the list shrink instead of just not grow — it turns
@@ -138,3 +190,93 @@ def test_grandfather_list_entries_still_actually_lack_the_check():
             f"crash assertion — remove it from GRANDFATHERED_NO_CRASH_CHECK, "
             f"the gap it was tracking is closed."
         )
+
+
+def _semantic_assertions(body: str) -> list[str]:
+    return [call for call in _SEMANTIC_ASSERT_CALLS if call in body]
+
+
+def _semantic_exemption(body: str) -> str | None:
+    for line in body.splitlines():
+        if _SEMANTIC_EXEMPTION_PREFIX in line:
+            return line.split(_SEMANTIC_EXEMPTION_PREFIX, 1)[1].strip()
+    return None
+
+
+@pytest.mark.parametrize(
+    "script",
+    [p for p in _smoke_scripts() if p.parent.name in I7554_RESIDUAL_SCRIPTS],
+    ids=lambda p: p.parent.name,
+)
+def test_crash_only_smoke_paths_are_reasoned_exemptions(script: Path) -> None:
+    """A crash check alone must never read as semantic smoke coverage."""
+    name = script.parent.name
+    body = script.read_text()
+    semantic = _semantic_assertions(body)
+    reason = _semantic_exemption(body)
+    if semantic:
+        assert name not in REASONED_SEMANTIC_EXEMPTIONS, (
+            f"{name} gained {semantic}; remove its self-retiring exemption"
+        )
+        assert reason is None, f"{name} has both a semantic assertion and an exemption"
+        return
+
+    assert name in REASONED_SEMANTIC_EXEMPTIONS, (
+        f"{name} has only a crash assertion and no named semantic exemption"
+    )
+    assert reason == REASONED_SEMANTIC_EXEMPTIONS[name], (
+        f"{name}'s script must carry its exact, reviewable exemption reason"
+    )
+
+
+def test_semantic_exemption_set_names_only_current_smoke_scripts() -> None:
+    names = {path.parent.name for path in _smoke_scripts()}
+    assert not REASONED_SEMANTIC_EXEMPTIONS.keys() - names
+
+
+def test_i7554_residual_set_names_only_current_smoke_scripts() -> None:
+    names = {path.parent.name for path in _smoke_scripts()}
+    assert not I7554_RESIDUAL_SCRIPTS - names
+
+
+@pytest.mark.parametrize(
+    ("body", "semantic", "reason"),
+    [
+        ("assert_json_response_field response ok true done", True, None),
+        ("assert_no_function_error invoke response", False, None),
+        (
+            "# SMOKE_SEMANTIC_EXEMPTION: cannot create the subject on demand.",
+            False,
+            "cannot create the subject on demand.",
+        ),
+        (
+            "# SMOKE_SEMANTIC_EXEMPTION: obsolete\n"
+            "assert_json_response_has_field response result done",
+            True,
+            "obsolete",
+        ),
+    ],
+    ids=("semantic", "crash-only", "valid-exemption", "self-retiring-exemption"),
+)
+def test_semantic_smoke_classification_shapes(
+    body: str, semantic: bool, reason: str | None
+) -> None:
+    """Pin all four guard shapes without deriving expectations from the guard."""
+    assert bool(_semantic_assertions(body)) is semantic
+    assert _semantic_exemption(body) == reason
+
+
+def test_json_response_assertion_fails_loud_for_broken_handler(tmp_path: Path) -> None:
+    """Local rehearsal: the shared assertion rejects a quiet false success."""
+    response = tmp_path / "response.json"
+    response.write_text('{"launched": false, "reason": "broken copy"}')
+    helper = REPO / "infrastructure/lambdas/_shared/smoke.sh"
+    command = (
+        f"source {helper}; assert_json_response_field {response} launched true "
+        "'dispatcher must launch'"
+    )
+    completed = subprocess.run(
+        ["bash", "-c", command], capture_output=True, text=True, check=False
+    )
+    assert completed.returncode != 0
+    assert "SMOKE FAILED: dispatcher must launch" in completed.stderr

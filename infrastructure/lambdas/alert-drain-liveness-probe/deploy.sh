@@ -268,5 +268,6 @@ if $SMOKE; then
     --payload '{}' --region "${REGION}" "${RESP}")
   cat "${RESP}"; echo ""
   assert_no_function_error "${INVOKE_STDOUT}" "${RESP}"
+  # SMOKE_SEMANTIC_EXEMPTION: reclaim success requires a real EC2 reclaim EventBridge event; the empty smoke payload can only exercise the documented no-op path.
   rm -f "${RESP}"
 fi

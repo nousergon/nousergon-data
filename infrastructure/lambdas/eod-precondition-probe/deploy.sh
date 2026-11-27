@@ -176,5 +176,6 @@ if $SMOKE; then
   cat "${RESP}"
   echo ""
   assert_no_function_error "${INVOKE_STDOUT}" "${RESP}"
+  assert_json_response_has_field "${RESP}" "precondition_met" "probe must evaluate today’s preconditions"
   rm -f "${RESP}"
 fi

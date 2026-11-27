@@ -189,5 +189,6 @@ if $SMOKE; then
   cat "${RESP}"
   echo ""
   assert_no_function_error "${INVOKE_STDOUT}" "${RESP}"
+  assert_json_response_field "${RESP}" "status" '"Registering"' "poller must classify the nonexistent command as registering"
   rm -f "${RESP}"
 fi

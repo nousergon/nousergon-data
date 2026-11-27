@@ -247,4 +247,5 @@ if $SMOKE; then
   cat "${RESP}"
   echo ""
   assert_no_function_error "${INVOKE_STDOUT}" "${RESP}"
+  assert_json_response_has_field "${RESP}" "expected" "reachability probe must scan the configured fleet"
 fi

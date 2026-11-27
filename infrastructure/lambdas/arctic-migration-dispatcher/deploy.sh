@@ -283,6 +283,7 @@ if $SMOKE; then
   cat "${RESP}"
   echo ""
   assert_no_function_error "${INVOKE_STDOUT}" "${RESP}"
+  assert_json_response_field "${RESP}" "launched" "true" "migration dispatcher must launch its smoke run"
 fi
 
 echo ""

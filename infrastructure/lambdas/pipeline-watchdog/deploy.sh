@@ -307,5 +307,6 @@ if $SMOKE; then
   cat "${RESP}"
   echo ""
   assert_no_function_error "${INVOKE_STDOUT}" "${RESP}"
+  assert_json_response_has_field "${RESP}" "weekly_silence_check" "watchdog must complete its check chain"
   rm -f "${RESP}"
 fi

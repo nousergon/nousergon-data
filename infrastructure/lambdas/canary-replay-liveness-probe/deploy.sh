@@ -225,4 +225,5 @@ if $SMOKE; then
   cat "${RESP}"
   echo ""
   assert_no_function_error "${INVOKE_STDOUT}" "${RESP}"
+  # SMOKE_SEMANTIC_EXEMPTION: a successful check requires the live scheduled check window and its run marker; the read-only smoke cannot create either on demand.
 fi

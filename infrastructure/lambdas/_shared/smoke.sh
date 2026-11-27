@@ -99,6 +99,60 @@ sys.exit(0)
 PY
 }
 
+# Assert one handler-contract field in a JSON Lambda response.  Keep the JSON
+# parsing and fail-loud diagnostic here so deploy scripts only declare the
+# field/value which proves their particular smoke payload did its job.
+assert_json_response_field() {
+  local resp_file="${1:?assert_json_response_field: response file required}"
+  local field="${2:?assert_json_response_field: field required}"
+  local expected="${3:?assert_json_response_field: expected JSON required}"
+  local description="${4:?assert_json_response_field: description required}"
+
+  python3 - "${resp_file}" "${field}" "${expected}" "${description}" <<'PY'
+import json
+import sys
+
+path, field, expected_json, description = sys.argv[1:]
+try:
+    with open(path, encoding="utf-8") as response_file:
+        value = json.load(response_file)
+    for part in field.split("."):
+        value = value[int(part)] if isinstance(value, list) else value[part]
+    expected = json.loads(expected_json)
+except (OSError, json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as exc:
+    print(f"SMOKE FAILED: {description}: invalid/missing {field!r}: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+if value != expected:
+    print(
+        f"SMOKE FAILED: {description}: expected {field}={expected!r}, got {value!r}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+PY
+}
+
+assert_json_response_has_field() {
+  local resp_file="${1:?assert_json_response_has_field: response file required}"
+  local field="${2:?assert_json_response_has_field: field required}"
+  local description="${3:?assert_json_response_has_field: description required}"
+
+  python3 - "${resp_file}" "${field}" "${description}" <<'PY'
+import json
+import sys
+
+path, field, description = sys.argv[1:]
+try:
+    with open(path, encoding="utf-8") as response_file:
+        value = json.load(response_file)
+    for part in field.split("."):
+        value = value[int(part)] if isinstance(value, list) else value[part]
+except (OSError, json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as exc:
+    print(f"SMOKE FAILED: {description}: invalid/missing {field!r}: {exc}", file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
 # assert_sf_lambda_task_not_failed — the same crash check for the ONE deploy.sh
 # (scheduled-groom-dispatcher) whose --smoke path dispatches through a Step
 # Function rather than a direct `aws lambda invoke`, so there is no invoke

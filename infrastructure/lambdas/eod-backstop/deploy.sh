@@ -338,5 +338,6 @@ if $SMOKE; then
   cat "${RESP}"
   echo ""
   assert_no_function_error "${INVOKE_STDOUT}" "${RESP}"
+  # SMOKE_SEMANTIC_EXEMPTION: started_eod requires a trading day with no current or completed EOD; smoke must not manufacture that live recovery condition.
   rm -f "${RESP}"
 fi
