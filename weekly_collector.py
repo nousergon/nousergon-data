@@ -3302,6 +3302,7 @@ def _self_heal_chronic_polygon_gaps(
         return summary
 
     import pandas as _pd
+    from typing import Any as _Any
 
     for ticker in chronic_tickers:
         try:
@@ -3321,8 +3322,13 @@ def _self_heal_chronic_polygon_gaps(
                 )
                 continue
 
+            # Include the last stored session as an overlap.  With
+            # ``auto_adjust=True``, a dividend in the missing window changes
+            # the adjusted values yfinance returns for earlier sessions.  A
+            # fetch starting only after ``existing_last`` cannot see that the
+            # cached history is now on the old adjustment scale.
             start_ts = (
-                (existing_last + _pd.Timedelta(days=1))
+                existing_last
                 if existing_last is not None
                 else (target_ts - _pd.Timedelta(days=30))
             )
@@ -3374,7 +3380,54 @@ def _self_heal_chronic_polygon_gaps(
                 except s3.exceptions.NoSuchKey:
                     continue
 
-            combined_pcache = _pd.concat([existing_pcache, new_rows])
+            existing_any: _Any = existing_pcache  # pyright: ignore[reportExplicitAny]
+            new_any: _Any = new_rows  # pyright: ignore[reportUnknownVariableType, reportExplicitAny]
+            combined_pcache = _pd.concat([existing_any, new_any])  # pyright: ignore[reportUnknownArgumentType]
+
+            overlap = existing_any.index.intersection(new_any.index)  # pyright: ignore[reportUnknownMemberType]
+            if len(overlap) and "Close" in existing_any and "Close" in new_any:
+                old_close = existing_any.loc[overlap, "Close"].astype(float)
+                new_close = new_any.loc[overlap, "Close"].astype(float)  # pyright: ignore[reportUnknownVariableType, reportUnknownMemberType]
+                adjustment_changed = not _pd.Series(  # pyright: ignore[reportUnknownMemberType]
+                    __import__("numpy").isclose(
+                        old_close.to_numpy(),
+                        new_close.to_numpy(),  # pyright: ignore[reportUnknownMemberType]
+                        rtol=1e-7,
+                        atol=1e-8,
+                        equal_nan=True,
+                    )
+                ).all()
+                if adjustment_changed:
+                    full_start = _pd.Timestamp(existing_any.index.min()).normalize()  # pyright: ignore[reportUnknownVariableType, reportUnknownMemberType, reportAttributeAccessIssue]
+                    with quiet_yfinance():
+                        full_yf_raw = _yf.download(  # pyright: ignore[reportUnknownMemberType]
+                            ticker,
+                            start=full_start.strftime("%Y-%m-%d"),  # pyright: ignore[reportUnknownMemberType]
+                            end=end_excl.strftime("%Y-%m-%d"),
+                            progress=False,
+                            auto_adjust=True,
+                            timeout=30,
+                        )
+                    if full_yf_raw is None:
+                        raise ValueError(
+                            "yfinance returned no rows for full-history adjustment refresh"
+                        )
+                    full_yf_df: _Any = full_yf_raw  # pyright: ignore[reportExplicitAny]
+                    if isinstance(full_yf_df.columns, _pd.MultiIndex):
+                        full_yf_df.columns = full_yf_df.columns.get_level_values(0)  # pyright: ignore[reportUnknownMemberType]
+                    full_yf_df = full_yf_df[
+                        (full_yf_df.index >= full_start)
+                        & (full_yf_df.index <= target_ts)
+                    ]
+                    if full_yf_df.empty:
+                        raise ValueError(
+                            "yfinance returned no rows for full-history adjustment refresh"
+                        )
+                    new_any = full_yf_df[
+                        [c for c in ohlcv_cols if c in full_yf_df.columns]
+                    ].copy()
+                    combined_pcache = _pd.concat([existing_any, new_any])
+
             combined_pcache = combined_pcache[
                 ~combined_pcache.index.duplicated(keep="last")
             ].sort_index()
@@ -3408,8 +3461,10 @@ def _self_heal_chronic_polygon_gaps(
                     "previous_last_date": (
                         str(existing_last.date()) if existing_last is not None else None
                     ),
-                    "rows_added": int(len(new_rows)),
-                    "new_last_date": str(new_rows.index[-1].date()),
+                    "rows_added": int((new_any.index > existing_last).sum())  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
+                    if existing_last is not None
+                    else int(len(new_any)),  # pyright: ignore[reportUnknownArgumentType]
+                    "new_last_date": str(new_any.index[-1].date()),  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
                 }
             )
             logger.info(
