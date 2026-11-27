@@ -638,14 +638,19 @@ def _enumerate_put_sites() -> dict[str, int]:
         # ``put_object(`` and ``upload_file(`` rather than counting
         # the bare words so docstring / comment mentions don't inflate.
         matches = re.findall(r"\b(?:put_object|upload_file)\(", text)
-        counts[rel] = len(matches)
+        protocol_declarations = re.findall(
+            r"^\s*def (?:put_object|upload_file)\([^\n]*\)\s*->[^:\n]+:\s*\.\.\.\s*$",
+            text,
+            flags=re.MULTILINE,
+        )
+        counts[rel] = len(matches) - len(protocol_declarations)
     return counts
 
 
 # ── Tests ───────────────────────────────────────────────────────────────────
 
 
-def test_every_producer_file_is_pinned():
+def test_every_producer_file_is_pinned() -> None:
     """Every file containing a PUT site is enumerated in
     :data:`EXPECTED_PER_FILE_PUT_COUNTS`. A new file with a PUT site
     forces the operator to (a) register the artifact in
@@ -667,7 +672,7 @@ def test_every_producer_file_is_pinned():
     )
 
 
-def test_every_pinned_file_still_exists():
+def test_every_pinned_file_still_exists() -> None:
     """The pinned set must stay aligned with the actual repo state.
     A file removed without updating this set is a stale pin."""
     actual = _enumerate_put_sites()
@@ -681,7 +686,7 @@ def test_every_pinned_file_still_exists():
     )
 
 
-def test_pinned_counts_match_actual():
+def test_pinned_counts_match_actual() -> None:
     """Per-file PUT-site counts must match the pinned values. A
     delta forces operator review: new PUT site needs registry entry;
     removed PUT site may need registry retirement."""

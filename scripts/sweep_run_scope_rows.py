@@ -82,6 +82,7 @@ class _Client(Protocol):
     def describe_execution(self, **kwargs: object) -> _Json: ...
     def describe_state_machine_for_execution(self, **kwargs: object) -> _Json: ...
     def get_object(self, **kwargs: object) -> _Json: ...
+    def put_object(self, **kwargs: object) -> object: ...
 
 
 def _json_object(value: object) -> _Json:
@@ -173,7 +174,7 @@ def row_authors(stored: _Json) -> list[str]:
         if isinstance(arn, str) and arn and arn not in authors:
             authors.append(arn)
 
-    for row in _json_object(stored.get("stages")).values():
+    for _, row in sorted(_json_object(stored.get("stages")).items()):
         row_object = _json_object(row)
         _add(row_object.get("recorded_by_execution_arn") or fallback)
     _add(fallback)
@@ -391,8 +392,7 @@ def write_artifact(
     if not etag:
         raise SweepWriteConflict(f"no ETag was read for s3://{bucket}/{key}; refusing to write")
     try:
-        put_object = cast(Callable[..., object], getattr(s3, "put_object"))
-        put_object(
+        s3.put_object(
             Bucket=bucket,
             Key=key,
             Body=json.dumps(body, indent=2, sort_keys=True).encode("utf-8"),
