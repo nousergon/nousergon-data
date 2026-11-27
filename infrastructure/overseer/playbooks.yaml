@@ -1033,6 +1033,16 @@ alert_classes:
     # finding.
     tier: tracked-only
     chat: none
+  - class: backtester_parity_alarm
+    source: "alpha-engine-backtester/analysis/parity_alarms.py"
+    severities: [error]
+    intake: bus
+    response: drain-queue
+    tier: tracked-only
+    chat: none
+    operator_reason: >-
+      drain-queue is the closed loop: parity mismatches require diagnosis of
+      the compared runs, not an automatic mutation of backtest evidence.
   - class: backtester_input_quality
     source: "alpha-engine-backtester/analysis/input_quality.py"
     severities: [warning]
@@ -2427,7 +2437,63 @@ alert_classes:
     tier: tracked-only
     chat: none
 
+  # ── alert sources found by the I9449 fleet sweep (config-I9461) ──
+  - class: weekly_coverage_sweep
+    source: "stage-coverage-sweep/*"
+    severities: [error]
+    intake: bus
+    response: drain-queue
+    tier: tracked-only
+    chat: none
+    operator_reason: >-
+      drain-queue is the closed loop: the finding names the missing stage
+      evidence for triage, while the sweep must not manufacture that evidence.
+  - class: router_funded_depth
+    source: "router-funded-depth"
+    severities: [warning, critical]
+    intake: bus
+    response: drain-queue
+    tier: tracked-only
+    chat: none
+    operator_reason: >-
+      drain-queue is the closed loop: funded-depth degradation requires
+      diagnosis of the router and its providers, not an automatic config edit.
+  - class: alpha_engine_health_checker
+    source: "alpha-engine/infrastructure/health_checker.sh"
+    severities: [error]
+    intake: bus
+    response: drain-queue
+    tier: tracked-only
+    chat: none
+    operator_reason: >-
+      drain-queue is the closed loop: the health finding supplies the failed
+      check for operator diagnosis; no universal repair is safe.
+
   # ── DRAIN-BLIND rows (every one carries its migration or declaration) ──
+  - class: sweep_artifact_monitor_raw_sns
+    source: "raw-sns:infrastructure/lambdas/sweep-artifact-monitor/index.py"
+    severities: [error]
+    intake: none
+    response: operator
+    tier: tracked-only
+    chat: none
+    migration_issue: alpha-engine-config-I2908
+  - class: spot_orphan_reaper_raw_telegram
+    source: "raw-telegram:infrastructure/lambdas/spot-orphan-reaper/index.py"
+    severities: [warning]
+    intake: none
+    response: operator
+    tier: tracked-only
+    chat: none
+    migration_issue: alpha-engine-config-I2908
+  - class: weekly_sf_silence_deadman_raw_sns
+    source: "raw-sns:scripts/weekly_sf_silence_deadman.py"
+    severities: [critical]
+    intake: none
+    response: operator
+    tier: tracked-only
+    chat: none
+    migration_issue: alpha-engine-config-I2908
   - class: executor_emergency_shutdown
     source: "raw-sns:executor/emergency_shutdown.py"
     severities: [critical]
