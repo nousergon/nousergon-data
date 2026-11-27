@@ -691,6 +691,52 @@ class TestCodifiedRootDiscovery:
         assert buried not in roots
         assert venv not in roots
 
+    def test_demo_units_in_nested_systemd_root_are_clean(self, cd, tmp_path, monkeypatch, capsys):
+        """The metron demo layout is codified despite its infrastructure nesting."""
+        module, _, installed_dir = cd
+        home = tmp_path / "home"
+        root = home / "metron-ops" / "infrastructure" / "demo" / "systemd"
+        root.mkdir(parents=True)
+        for name in ("metron-demo-api.service", "metron-demo-web.service"):
+            (root / name).write_text(f"UNIT {name}\n")
+            (installed_dir / name).write_text(f"UNIT {name}\n")
+
+        monkeypatch.setattr(module, "CODIFIED_SEARCH_BASES", (home,))
+        monkeypatch.setattr("sys.argv", ["check-systemd-unit-drift.py"])
+        code = module.main()
+        cap = capsys.readouterr()
+
+        assert code == 0
+        assert "[clean] metron-demo-api.service" in cap.out
+        assert "[clean] metron-demo-web.service" in cap.out
+        assert "uncodified=0" in cap.out
+
+    def test_nested_walk_prunes_and_survives_unreadable_directories(
+        self, cd, tmp_path, monkeypatch, capsys
+    ):
+        module, _, _ = cd
+        infrastructure = tmp_path / "repo" / "infrastructure"
+        readable = infrastructure / "demo" / "systemd"
+        unreadable = infrastructure / "blocked"
+        pruned = infrastructure / ".venv" / "systemd"
+        readable.mkdir(parents=True)
+        unreadable.mkdir()
+        pruned.mkdir(parents=True)
+        original_iterdir = Path.iterdir
+
+        def fake_iterdir(path):
+            if path == unreadable:
+                raise PermissionError("blocked for test")
+            return original_iterdir(path)
+
+        monkeypatch.setattr(Path, "iterdir", fake_iterdir)
+        roots = module.discover_codified_roots(bases=[tmp_path])
+
+        assert infrastructure in roots
+        assert readable in roots
+        assert pruned not in roots
+        assert f"could not list {unreadable}" in capsys.readouterr().err
+
     def test_explicit_roots_are_additive_never_a_replacement(self, cd, tmp_path, monkeypatch, capsys):
         """`--codified-root` narrowing coverage back to a hand-written list is
         how I6960 would return through the flag instead of the unit file."""
