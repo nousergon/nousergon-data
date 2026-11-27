@@ -1175,6 +1175,7 @@ def test_definition_input_coherence_ignores_mid_flow_refs():
                 "Type": "Task",
                 "Resource": "arn:aws:states:::lambda:invoke",
                 "Parameters": {"FunctionName": "launcher"},
+                "ResultSelector": {"Payload": {"instance_id": "i-test"}},
                 "ResultPath": "$.launch_result",
                 "Next": "Wrap",
             },
@@ -1185,22 +1186,23 @@ def test_definition_input_coherence_ignores_mid_flow_refs():
                 "Parameters": {
                     "merged.$": "States.JsonMerge($, States.StringToJson("
                                 "States.Format('{\"ec2_instance_id\":[\"{}\"]}', "
-                                "$.launch_result.instance_id)), false)"
+                                "$.launch_result.Payload.instance_id)), false)"
                 },
                 "OutputPath": "$.merged",
                 "Next": "Poll",
             },
-            "Poll": {  # output-replacing Task: emits the raw SSM response
+            "Poll": {
                 "Type": "Task",
                 "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
                 "Parameters": {"InstanceIds.$": "$.ec2_instance_id[0]"},
+                "ResultPath": "$.poll",
                 "Next": "Done",
             },
             "Done": {
                 "Type": "Pass",
                 "Parameters": {
-                    "status.$": "$.Status",                     # SSM response field
-                    "payload.$": "$.launch_result.Payload",     # prior state's result
+                    "status.$": "$.poll.Status",                # SSM response field
+                    "payload.$": "$.launch_result.Payload",     # earlier Task result
                     "instance.$": "$.ec2_instance_id[0]",       # intrinsic-written
                     "role.$": "$.pipeline_role",                # execution input
                 },
@@ -1213,8 +1215,95 @@ def test_definition_input_coherence_ignores_mid_flow_refs():
     with patch("boto3.client", return_value=fake_sfn):
         result = sfp.check_definition_input_coherence(_ctx())
     assert result.status == "ok", result.details
-    assert result.details["undecidable_refs"] >= 3
-    assert result.details["checked"] >= 1  # $.pipeline_role still verified
+    assert result.details["checked"] >= 4
+
+
+def test_definition_input_coherence_models_mid_flow_dataflow():
+    """Parallel, Map, service results, and JsonMerge retain exact shapes."""
+    import json
+
+    sf_def = {
+        "StartAt": "Parallel",
+        "States": {
+            "Parallel": {
+                "Type": "Parallel",
+                "Branches": [{
+                    "StartAt": "Branch",
+                    "States": {"Branch": {
+                        "Type": "Pass",
+                        "Parameters": {
+                            "valid.$": "$.pipeline_role",
+                            "broken.$": "$.missing_parallel",
+                        },
+                        "End": True,
+                    }},
+                }],
+                "ResultPath": "$.parallel",
+                "Next": "Items",
+            },
+            "Items": {
+                "Type": "Pass",
+                "Result": [{"name": "one"}],
+                "ResultPath": "$.items",
+                "Next": "Map",
+            },
+            "Map": {
+                "Type": "Map",
+                "ItemsPath": "$.items",
+                "ItemProcessor": {
+                    "StartAt": "Item",
+                    "States": {"Item": {
+                        "Type": "Pass",
+                        "Parameters": {
+                            "valid.$": "$.name",
+                            "broken.$": "$.missing_map",
+                        },
+                        "End": True,
+                    }},
+                },
+                "ResultPath": "$.mapped",
+                "Next": "Poll",
+            },
+            "Poll": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+                "ResultPath": "$.poll",
+                "Next": "Merge",
+            },
+            "Merge": {
+                "Type": "Pass",
+                "Parameters": {
+                    "merged.$": "States.JsonMerge($, States.StringToJson("
+                    "States.Format('{\"ec2_instance_id\":[\"{}\"]}', "
+                    "$.pipeline_role)), false)"
+                },
+                "OutputPath": "$.merged",
+                "Next": "Check",
+            },
+            "Check": {
+                "Type": "Pass",
+                "Parameters": {
+                    "valid_service.$": "$.poll.Status",
+                    "broken_service.$": "$.poll.NoSuchField",
+                    "valid_merge.$": "$.ec2_instance_id[0]",
+                    "broken_merge.$": "$.missing_merge",
+                },
+                "End": True,
+            },
+        },
+    }
+    fake_sfn = MagicMock()
+    fake_sfn.describe_state_machine.return_value = {"definition": json.dumps(sf_def)}
+    with patch("boto3.client", return_value=fake_sfn):
+        result = sfp.check_definition_input_coherence(_ctx())
+    assert result.status == "fail"
+    failures = {(item["state"], item["reference"]) for item in result.details["failures"]}
+    assert failures == {
+        ("Branch", "$.missing_parallel"),
+        ("Item", "$.missing_map"),
+        ("Check", "$.poll.NoSuchField"),
+        ("Check", "$.missing_merge"),
+    }
 
 
 # ── check_skip_flag_artifact_coherence (alpha-engine-config-I7443) ────────────

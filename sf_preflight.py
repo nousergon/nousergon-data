@@ -52,7 +52,8 @@ import logging
 import sys
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from pathlib import Path
+from typing import Any, cast
 
 log = logging.getLogger(__name__)
 
@@ -942,7 +943,7 @@ def scan_command_checkouts(command_value: str) -> "list[str]":
     return seen
 
 
-def _read_pinned_version(requirements_path) -> str | None:
+def _read_pinned_version(requirements_path: Path) -> str | None:
     """Read a package version from a requirements file.
 
     Supports ``pinned==X.Y.Z`` lines. Returns the version string or None.
@@ -1031,7 +1032,7 @@ def check_tool_contracts(ctx: PreflightContext) -> CheckResult:
     checked = 0
     seen_repos: set[str] = set()
 
-    def _walk_commands(node) -> None:
+    def _walk_commands(node: object) -> None:
         nonlocal checked
         if isinstance(node, dict):
             for key, val in node.items():
@@ -1194,7 +1195,7 @@ _SELF_DESCRIBING_KEYS = {
 }
 
 
-def _collect_jsonpath_refs(node, path: str = "") -> list[tuple[str, str]]:
+def _collect_jsonpath_refs(node: object, path: str = "") -> list[tuple[str, str]]:
     """Collect every JSONPath reference (``.$``-suffixed key or JSONPath in
     a string value) from the SF definition.
 
@@ -1202,24 +1203,24 @@ def _collect_jsonpath_refs(node, path: str = "") -> list[tuple[str, str]]:
     """
     refs: list[tuple[str, str]] = []
     if isinstance(node, dict):
-        for key, val in node.items():
-            child_path = f"{path}.{key}" if path else key
+        for key, val in cast("dict[str, object]", node).items():
+            child_path = f"{path}.{key}" if path else str(key)
             if key.endswith(".$") and isinstance(val, str) and val.startswith("$"):
                 refs.append((val, child_path))
             elif key.endswith(".$") and isinstance(val, str):
                 # Non-JSONPath .$ reference (e.g. literal template)
                 pass
             elif isinstance(val, (dict, list)):
-                refs.extend(_collect_jsonpath_refs(val, child_path))
+                refs.extend(_collect_jsonpath_refs(cast(object, val), child_path))
     elif isinstance(node, list):
         for i, item in enumerate(node):
             child_path = f"{path}[{i}]"
             if isinstance(item, (dict, list)):
-                refs.extend(_collect_jsonpath_refs(item, child_path))
+                refs.extend(_collect_jsonpath_refs(cast(object, item), child_path))
     return refs
 
 
-def _collect_produced_roots(node) -> "set[str]":
+def _collect_produced_roots(node: object) -> "set[str]":
     """Top-level keys the definition WRITES somewhere, from three shapes.
 
     A ref rooted in one of these does not resolve against the execution
@@ -1252,14 +1253,14 @@ def _collect_produced_roots(node) -> "set[str]":
                 roots.update(
                     _re.findall(r'\{\s*\\?"([A-Za-z_][A-Za-z0-9_]*)\\?"\s*:', val)
                 )
-            roots.update(_collect_produced_roots(val))
+            roots.update(_collect_produced_roots(cast(object, val)))
     elif isinstance(node, list):
         for item in node:
             roots.update(_collect_produced_roots(item))
     return roots
 
 
-def _has_output_replacing_state(node) -> bool:
+def _has_output_replacing_state(node: object) -> bool:
     """True if any state REPLACES its output with something the definition
     does not name — an AWS API response.
 
@@ -1286,7 +1287,7 @@ def _has_output_replacing_state(node) -> bool:
     return False
 
 
-def _build_proposed_input(skip_flags: dict[str, bool] | None = None) -> dict:
+def _build_proposed_input(skip_flags: dict[str, bool] | None = None) -> "dict[str, object]":
     """Build a proposed execution input that exercises all code paths.
 
     Includes realistic values for every known path the SF definition
@@ -1294,7 +1295,7 @@ def _build_proposed_input(skip_flags: dict[str, bool] | None = None) -> dict:
     JSONPath behind the skip gate is reachable). Takes an optional override
     dict for testing specific skip_* combinations.
     """
-    base = {
+    base: dict[str, object] = {
         "pipeline_role": "weekly",
         "run_date": "2026-07-28",
         "sns_topic_arn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
@@ -1333,6 +1334,379 @@ def _build_proposed_input(skip_flags: dict[str, bool] | None = None) -> dict:
     return base
 
 
+class _UnknownShape:
+    """A value whose ASL shape cannot be established statically."""
+
+
+class _MissingShape:
+    """A path that is provably absent from an otherwise known shape."""
+
+
+_UNKNOWN_SHAPE = _UnknownShape()
+_MISSING_SHAPE = _MissingShape()
+
+_TASK_RESPONSE_SHAPES: "dict[str, dict[str, object]]" = {
+    "arn:aws:states:::aws-sdk:ssm:getCommandInvocation": {
+        "Status": "",
+        "ResponseCode": 0,
+        "StandardOutputContent": "",
+        "StandardErrorContent": "",
+    },
+    "arn:aws:states:::lambda:invoke": {"Payload": _UNKNOWN_SHAPE},
+}
+
+
+def _jsonpath_parts(path: str) -> "list[str | int] | None":
+    """Parse the simple reference paths used by ASL data-flow fields."""
+    import re
+
+    if path == "$":
+        return []
+    if not path.startswith("$."):
+        return None
+    parts: list[str | int] = []
+    for name, index in re.findall(r"(?:^|\.)([A-Za-z_][A-Za-z0-9_-]*)|\[(\d+)\]", path[1:]):
+        parts.append(name if name else int(index))
+    return parts
+
+
+def _shape_at(value: object, path: str) -> object:
+    """Return a path's abstract value, distinguishing unknown from missing."""
+    if path.startswith("$$"):
+        return _UNKNOWN_SHAPE
+    parts = _jsonpath_parts(path)
+    if parts is None:
+        return _UNKNOWN_SHAPE
+    current = value
+    for part in parts:
+        if current is _UNKNOWN_SHAPE:
+            return current
+        if isinstance(part, str) and isinstance(current, dict):
+            current_dict = cast("dict[str, object]", current)
+            if part not in current_dict:
+                return _MISSING_SHAPE
+            current = current_dict[part]
+        elif isinstance(part, int) and isinstance(current, list):
+            current_list = cast("list[object]", current)
+            if not current_list:
+                return _MISSING_SHAPE
+            # A one-element abstract list represents every item in a Map result.
+            current = current_list[part] if part < len(current_list) else current_list[0]
+        else:
+            return _MISSING_SHAPE
+    return current
+
+
+def _split_intrinsic_args(text: str) -> list[str]:
+    """Split intrinsic arguments without splitting nested calls or strings."""
+    args: list[str] = []
+    start = 0
+    depth = 0
+    quote = ""
+    escaped = False
+    for index, char in enumerate(text):
+        if escaped:
+            escaped = False
+        elif char == "\\" and quote:
+            escaped = True
+        elif quote:
+            if char == quote:
+                quote = ""
+        elif char in "'\"":
+            quote = char
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        elif char == "," and depth == 0:
+            args.append(text[start:index].strip())
+            start = index + 1
+    args.append(text[start:].strip())
+    return args
+
+
+def _eval_asl_expression(expression: str, value: object) -> object:
+    """Evaluate the shape-preserving subset of ASL intrinsics used here."""
+    import ast
+    import json as _json
+
+    if expression.startswith("$"):
+        return _shape_at(value, expression)
+    if not expression.startswith("States.") or not expression.endswith(")"):
+        return _UNKNOWN_SHAPE
+    name, _, body = expression.partition("(")
+    args = _split_intrinsic_args(body[:-1])
+    if name == "States.JsonMerge" and len(args) == 3:
+        left = _eval_asl_expression(args[0], value)
+        right = _eval_asl_expression(args[1], value)
+        if isinstance(left, dict) and isinstance(right, dict):
+            return {
+                **cast("dict[str, object]", left),
+                **cast("dict[str, object]", right),
+            }
+        return _UNKNOWN_SHAPE
+    if name == "States.StringToJson" and len(args) == 1:
+        rendered = _eval_asl_expression(args[0], value)
+        if not isinstance(rendered, str):
+            return _UNKNOWN_SHAPE
+        try:
+            return _json.loads(rendered)
+        except (TypeError, ValueError):
+            return _UNKNOWN_SHAPE
+    if name == "States.Format" and args:
+        try:
+            template = ast.literal_eval(args[0])
+        except (SyntaxError, ValueError):
+            return _UNKNOWN_SHAPE
+        replacements = [_eval_asl_expression(arg, value) for arg in args[1:]]
+        if not isinstance(template, str) or any(
+            replacement in (_UNKNOWN_SHAPE, _MISSING_SHAPE)
+            or isinstance(replacement, (dict, list))
+            for replacement in replacements
+        ):
+            return _UNKNOWN_SHAPE
+        rendered = template
+        for replacement in replacements:
+            rendered = rendered.replace("{}", str(replacement), 1)
+        return rendered
+    return _UNKNOWN_SHAPE
+
+
+def _eval_payload(template: object, value: object) -> object:
+    """Build an abstract Parameters/ResultSelector payload."""
+    if isinstance(template, dict):
+        result: dict[str, object] = {}
+        for key, item in cast("dict[str, object]", template).items():
+            if key.endswith(".$") and isinstance(item, str):
+                result[key[:-2]] = _eval_asl_expression(item, value)
+            else:
+                result[key] = _eval_payload(item, value)
+        return result
+    if isinstance(template, list):
+        return [_eval_payload(item, value) for item in cast("list[object]", template)]
+    return template
+
+
+def _eval_item_selector(template: object, map_input: object, item: object) -> object:
+    """Evaluate a Map ItemSelector with its ASL item context available."""
+    if isinstance(template, dict):
+        result: dict[str, object] = {}
+        for key, value in cast("dict[str, object]", template).items():
+            if key.endswith(".$") and value == "$$.Map.Item.Value":
+                result[key[:-2]] = item
+            elif key.endswith(".$") and isinstance(value, str):
+                result[key[:-2]] = _eval_asl_expression(value, map_input)
+            else:
+                result[key] = _eval_item_selector(value, map_input, item)
+        return result
+    if isinstance(template, list):
+        return [
+            _eval_item_selector(value, map_input, item)
+            for value in cast("list[object]", template)
+        ]
+    return template
+
+
+def _put_shape(value: object, path: object, result: object) -> object:
+    """Apply ResultPath to a known object, conservatively for exotic paths."""
+    if path is None:
+        return value
+    if path == "$" or path is None:
+        return result
+    if not isinstance(path, str):
+        return _UNKNOWN_SHAPE
+    parts = _jsonpath_parts(path)
+    if not isinstance(value, dict) or not parts or not all(isinstance(p, str) for p in parts):
+        return _UNKNOWN_SHAPE
+    output = dict(cast("dict[str, object]", value))
+    cursor = output
+    for part in parts[:-1]:
+        assert isinstance(part, str)
+        child = cursor.get(part)
+        child_copy = dict(cast("dict[str, object]", child)) if isinstance(child, dict) else {}
+        cursor[part] = child_copy
+        cursor = child_copy
+    last = parts[-1]
+    assert isinstance(last, str)
+    cursor[last] = result
+    return output
+
+
+def _state_refs(state: "dict[str, object]") -> "list[str]":
+    return [ref for ref, _ in _collect_jsonpath_refs(state) if ref.startswith("$")]
+
+
+def _analyse_machine(
+    machine: "dict[str, object]", initial: object
+) -> "tuple[list[dict[str, str]], list[dict[str, str]], list[str], object]":
+    """Propagate abstract ASL values and classify references per state."""
+    states_raw = machine.get("States")
+    states = cast("dict[str, object]", states_raw) if isinstance(states_raw, dict) else None
+    start = machine.get("StartAt")
+    if not isinstance(states, dict) or not isinstance(start, str):
+        return [], [], ["definition has no valid StartAt/States"], _UNKNOWN_SHAPE
+    queue: list[tuple[str, object]] = [(start, initial)]
+    seen: set[tuple[str, str]] = set()
+    missing: list[dict[str, str]] = []
+    uncertain: list[dict[str, str]] = []
+    unmodelled: set[str] = set()
+    terminal: list[object] = []
+    while queue:
+        state_name, incoming = queue.pop(0)
+        signature = (state_name, repr(incoming)[:4000])
+        if signature in seen:
+            continue
+        seen.add(signature)
+        raw_state = states.get(state_name)
+        if not isinstance(raw_state, dict):
+            continue
+        state = cast("dict[str, object]", raw_state)
+        input_path = state.get("InputPath", "$")
+        selected = _shape_at(incoming, input_path) if isinstance(input_path, str) else _UNKNOWN_SHAPE
+
+        def classify(refs: "list[str]", subject: object) -> None:
+            """Record each reference as missing, uncertain, or resolved."""
+            for ref in refs:
+                found = _eval_asl_expression(ref, subject)
+                diagnostic = {"state": state_name, "reference": ref}
+                if found is _MISSING_SHAPE:
+                    missing.append(diagnostic)
+                elif found is _UNKNOWN_SHAPE:
+                    uncertain.append({**diagnostic, "resolution": "unknown"})
+                else:
+                    uncertain.append({**diagnostic, "resolution": "resolved"})
+
+        if isinstance(input_path, str) and input_path.startswith("$."):
+            classify([input_path], incoming)
+        parameters = state.get("Parameters")
+        if isinstance(parameters, dict):
+            parameters_dict = cast("dict[str, object]", parameters)
+            classify(_state_refs(parameters_dict), selected)
+        direct_refs = [
+            item
+            for key, item in state.items()
+            if key.endswith(".$") and isinstance(item, str) and item.startswith("$")
+        ]
+        classify(direct_refs, selected)
+        choices_for_refs = state.get("Choices")
+        if isinstance(choices_for_refs, list):
+            classify(_state_refs({"Choices": choices_for_refs}), selected)
+        effective = (
+            _eval_payload(cast("dict[str, object]", parameters), selected)
+            if isinstance(parameters, dict)
+            else selected
+        )
+        state_type = state.get("Type")
+        if state_type == "Pass":
+            raw_result = state.get("Result", effective)
+        elif state_type == "Task":
+            resource = state.get("Resource")
+            raw_result = _TASK_RESPONSE_SHAPES.get(resource, _UNKNOWN_SHAPE) if isinstance(resource, str) else _UNKNOWN_SHAPE
+            if isinstance(resource, str) and resource not in _TASK_RESPONSE_SHAPES:
+                unmodelled.add(resource)
+        elif state_type == "Parallel":
+            branches = state.get("Branches")
+            branch_outputs: list[object] = []
+            if isinstance(branches, list):
+                for branch in cast("list[object]", branches):
+                    if isinstance(branch, dict):
+                        branch_missing, branch_uncertain, branch_unmodelled, branch_output = _analyse_machine(cast("dict[str, object]", branch), effective)
+                        missing.extend(branch_missing)
+                        uncertain.extend(branch_uncertain)
+                        unmodelled.update(branch_unmodelled)
+                        branch_outputs.append(branch_output)
+            raw_result = branch_outputs
+        elif state_type == "Map":
+            items_path = state.get("ItemsPath", "$")
+            if isinstance(items_path, str) and items_path.startswith("$."):
+                classify([items_path], effective)
+            items = _shape_at(effective, items_path) if isinstance(items_path, str) else _UNKNOWN_SHAPE
+            item_list = cast("list[object]", items) if isinstance(items, list) else []
+            item = item_list[0] if item_list else _UNKNOWN_SHAPE
+            selector = state.get("ItemSelector")
+            item_input = (
+                _eval_item_selector(
+                    cast("dict[str, object]", selector), effective, item
+                )
+                if isinstance(selector, dict)
+                else item
+            )
+            processor = state.get("ItemProcessor", state.get("Iterator"))
+            if isinstance(processor, dict):
+                map_missing, map_uncertain, map_unmodelled, map_output = _analyse_machine(cast("dict[str, object]", processor), item_input)
+                missing.extend(map_missing)
+                uncertain.extend(map_uncertain)
+                unmodelled.update(map_unmodelled)
+                raw_result = [map_output]
+            else:
+                raw_result = _UNKNOWN_SHAPE
+        else:
+            raw_result = effective
+        selector = state.get("ResultSelector")
+        if isinstance(selector, dict):
+            selector = cast("dict[str, object]", selector)
+            classify(_state_refs(selector), raw_result)
+            raw_result = _eval_payload(selector, raw_result)
+        combined = _put_shape(selected, state.get("ResultPath", "$"), raw_result)
+        output_path = state.get("OutputPath", "$")
+        if isinstance(output_path, str) and output_path.startswith("$."):
+            classify([output_path], combined)
+        output = _shape_at(combined, output_path) if isinstance(output_path, str) else _UNKNOWN_SHAPE
+        successors: list[str] = []
+        next_state = state.get("Next")
+        if isinstance(next_state, str):
+            successors.append(next_state)
+        choices = state.get("Choices")
+        if isinstance(choices, list):
+            for choice_raw in cast("list[object]", choices):
+                if isinstance(choice_raw, dict):
+                    choice = cast("dict[str, object]", choice_raw)
+                    if isinstance(choice.get("Next"), str):
+                        successors.append(cast(str, choice["Next"]))
+        default = state.get("Default")
+        if isinstance(default, str):
+            successors.append(default)
+        catches = state.get("Catch")
+        if isinstance(catches, list):
+            for catcher_raw in cast("list[object]", catches):
+                if isinstance(catcher_raw, dict):
+                    catcher = cast("dict[str, object]", catcher_raw)
+                else:
+                    continue
+                if isinstance(catcher.get("Next"), str):
+                    catch_output = _put_shape(selected, catcher.get("ResultPath", "$"), {"Error": "", "Cause": ""})
+                    queue.append((cast(str, catcher["Next"]), catch_output))
+        for successor in successors:
+            queue.append((successor, output))
+        if not successors and not catches:
+            terminal.append(output)
+        if len(seen) > max(1000, len(states) * 20):
+            uncertain.append({"state": state_name, "reference": "cycle did not converge"})
+            break
+    if not terminal:
+        final: object = _UNKNOWN_SHAPE
+    elif all(repr(item) == repr(terminal[0]) for item in terminal):
+        final = terminal[0]
+    else:
+        final = _UNKNOWN_SHAPE
+    nonmissing = {
+        (item["state"], item["reference"])
+        for item in uncertain
+        if item.get("resolution") in {"unknown", "resolved"}
+    }
+    joined_missing = [
+        item for item in missing
+        if (item["state"], item["reference"]) not in nonmissing
+    ]
+    undecidable = [item for item in uncertain if item.get("resolution") == "unknown"]
+    undecidable.extend(
+        {**item, "resolution": "branch_join"}
+        for item in missing
+        if (item["state"], item["reference"]) in nonmissing
+    )
+    return joined_missing, undecidable, sorted(unmodelled), final
+
+
 def check_definition_input_coherence(ctx: PreflightContext) -> CheckResult:
     """Every JSONPath rooted in the EXECUTION INPUT resolves against a
     proposed input, including under each skip_* combination.
@@ -1366,8 +1740,6 @@ def check_definition_input_coherence(ctx: PreflightContext) -> CheckResult:
     """
     import time
     import json as _json
-    import jmespath
-
     import boto3 as _boto3
 
     t0 = time.time()
@@ -1385,82 +1757,11 @@ def check_definition_input_coherence(ctx: PreflightContext) -> CheckResult:
             elapsed_seconds=time.time() - t0,
         )
 
-    refs = _collect_jsonpath_refs(live)
-    builtin_only = {r for r, _ in refs if r.startswith("$$")}
-    input_refs = [r for r, _ in refs if r.startswith("$.") and r not in builtin_only]
-
-    if not input_refs:
-        return CheckResult(
-            name="definition_input_coherence",
-            status="ok",
-            message="No input JSONPath refs found to validate",
-            elapsed_seconds=time.time() - t0,
-        )
-
-    # Build the base proposed input (all skip flags false).
     base_input = _build_proposed_input()
-
-    # Partition the refs: only those rooted in an execution-input key that no
-    # state overwrites are decidable from the input model alone.
-    produced_roots = _collect_produced_roots(live)
-    input_roots = set(base_input)
-    # Only where NO state emits an unnamed API response is an unknown root
-    # provably unresolvable rather than merely unmodelled.
-    unknown_root_is_a_violation = not _has_output_replacing_state(live)
-    decidable_refs = []
-    undecidable_roots: set[str] = set()
-    unresolvable_roots: list[str] = []
-    for ref in input_refs:
-        root = ref[2:].split(".")[0].split("[")[0]
-        if root in input_roots and root not in produced_roots:
-            decidable_refs.append(ref)
-        elif root not in input_roots and root not in produced_roots and unknown_root_is_a_violation:
-            unresolvable_roots.append(ref)
-        else:
-            undecidable_roots.add(root)
-
-    failures: list[str] = [
-        f"{ref}: root key is neither an execution-input field nor written by "
-        f"any state — unresolvable at run time"
-        for ref in unresolvable_roots
-    ]
-    checked = 0
-
-    # Resolve each decidable JSONPath against the base input.
-    for ref in decidable_refs:
-        checked += 1
-        # Strip the leading "$" for jmespath (it uses bare paths)
-        jmes_expr = ref.lstrip("$").lstrip(".")
-        try:
-            result = jmespath.search(jmes_expr, base_input)
-        except Exception as exc:
-            failures.append(
-                f"{ref}: jmespath resolve raised: {exc}"
-            )
-            continue
-        if result is None:
-            failures.append(
-                f"{ref}: resolved to None against the proposed base input — "
-                f"would throw States.Runtime on execution"
-            )
-
-    # Also test each skip_* flag individually set to True, since a
-    # bypassed state may omit a result path that a downstream state needs.
-    skip_flags = [k for k in base_input if k.startswith("skip_")]
-    for skip_flag in skip_flags:
-        skip_input = _build_proposed_input({skip_flag: True})
-        for ref in decidable_refs:
-            jmes_expr = ref.lstrip("$").lstrip(".")
-            try:
-                result = jmespath.search(jmes_expr, skip_input)
-            except Exception:
-                # jmespath exception is itself a finding — the execution
-                # would fail with a different error at runtime.
-                failures.append(
-                    f"{ref}: raised under {skip_flag}=true — "
-                    f"this skip combination leaves a JSONPath unresolvable"
-                )
-
+    failures, uncertain, unmodelled_resources, _ = _analyse_machine(live, base_input)
+    # The same graph is explored along every Choice edge. Skip flags alter
+    # values, not shapes, so one shape analysis covers every individual flag.
+    skip_flags = [key for key in base_input if key.startswith("skip_")]
     elapsed = time.time() - t0
     if failures:
         return CheckResult(
@@ -1469,27 +1770,28 @@ def check_definition_input_coherence(ctx: PreflightContext) -> CheckResult:
             message=f"{len(failures)} JSONPath reference(s) unresolvable",
             details={
                 "failures": failures,
-                "checked": checked,
+                "checked": max(0, len(_collect_jsonpath_refs(live)) - len(uncertain) - len(failures)),
                 "skip_combinations_tested": len(skip_flags),
-                "undecidable_refs": len(input_refs) - len(decidable_refs),
-                "undecidable_roots": sorted(undecidable_roots),
+                "undecidable_refs": len(uncertain),
+                "undecidable": uncertain,
+                "unmodelled_resources": unmodelled_resources,
             },
             elapsed_seconds=elapsed,
         )
+    checked = max(0, len(_collect_jsonpath_refs(live)) - len(uncertain))
     return CheckResult(
         name="definition_input_coherence",
         status="ok",
         message=(
-            f"All {checked} execution-input JSONPath reference(s) resolve against "
-            f"base input and {len(skip_flags)} individual skip-flag combinations "
-            f"({len(input_refs) - len(decidable_refs)} mid-flow ref(s) not covered — "
-            f"they resolve against prior-state output, not the execution input)"
+            f"All {checked} decidable JSONPath reference(s) resolve against "
+            f"state-specific inputs ({len(uncertain)} undecidable)"
         ),
         details={
             "checked": checked,
             "skip_flags_tested": len(skip_flags),
-            "undecidable_refs": len(input_refs) - len(decidable_refs),
-            "undecidable_roots": sorted(undecidable_roots),
+            "undecidable_refs": len(uncertain),
+            "undecidable": uncertain,
+            "unmodelled_resources": unmodelled_resources,
         },
         elapsed_seconds=elapsed,
     )
