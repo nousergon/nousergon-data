@@ -795,6 +795,8 @@ alert_classes:
     severities: [dynamic]
     intake: bus
     response: drain-queue
+    operator_reason: >-
+      A turnover breach requires an operator to review the proposed orders and decide whether execution may continue.
     # derived: severities [dynamic] — resolved per emission
     tier: dynamic
     chat: critical-only
@@ -974,6 +976,8 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    operator_reason: >-
+      Unexpected stance distribution requires a researcher to judge whether the strategy change is intentional before accepting it.
     # DECLARED: stance drift is named in I6751's NOTIFY-SILENT row (suboptimal,
     # not broken).
     tier: tracked-only
@@ -983,6 +987,8 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    operator_reason: >-
+      An anomalous simulated cost requires a researcher to validate the market and fee assumptions before accepting results.
     # derived: error-capable, automated response declared
     tier: tracked-only
     chat: none
@@ -992,6 +998,8 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    operator_reason: >-
+      A failed champion evaluation requires a researcher to inspect the evidence and decide whether promotion should proceed.
     # derived: error-capable, automated response declared
     tier: tracked-only
     chat: none
@@ -1021,6 +1029,8 @@ alert_classes:
     severities: [critical]
     intake: bus
     response: drain-queue
+    operator_reason: >-
+      A live-key mismatch requires an operator to reconcile the approved production configuration before another promotion.
     # derived: critical/alarm-capable
     tier: tracked-only
     chat: none
@@ -1194,6 +1204,8 @@ alert_classes:
     severities: [info, warning, critical]
     intake: bus
     response: drain-queue
+    operator_reason: >-
+      Model rotation failure requires a researcher to inspect candidate quality and choose whether to retain or replace the incumbent.
     # derived: critical/alarm-capable
     tier: tracked-only
     chat: none
@@ -1202,6 +1214,8 @@ alert_classes:
     severities: [warning, critical]
     intake: bus
     response: drain-queue
+    operator_reason: >-
+      A failed predictions write requires an operator to inspect the output and restore or rerun the affected publication.
     # derived: critical/alarm-capable
     tier: tracked-only
     chat: none
@@ -1250,6 +1264,8 @@ alert_classes:
     severities: [dynamic]
     intake: bus
     response: drain-queue
+    operator_reason: >-
+      Inference failure requires an operator to diagnose the model or input failure and decide whether a rerun is safe.
     # derived: severities [dynamic] — resolved per emission
     tier: tracked-only
     chat: none
@@ -1260,6 +1276,8 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    operator_reason: >-
+      A predictor deployment failure requires an operator to inspect the deployment and choose rollback, repair, or retry.
     # derived: error-capable, automated response declared
     tier: tracked-only
     chat: none
@@ -1278,6 +1296,8 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    operator_reason: >-
+      A rolling-mean producer failure requires a researcher to validate the evaluation inputs and rerun or repair the producer.
     # derived: error-capable, automated response declared
     tier: tracked-only
     chat: none
@@ -1294,6 +1314,8 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    operator_reason: >-
+      A quarantined archive write requires a researcher to inspect the rejected artifact before releasing or replacing it.
     # derived: error-capable, automated response declared
     tier: tracked-only
     chat: none
@@ -1302,6 +1324,8 @@ alert_classes:
     severities: [critical]
     intake: bus
     response: drain-queue
+    operator_reason: >-
+      A stopped research daemon requires an operator to diagnose its host and workload before restarting it.
     # derived: critical/alarm-capable
     tier: tracked-only
     chat: none
@@ -1370,6 +1394,8 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    operator_reason: >-
+      A cut-promotion failure requires a researcher to review the candidate evidence and decide whether promotion remains valid.
     # derived: error-capable, automated response declared
     tier: tracked-only
     chat: none
@@ -1427,6 +1453,8 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    operator_reason: >-
+      A weekly-ledger failure requires a researcher to reconcile the ledger inputs and approve any correction.
     # derived: error-capable, automated response declared
     tier: tracked-only
     chat: none
@@ -1496,6 +1524,8 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    operator_reason: >-
+      A rejected signal envelope requires a researcher to inspect and correct the producing signal rather than automatically resubmit it.
     # derived: error-capable, automated response declared
     tier: tracked-only
     chat: none
@@ -1535,6 +1565,8 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    operator_reason: >-
+      A research deployment failure requires an operator to inspect the deployment and choose rollback, repair, or retry.
     # derived: error-capable, automated response declared
     tier: tracked-only
     chat: none
@@ -1823,6 +1855,8 @@ alert_classes:
     severities: [dynamic]
     intake: bus
     response: drain-queue
+    operator_reason: >-
+      Constituent drift requires a data operator to verify the upstream change and approve or correct the expected universe.
     # DECLARED dynamic: non-severe constituents drift is TRACKED-ONLY per the
     # matrix; a severe (critical) drift is a data-integrity break and pages.
     tier: tracked-only
@@ -1836,6 +1870,8 @@ alert_classes:
     severities: [dynamic]
     intake: bus
     response: drain-queue
+    operator_reason: >-
+      A stage-output discrepancy requires a data operator to identify the affected stage and choose repair or rerun.
     # DECLARED dynamic: the per-run verdict is `error` when the run has defects
     # and `warn` otherwise, and a DEGRADED run that still produced its artifact
     # is tracked-only work (tonight's data-collector 'Collection finished
@@ -1847,6 +1883,8 @@ alert_classes:
     severities: [dynamic]
     intake: bus
     response: drain-queue
+    operator_reason: >-
+      A phase-marker discrepancy requires a data operator to reconcile pipeline state before advancing or replaying a phase.
     # derived: severities [dynamic] — resolved per emission
     tier: tracked-only
     chat: none
@@ -1889,6 +1927,8 @@ alert_classes:
     severities: [critical]
     intake: bus
     response: drain-queue
+    operator_reason: >-
+      A stalled replay can reflect the canary, its inputs, or infrastructure and requires an operator to choose repair or restart.
     # derived: critical/alarm-capable
     tier: tracked-only
     chat: none
@@ -1897,6 +1937,8 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    operator_reason: >-
+      A stuck Step Functions execution requires an operator to inspect state and choose whether to stop, repair, or redrive it.
     # derived: error-capable, automated response declared
     tier: tracked-only
     chat: none
@@ -1905,6 +1947,8 @@ alert_classes:
     severities: [critical]
     intake: bus
     response: drain-queue
+    operator_reason: >-
+      Dispatch exhausted automated handling; an operator must diagnose and resolve the underlying alert.
     # derived: critical/alarm-capable
     tier: page
     chat: critical
@@ -1924,6 +1968,8 @@ alert_classes:
     severities: [dynamic]
     intake: bus
     response: drain-queue
+    operator_reason: >-
+      Step Functions definition drift requires an operator to determine whether to deploy the repository definition or preserve an intentional live change.
     # DECLARED: SF-definition drift is conformance, named in I6751's
     # TRACKED-ONLY row.
     tier: tracked-only
@@ -1935,6 +1981,8 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    operator_reason: >-
+      A data-plane deployment failure requires an operator to inspect the deployment and choose rollback, repair, or retry.
     # derived: error-capable, automated response declared
     tier: tracked-only
     chat: none
@@ -1945,6 +1993,8 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    operator_reason: >-
+      A changelog-mirror deployment failure requires an operator to inspect the deployment and choose rollback, repair, or retry.
     # derived: error-capable, automated response declared
     tier: tracked-only
     chat: none
@@ -1960,6 +2010,8 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    operator_reason: >-
+      Systemd unit drift requires an operator to determine whether the host or repository definition is authoritative before reconciling it.
     # DECLARED: conformance drift — backlog work, nothing broken. I6751 matrix
     # names systemd-unit-drift in the TRACKED-ONLY row.
     tier: tracked-only
@@ -1977,6 +2029,8 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    operator_reason: >-
+      A boot-time pull failure requires an operator to inspect the host checkout and resolve repository or local-state conflicts.
     # derived: error-capable, automated response declared
     tier: tracked-only
     chat: none
@@ -1990,6 +2044,8 @@ alert_classes:
     severities: [dynamic]
     intake: bus
     response: drain-queue
+    operator_reason: >-
+      A reconciliation mismatch requires an operator to compare desired and observed deployment state and approve the correction.
     # derived: severities [dynamic] — resolved per emission
     tier: tracked-only
     chat: none
@@ -2001,6 +2057,8 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    operator_reason: >-
+      A Metron deployment failure requires an operator to inspect the deployment and choose rollback, repair, or retry.
     # derived: error-capable, automated response declared
     tier: tracked-only
     chat: none
@@ -2043,6 +2101,8 @@ alert_classes:
     severities: [error, warning]
     intake: bus
     response: drain-queue
+    operator_reason: >-
+      A lifecycle-event publication failure requires an operator to inspect the affected grooming run and repair or replay its event.
     # DECLARED: groom lifecycle, named in I6751's NOTIFY-SILENT row.
     tier: tracked-only
     chat: none
@@ -2114,6 +2174,8 @@ alert_classes:
     severities: [warning, critical]
     intake: bus
     response: drain-queue
+    operator_reason: >-
+      Repeated host-health failure requires an operator to diagnose the machine and decide whether to repair, reboot, or replace it.
     # DECLARED dynamic + `page_after_consecutive` below: a single failed run of
     # an HOURLY timer that its own next run repairs is not actionable-now.
     # Measured 2026-09-09: metron-deploy-drift failed once at 18:07 (git
@@ -2176,6 +2238,8 @@ alert_classes:
     severities: [critical]
     intake: bus
     response: drain-queue
+    operator_reason: >-
+      A merge-triggered deployment failure requires an operator to inspect the deployment and choose rollback, repair, or retry.
     # derived: critical/alarm-capable
     tier: tracked-only
     chat: none
@@ -2226,6 +2290,8 @@ alert_classes:
     severities: [dynamic]
     intake: bus
     response: drain-queue
+    operator_reason: >-
+      A required reboot is deliberately operator-approved because active workloads must be checked and drained first.
     # DECLARED: a pending-reboot notice is scheduled maintenance, not a break.
     tier: tracked-only
     chat: none
@@ -2234,6 +2300,8 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    operator_reason: >-
+      A concordance deployment failure requires an operator to inspect the deployment and choose rollback, repair, or retry.
     # derived: error-capable, automated response declared
     tier: tracked-only
     chat: none
@@ -2242,6 +2310,8 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    operator_reason: >-
+      A counterfactual deployment failure requires an operator to inspect the deployment and choose rollback, repair, or retry.
     # derived: error-capable, automated response declared
     tier: tracked-only
     chat: none
@@ -2250,6 +2320,8 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    operator_reason: >-
+      A backtester-health deployment failure requires an operator to inspect the deployment and choose rollback, repair, or retry.
     # derived: error-capable, automated response declared
     tier: tracked-only
     chat: none
@@ -2258,6 +2330,8 @@ alert_classes:
     severities: [critical]
     intake: bus
     response: drain-queue
+    operator_reason: >-
+      A missing end-of-day snapshot requires an operator to verify source completeness and choose repair or backfill.
     # derived: critical/alarm-capable
     tier: page
     chat: critical
@@ -2266,6 +2340,8 @@ alert_classes:
     severities: [critical]
     intake: bus
     response: drain-queue
+    operator_reason: >-
+      A failed pre-open readiness probe requires an operator to identify the blocking deployment and decide whether the session may proceed.
     # derived: critical/alarm-capable
     tier: page
     chat: critical
@@ -2274,6 +2350,8 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    operator_reason: >-
+      A failed weekly recovery report requires an operator to inspect the executions and correct or rerun the measurement.
     # derived: error-capable, automated response declared
     tier: tracked-only
     chat: none
@@ -2285,6 +2363,8 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    operator_reason: >-
+      Zero executor entries requires an operator to distinguish a valid no-trade decision from broken inputs or execution before intervening.
     # derived: error-capable, automated response declared
     tier: tracked-only
     chat: none
@@ -2298,6 +2378,8 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    operator_reason: >-
+      A router canary failure requires an operator to diagnose routing or provider health and choose failover, repair, or retry.
     # DECLARED: the canary's own defects (alpha-engine-config-I9314 / I9486) are
     # the dominant firing condition and are already tracked; one of tonight's
     # two pages self-labelled 'CANARY DEFECT (not a router fault)'. A router
@@ -2319,6 +2401,8 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    operator_reason: >-
+      An egress-proxy SLI breach requires an operator to diagnose proxy or provider health and choose mitigation.
     # DECLARED: an SLI breach is degraded-not-broken; the proxy fails CLOSED, so
     # a real outage surfaces as the consumer's own error, which pages on its own
     # class.
@@ -2329,6 +2413,8 @@ alert_classes:
     severities: [error]
     intake: bus
     response: drain-queue
+    operator_reason: >-
+      A router reload health failure requires an operator to inspect the loaded configuration and choose rollback, repair, or retry.
     # derived: error-capable, automated response declared
     tier: tracked-only
     chat: none
