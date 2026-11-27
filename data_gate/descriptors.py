@@ -128,9 +128,10 @@ _GUARD_CODE_REF = re.compile(r"^[A-Za-z0-9_./-]+\.py::[A-Za-z_][A-Za-z0-9_]*$")
 #: alpha-engine-config-I10870 — the two were declaring opposite things about
 #: D39 before this constant unified them: the generator's docstring said "flip
 #: the EXISTING ops-side row", the reader only ever looked in this repo).
-EXTERNALLY_OWNED_OBSERVABILITY_ROWS: dict[str, str] = {
-    "D39": "nousergon-data-inst-ownership-weekly",
-}
+#: D39 deliberately is not an exception: its run-record observation uses its
+#: unit component id, so this repository must declare that same id for the
+#: console merge (alpha-engine-config-I12911).
+EXTERNALLY_OWNED_OBSERVABILITY_ROWS: dict[str, str] = {}
 
 #: `observability-policy` §3.5's CLOSED N/A taxonomy. A guard class, a freshness
 #: deadline or a completeness floor may be marked not-applicable ONLY with one
