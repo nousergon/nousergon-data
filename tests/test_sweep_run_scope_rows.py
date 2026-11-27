@@ -21,6 +21,8 @@ import copy
 import gzip
 import io
 import json
+from collections.abc import Iterator
+from typing import Any
 
 import pytest
 
@@ -41,15 +43,15 @@ _TAGS = {
 }
 
 
-def _load(name: str):
+def _load(name: str) -> Any:
     return json.loads(gzip.decompress((_FIXTURES / name).read_bytes()))
 
 
 class _Paginator:
-    def __init__(self, pages):
+    def __init__(self, pages: list[dict[str, Any]]) -> None:
         self._pages = pages
 
-    def paginate(self, **_kwargs):
+    def paginate(self, **_kwargs: object) -> Iterator[dict[str, Any]]:
         return iter(self._pages)
 
 
@@ -57,25 +59,25 @@ class FakeStates:
     """Serves each fixture execution's definition, input and history, with a
     RunScope-less tail appended so the cut is exercised, not assumed."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.calls = []
 
-    def describe_execution(self, executionArn):
+    def describe_execution(self, executionArn: str) -> dict[str, Any]:
         self.calls.append(("describe_execution", executionArn))
         return {"input": json.dumps({"skip_parity": True}), "stateMachineArn": "arn:sm"}
 
-    def describe_state_machine_for_execution(self, executionArn):
+    def describe_state_machine_for_execution(self, executionArn: str) -> dict[str, Any]:
         self.calls.append(("describe_state_machine_for_execution", executionArn))
         if executionArn == NEVER_SCOPED:
             return {"definition": json.dumps({"States": {}})}
         return {"definition": json.dumps(_load(f"definition_{_TAGS[executionArn]}.json.gz"))}
 
-    def get_paginator(self, name):
+    def get_paginator(self, name: str) -> Any:
         assert name == "get_execution_history"
         outer = self
 
         class _HistoryPaginator:
-            def paginate(self, executionArn, **_kwargs):
+            def paginate(self, executionArn: str, **_kwargs: object) -> Iterator[dict[str, Any]]:
                 outer.calls.append(("get_execution_history", executionArn))
                 if executionArn == NEVER_SCOPED:
                     return iter([{"events": [{"id": 1, "type": "ExecutionStarted"}]}])
@@ -97,21 +99,21 @@ class _PreconditionFailed(Exception):
 
 
 class FakeS3:
-    def __init__(self, objects: dict[str, dict], etag: str = '"etag-1"'):
+    def __init__(self, objects: dict[str, dict], etag: str = '"etag-1"') -> None:
         self.objects = {k: copy.deepcopy(v) for k, v in objects.items()}
         self.etag = etag
         self.puts = []
         self.fail_put = False
 
-    def get_paginator(self, name):
+    def get_paginator(self, name: str) -> _Paginator:
         assert name == "list_objects_v2"
         keys = sorted(self.objects) + ["backtest/2026-10-02/other.json"]
         return _Paginator([{"Contents": [{"Key": k} for k in keys]}])
 
-    def get_object(self, Bucket, Key):
+    def get_object(self, Bucket: str, Key: str) -> dict[str, Any]:
         return {"Body": io.BytesIO(json.dumps(self.objects[Key]).encode()), "ETag": self.etag}
 
-    def put_object(self, **params):
+    def put_object(self, **params: Any) -> None:
         if self.fail_put:
             raise _PreconditionFailed()
         self.puts.append(params)
@@ -139,7 +141,7 @@ def _stored_wrong_branch() -> dict:
 KEY = "backtest/2026-10-02/run_scope.json"
 
 
-def test_cut_stops_at_the_first_run_scope_entry():
+def test_cut_stops_at_the_first_run_scope_entry() -> None:
     history = [
         {"id": 1, "type": "PassStateEntered", "stateEnteredEventDetails": {"name": "A"}},
         {"id": 2, "type": "TaskStateEntered", "stateEnteredEventDetails": {"name": "RunScope"}},
@@ -150,7 +152,7 @@ def test_cut_stops_at_the_first_run_scope_entry():
     assert sweep.cut_at_scope(history[:1]) is None
 
 
-def test_authors_include_the_last_writer_and_contributors_after_row_authors():
+def test_authors_include_the_last_writer_and_contributors_after_row_authors() -> None:
     stored = {
         "execution_arn": "arn:last",
         "contributing_executions": ["arn:a", "arn:c"],
@@ -159,7 +161,20 @@ def test_authors_include_the_last_writer_and_contributors_after_row_authors():
     assert sweep.row_authors(stored) == ["arn:a", "arn:last", "arn:c"]
 
 
-def test_report_only_by_default_finds_the_wrong_branch_row_and_writes_nothing(capsys):
+def test_authors_follow_sorted_stage_order() -> None:
+    stored = {
+        "execution_arn": "arn:last",
+        "stages": {
+            "Zulu": {"recorded_by_execution_arn": "arn:z"},
+            "Alpha": {"recorded_by_execution_arn": "arn:a"},
+        },
+    }
+    assert sweep.row_authors(stored) == ["arn:a", "arn:z", "arn:last"]
+
+
+def test_report_only_by_default_finds_the_wrong_branch_row_and_writes_nothing(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     s3 = FakeS3({KEY: _stored_wrong_branch()})
     states = FakeStates()
     assert sweep.main([], s3=s3, states=states) == 0
@@ -174,7 +189,7 @@ def test_report_only_by_default_finds_the_wrong_branch_row_and_writes_nothing(ca
     }
 
 
-def test_the_classification_names_only_the_eval_judge_row():
+def test_the_classification_names_only_the_eval_judge_row() -> None:
     result = sweep.sweep_one(FakeS3({KEY: _stored_wrong_branch()}), FakeStates(),
                              sweep.BUCKET, KEY)
     changed = [f for f in result["findings"] if f["kind"] not in (sweep.UNCHANGED, sweep.AFTER_SCOPE)]
@@ -182,7 +197,7 @@ def test_the_classification_names_only_the_eval_judge_row():
     assert changed[0]["corrected"]["entry_state_source"] == "execution_history"
 
 
-def test_apply_writes_the_corrected_row_conditionally_and_keeps_everything_else():
+def test_apply_writes_the_corrected_row_conditionally_and_keeps_everything_else() -> None:
     stored = _stored_wrong_branch()
     s3 = FakeS3({KEY: stored})
     assert sweep.main(["--run-date", "2026-10-02", "--stage", "EvalJudge", "--apply"],
@@ -212,7 +227,7 @@ def test_apply_writes_the_corrected_row_conditionally_and_keeps_everything_else(
     assert body["scope_merge"]["rejected"] == []
 
 
-def test_a_demotion_is_reported_and_never_written(capsys):
+def test_a_demotion_is_reported_and_never_written(capsys: pytest.CaptureFixture[str]) -> None:
     """A stored COMPLETED whose branch really failed (the 08-29 shape) is
     weaker under the fix; the merge rule refuses it, so --apply leaves it."""
     stored = rs.build_run_scope(
@@ -232,7 +247,7 @@ def test_a_demotion_is_reported_and_never_written(capsys):
     assert "DOWNGRADE        EvalJudge: ENABLED_COMPLETED" in capsys.readouterr().out
 
 
-def test_another_author_completing_the_stage_keeps_the_cycle_completed():
+def test_another_author_completing_the_stage_keeps_the_cycle_completed() -> None:
     """09-18 shape: the scheduled run's branch failed, a rerun completed it.
     The cycle's row is COMPLETED, so there is nothing to demote."""
     stored = rs.build_run_scope(
@@ -253,14 +268,14 @@ def test_another_author_completing_the_stage_keeps_the_cycle_completed():
     assert [f["kind"] for f in result["findings"]] == [sweep.UNCHANGED]
 
 
-def test_a_write_race_stops_without_overwriting(capsys):
+def test_a_write_race_stops_without_overwriting(capsys: pytest.CaptureFixture[str]) -> None:
     s3 = FakeS3({KEY: _stored_wrong_branch()})
     s3.fail_put = True
     assert sweep.main(["--apply"], s3=s3, states=FakeStates()) == 2
     assert "CONFLICT" in capsys.readouterr().err
 
 
-def test_an_author_that_never_reached_run_scope_is_reported_not_guessed():
+def test_an_author_that_never_reached_run_scope_is_reported_not_guessed() -> None:
     stored = _stored_wrong_branch()
     stored["execution_arn"] = NEVER_SCOPED
     result = sweep.sweep_one(FakeS3({KEY: stored}), FakeStates(), sweep.BUCKET, KEY)
@@ -269,17 +284,17 @@ def test_an_author_that_never_reached_run_scope_is_reported_not_guessed():
     assert eval_judge[0]["kind"] == sweep.UPGRADE  # still corrected from its real author
 
 
-def test_a_missing_cycle_is_skipped_loudly(capsys):
+def test_a_missing_cycle_is_skipped_loudly(capsys: pytest.CaptureFixture[str]) -> None:
     s3 = FakeS3({KEY: _stored_wrong_branch()})
     assert sweep.main(["--run-date", "2026-09-30"], s3=s3, states=FakeStates()) == 1
     assert "SKIPPED" in capsys.readouterr().err
 
 
-def test_a_malformed_run_date_is_rejected():
+def test_a_malformed_run_date_is_rejected() -> None:
     with pytest.raises(SystemExit):
         sweep.main(["--run-date", "10/02"], s3=FakeS3({}), states=FakeStates())
 
 
-def test_listing_only_picks_run_scope_artifacts():
+def test_listing_only_picks_run_scope_artifacts() -> None:
     s3 = FakeS3({KEY: {}})
     assert sweep.stored_keys(s3, sweep.BUCKET, None) == [KEY]
