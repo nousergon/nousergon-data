@@ -23,12 +23,15 @@ Each calling Lambda's ``deploy.sh`` packages ``data_gate/__init__.py``,
 repo-relative paths, and each one's deploy workflow path-filters on them.
 """
 
+# ruff: noqa: ANN001, ANN002, ANN003, ANN101, ANN102, ANN201, ANN202, ANN204, ANN205, ANN206
+
 from __future__ import annotations
 
 import json
 import logging
 import os
 import re
+from typing import cast
 
 __all__ = [
     "AWAITS_PRODUCER_RETRY",
@@ -398,6 +401,7 @@ def _check_unit(s3, unit_id: str, raw: dict, started_at) -> tuple[list[dict], di
     status = str(doc.get("status") or "")
     row["status"] = status
     if status != "ok":
+        row["failure_reason"] = str(doc.get("reason") or "")
         return [
             _finding(
                 "run_not_ok", unit_id, None,
@@ -728,6 +732,7 @@ def _readiness_check(event: dict, s3_client=None) -> dict:
 
     awaits_retry = collection in AWAITS_PRODUCER_RETRY
     findings: list[dict] = []
+    failure_signatures: list[dict[str, str]] = []
     retry_pending: list[str] = []
     for unit_id in units:
         raw = descriptors.get(unit_id)
@@ -738,7 +743,16 @@ def _readiness_check(event: dict, s3_client=None) -> dict:
                 f"would grade nothing and read as ready."
             )
         unit_findings, row = _check_unit(s3, unit_id, raw, baseline)
+        row = cast(dict[str, object], row)
         findings.extend(unit_findings)
+        # A retry is deterministically doomed only when a fresh manifest says
+        # the workload itself failed and supplied a reason.  Keep the value
+        # independent of manifest keys/times/run IDs so separate executions
+        # of the same unit failure compare equal.
+        if row.get("status") == "failed" and str(row.get("failure_reason") or "").strip():
+            failure_signatures.append(
+                {"unit": unit_id, "reason": str(row["failure_reason"]).strip()}
+            )
         if awaits_retry and unit_findings and _retry_pending(s3, raw, row, unit_findings, baseline):
             retry_pending.append(unit_id)
 
@@ -770,7 +784,7 @@ def _readiness_check(event: dict, s3_client=None) -> dict:
         "readiness-check %s: ready=%s settled=%s missing=%s failed=%s retry_pending=%s",
         collection, ready, settled, missing, failed, retry_pending,
     )
-    return {
+    return cast(dict[str, object], {
         "readiness": {
             "ready": ready,
             "settled": settled,
@@ -778,10 +792,15 @@ def _readiness_check(event: dict, s3_client=None) -> dict:
             "failed": failed,
             "retry_pending": retry_pending,
             "failure_mode": mode,
+            "failure_signature": json.dumps(
+                sorted(failure_signatures, key=lambda item: (item["unit"], item["reason"])),
+                sort_keys=True,
+                separators=(",", ":"),
+            ) if failure_signatures else "",
             "baseline": baseline.isoformat().replace("+00:00", "Z"),
             "summary": summary,
         }
-    }
+    })
 
 
 # ── public surface ───────────────────────────────────────────────────────────

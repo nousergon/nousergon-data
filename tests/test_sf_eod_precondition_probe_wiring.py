@@ -43,6 +43,8 @@ above already independently pins the StopTradingInstance -> CheckDegradedOutcome
 routing that file also covered.
 """
 
+# ruff: noqa: ANN001, ANN002, ANN003, ANN101, ANN102, ANN201, ANN202, ANN204, ANN205, ANN206
+
 from __future__ import annotations
 
 import json
@@ -292,7 +294,7 @@ class TestHealLoopBound:
         assert st["Type"] == "Pass"
         assert st["Result"] == {"attempts": 0}
         assert st["ResultPath"] == "$.heal_loop"
-        assert st["Next"] == "HealLoopGate"
+        assert st["Next"] == "HealInitialSignatureAvailable"
 
     def test_gate_trips_on_attempts_or_deadline(self, states):
         gate = states["HealLoopGate"]
@@ -313,7 +315,7 @@ class TestHealLoopBound:
         assert variables == {"$.heal_loop.attempts", "$.precondition_probe.Payload.past_deadline"}
         assert c["Next"] == "HealNonConvergent"
         # alpha-engine-config-I11266: the actuator is HealStartCollection now.
-        assert gate["Default"] == "HealStartCollection"
+        assert gate["Default"] == "HealMarkAttemptStarted"
 
     def test_attempts_bound_is_two(self, states):
         gate = states["HealLoopGate"]
@@ -334,10 +336,15 @@ class TestHealLoopBound:
         # No dead end anywhere in the act-reprobe chain — every non-success
         # branch must funnel back to HealLoopIncrement so the attempts/deadline
         # bound (not an unbounded retry) is what stops it.
-        assert "HealLoopIncrement" in _targets(states[failure_state]), (
-            f"{failure_state} has a branch that does not reach HealLoopIncrement: "
-            f"{_targets(states[failure_state])}"
-        )
+        frontier = deque(_targets(states[failure_state]))
+        visited = set()
+        while frontier:
+            name = frontier.popleft()
+            if name in visited or name in {"HealNonConvergent", "HealDispatchReplay"}:
+                continue
+            visited.add(name)
+            frontier.extend(_targets(states[name]))
+        assert "HealLoopIncrement" in visited
 
     def test_every_actuator_outcome_is_reprobed(self, states):
         # alpha-engine-config-I11266: success, FAILED, TIMED_OUT and ABORTED
@@ -346,8 +353,243 @@ class TestHealLoopBound:
         # fails loud on ANY unit; the precondition is the SPY close + macro
         # sentinel). HealReProbe's own Catch then reaches HealLoopIncrement.
         st = states["HealStartCollection"]
-        assert set(_targets(st)) == {"HealReProbe"}
+        assert set(_targets(st)) == {"HealReadFailureSignature"}
         assert [c["ErrorEquals"] for c in st["Catch"]] == [["States.ALL"]]
+
+    def test_signature_read_is_not_a_substantive_registry_state(self, states):
+        # The read feeds a comparison; it is not a pipeline stage. It uses the
+        # SDK Lambda integration so no console registry row is owed
+        # (aec#7764). A lambda:invoke Task here would need a nousergon-lib
+        # STATE_TO_ARCHIVE_PAGE entry first.
+        probe = states["HealReadFailureSignature"]
+        assert probe["Resource"] == "arn:aws:states:::aws-sdk:lambda:invoke"
+        assert probe["Parameters"]["FunctionName"] == "alpha-engine-collection-readiness-probe"
+        assert probe["Catch"][0]["Next"] == "HealSetSignatureDegradedFlag"
+        flag = states["HealSetSignatureDegradedFlag"]
+        assert flag["ResultPath"] == "$.degraded_summary"
+        assert flag["Parameters"]["degraded"] is True
+        assert flag["Next"] == "HealReProbe"
+
+    def test_fresh_signature_probe_excludes_pre_attempt_manifests(self, states):
+        mark = states["HealMarkAttemptStarted"]
+        assert mark["Next"] == "HealStartCollection"
+        assert mark["Parameters"]["not_before.$"] == "$$.State.EnteredTime"
+        payload = mark["Parameters"]["payload"]
+        assert payload["not_before.$"] == "$$.State.EnteredTime"
+        assert payload["lookback_seconds"] == 0
+        # The attempt record is rebuilt on every attempt, so a previous
+        # attempt's fresh read can never be compared against.
+        assert mark["ResultPath"] == "$.heal_attempt"
+
+
+# ── aec#7764: synthetic transition simulation ────────────────────────────────
+#
+# A small, honest walker over the real state machine definition. Task states
+# are stubbed (they are AWS calls); Pass and Choice states execute from the
+# JSON itself, so a rewiring of the gate/comparison changes what this observes.
+
+_SIG = '[{"reason":"zero variance","unit":"D20"}]'
+
+
+def _get(doc, path):
+    cur = doc
+    for part in path[2:].split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            raise KeyError(path)
+        cur = cur[part]
+    return cur
+
+
+def _put(doc, path, value):
+    parts = path[2:].split(".")
+    cur = doc
+    for part in parts[:-1]:
+        cur = cur.setdefault(part, {})
+    cur[parts[-1]] = value
+
+
+def _eval_rule(rule, doc):
+    if "And" in rule:
+        return all(_eval_rule(r, doc) for r in rule["And"])
+    if "Or" in rule:
+        return any(_eval_rule(r, doc) for r in rule["Or"])
+    var = rule["Variable"]
+    try:
+        value = _get(doc, var)
+    except KeyError:
+        if "IsPresent" in rule:
+            return rule["IsPresent"] is False
+        raise RuntimeError(f"States.Runtime: {var} absent without IsPresent guard")
+    if "IsPresent" in rule:
+        return rule["IsPresent"] is True
+    if "StringGreaterThan" in rule:
+        return isinstance(value, str) and value > rule["StringGreaterThan"]
+    if "StringEqualsPath" in rule:
+        return value == _get(doc, rule["StringEqualsPath"])
+    if "BooleanEquals" in rule:
+        return value is rule["BooleanEquals"]
+    if "NumericGreaterThanEquals" in rule:
+        return value >= rule["NumericGreaterThanEquals"]
+    raise AssertionError(f"simulator does not model {rule}")
+
+
+def _run_heal(states, *, initial_sig, attempts, probe_met=None, start_at="InitHealLoop",
+              past_deadline=False, pipeline_role=None, read_raises=None, probe_raises=False):
+    """Walk from ``start_at`` and return (final_state, launches, visited).
+
+    ``attempts`` is a list of the fresh failure-signature value each heal
+    collection leaves behind (``None`` = the probe response has no signature,
+    e.g. a Lambda function error). ``probe_met`` is a per-attempt list of
+    precondition_met verdicts for the re-probe.
+    """
+    doc = {"run_date": "2026-01-02", "degraded_summary": {"degraded": True},
+           "collection_readiness": {"failure_signature": initial_sig},
+           "precondition_probe": {"Payload": {"past_deadline": past_deadline,
+                                              "precondition_met": False}}}
+    if pipeline_role:
+        doc["pipeline_role"] = pipeline_role
+    launches = 0
+    visited = []
+    name = start_at
+    clock = 0
+    for _ in range(200):
+        visited.append(name)
+        st = states[name]
+        if name == "HealNonConvergent" or name == "HealDispatchReplay":
+            return name, launches, visited
+        if name == "HealStartCollection":
+            launches += 1
+            name = st["Next"]
+        elif name == "HealReadFailureSignature":
+            idx = launches - 1
+            if read_raises and idx in read_raises:
+                name = st["Catch"][0]["Next"]
+                continue
+            sig = attempts[min(idx, len(attempts) - 1)]
+            readiness = {} if sig is None else {"failure_signature": sig}
+            _put(doc, st["ResultPath"], {"parsed": {"readiness": readiness}})
+            name = st["Next"]
+        elif name == "HealReProbe":
+            idx = launches - 1
+            if probe_raises:
+                name = st["Catch"][0]["Next"]
+                continue
+            met = probe_met[min(idx, len(probe_met) - 1)] if probe_met else False
+            doc["precondition_probe"] = {"Payload": {"precondition_met": met,
+                                                      "past_deadline": past_deadline}}
+            name = st["Next"]
+        elif st["Type"] == "Pass":
+            if "Result" in st:
+                value = json.loads(json.dumps(st["Result"]))
+            else:
+                value = {}
+                for k, v in st["Parameters"].items():
+                    if k == "attempts.$":
+                        value["attempts"] = _get(doc, "$.heal_loop.attempts") + 1
+                    elif k.endswith(".$") and v == "$$.State.EnteredTime":
+                        clock += 1
+                        value[k[:-2]] = f"2026-01-02T20:00:0{clock}Z"
+                    elif k.endswith(".$"):
+                        value[k[:-2]] = _get(doc, v)
+                    elif isinstance(v, dict):
+                        value[k] = {kk[:-2] if kk.endswith(".$") else kk:
+                                    (f"2026-01-02T20:00:0{clock}Z" if kk.endswith(".$") else vv)
+                                    for kk, vv in v.items()}
+                    else:
+                        value[k] = v
+            if "ResultPath" in st:
+                _put(doc, st["ResultPath"], value)
+            name = st["Next"]
+        elif st["Type"] == "Choice":
+            for choice in st["Choices"]:
+                if _eval_rule(choice, doc):
+                    name = choice["Next"]
+                    break
+            else:
+                name = st["Default"]
+        else:
+            raise AssertionError(f"simulator reached unmodelled {name} ({st['Type']})")
+    raise AssertionError(f"heal loop did not terminate: {visited[-12:]}")
+
+
+class TestRepeatedWorkloadFailureShortCircuit:
+    """aec#7764: a deterministic workload failure pages after ONE wasted
+    relaunch instead of two, through the same HealNonConvergent state."""
+
+    def test_identical_failure_pages_after_exactly_one_relaunch(self, states):
+        final, launches, visited = _run_heal(states, initial_sig=_SIG, attempts=[_SIG])
+        assert (final, launches) == ("HealNonConvergent", 1)
+        assert visited.count("HealStartCollection") == 1
+        assert "HealLoopIncrement" not in visited
+
+    def test_previous_definition_would_have_relaunched_twice(self, states):
+        # Red-before: take the shipped definition and remove the comparison
+        # (HealCheckConverged's Default back to HealLoopIncrement, the old
+        # wiring). The same scenario then burns the second relaunch.
+        old = json.loads(json.dumps(states))
+        old["HealCheckConverged"]["Default"] = "HealLoopIncrement"
+        final, launches, _ = _run_heal(old, initial_sig=_SIG, attempts=[_SIG])
+        assert (final, launches) == ("HealNonConvergent", 2)
+
+    def test_differing_signature_keeps_both_attempts(self, states):
+        other = '[{"reason":"vendor 429","unit":"D20"}]'
+        final, launches, _ = _run_heal(states, initial_sig=_SIG, attempts=[other])
+        assert (final, launches) == ("HealNonConvergent", 2)
+
+    def test_signature_differing_on_attempt_two_after_a_match_cannot_happen_stale(self, states):
+        # Attempt 1 differs, attempt 2 matches the initial: short-circuits on
+        # attempt 2 (still the final attempt, same page).
+        other = '[{"reason":"vendor 429","unit":"D20"}]'
+        final, launches, _ = _run_heal(states, initial_sig=_SIG, attempts=[other, _SIG])
+        assert (final, launches) == ("HealNonConvergent", 2)
+
+    @pytest.mark.parametrize("initial", ["", None])
+    def test_missing_initial_signature_never_short_circuits(self, states, initial):
+        final, launches, visited = _run_heal(states, initial_sig=initial, attempts=[_SIG])
+        assert (final, launches) == ("HealNonConvergent", 2)
+        assert "HealCheckRepeatedFailure" in visited
+
+    @pytest.mark.parametrize("fresh", ["", None])
+    def test_missing_or_empty_fresh_signature_never_short_circuits(self, states, fresh):
+        final, launches, _ = _run_heal(states, initial_sig=_SIG, attempts=[fresh])
+        assert (final, launches) == ("HealNonConvergent", 2)
+
+    def test_unreadable_signature_degrades_and_keeps_bounded_retry(self, states):
+        final, launches, visited = _run_heal(
+            states, initial_sig=_SIG, attempts=[_SIG], read_raises={0, 1})
+        assert (final, launches) == ("HealNonConvergent", 2)
+        assert "HealSetSignatureDegradedFlag" in visited
+
+    def test_reprobe_error_keeps_bounded_retry(self, states):
+        final, launches, visited = _run_heal(
+            states, initial_sig=_SIG, attempts=[_SIG], probe_raises=True)
+        assert (final, launches) == ("HealNonConvergent", 2)
+        assert "HealCheckRepeatedFailure" not in visited
+
+    def test_converged_precondition_still_dispatches_replay_despite_matching_signature(self, states):
+        final, launches, _ = _run_heal(
+            states, initial_sig=_SIG, attempts=[_SIG], probe_met=[True])
+        assert (final, launches) == ("HealDispatchReplay", 1)
+
+    def test_attempt_bound_still_enforced(self, states):
+        # Non-matching failures still get exactly the two attempts (see the
+        # differing-signature tests) and the gate constant is unchanged.
+        gate = states["HealLoopGate"]
+        assert gate["Choices"][0]["Or"][0]["NumericGreaterThanEquals"] == 2
+        final, launches, _ = _run_heal(states, initial_sig="", attempts=[_SIG])
+        assert (final, launches) == ("HealNonConvergent", 2)
+
+    def test_deadline_still_enforced(self, states):
+        final, launches, _ = _run_heal(
+            states, initial_sig=_SIG, attempts=[_SIG], past_deadline=True)
+        assert (final, launches) == ("HealNonConvergent", 0)
+
+    def test_short_circuit_reaches_the_same_page_and_cleanup_as_exhaustion(self, states):
+        # Both routes end in the one HealNonConvergent state (one SNS page,
+        # one cleanup continuation); nothing new routes around it.
+        into = {n for n, st in states.items() if "HealNonConvergent" in _targets(st)}
+        assert {"HealLoopGate", "HealCheckRepeatedFailure", "CheckHealLoopEligible"} <= into
+        assert states["HealNonConvergent"]["Resource"] == "arn:aws:states:::sns:publish"
 
 
 class TestHealLoopDispatchChain:
@@ -398,13 +640,13 @@ class TestHealLoopDispatchChain:
         hcc = states["HealCheckConverged"]
         c = hcc["Choices"][0]
         # config-I2767: IsPresent-guarded — a partial probe payload falls to
-        # Default HealLoopIncrement (bounded loop), never States.Runtime.
+        # Default checks a measured workload signature before the bounded loop.
         guard, comparison = c["And"]
         assert guard == {"Variable": "$.precondition_probe.Payload.precondition_met", "IsPresent": True}
         assert comparison["Variable"] == "$.precondition_probe.Payload.precondition_met"
         assert comparison["BooleanEquals"] is True
         assert c["Next"] == "HealDispatchReplay"
-        assert hcc["Default"] == "HealLoopIncrement"
+        assert hcc["Default"] == "HealCheckRepeatedFailure"
 
 
 class TestHealDispatchReplay:
