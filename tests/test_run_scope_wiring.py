@@ -9,6 +9,9 @@ for itself, and that it can never fail the run.
 """
 from __future__ import annotations
 
+# Existing modules predate the repository-wide ANN gate.
+# ruff: noqa: ANN001, ANN003, ANN201, ANN202, ANN204, ANN205
+
 import json
 import pathlib
 
@@ -121,6 +124,32 @@ def test_the_state_timeout_binds_before_the_lambda_timeout(states):
     tests/test_sf_lambda_timeout_ordering.py.
     """
     assert states["RunScope"]["TimeoutSeconds"] == 45
+
+
+def test_terminal_scope_is_derived_from_this_execution(states):
+    terminal = states["ClassifyExecutionScope"]
+    payload = terminal["Parameters"]["Payload"]
+    assert states["WeeklyCoverageSweep"]["Next"] == "ClassifyExecutionScope"
+    assert payload["execution_arn.$"] == "$$.Execution.Id"
+    assert payload["execution_input.$"] == "$$.Execution.Input"
+    assert payload["terminal_scope"] is True
+    assert terminal["ResultPath"] == "$.execution_scope_result"
+
+
+def test_only_complete_terminal_scope_can_continue_toward_success(states):
+    choice = states["CheckExecutionScope"]
+    routes = {rule["And"][1]["StringEquals"]: rule["Next"] for rule in choice["Choices"]}
+    assert routes == {
+        "VACUOUS": "CheckRunSlotHeldBeforeVacuousRun",
+        "PARTIAL": "PartialScopeRun",
+        "UNAVAILABLE": "ExecutionScopeUnavailable",
+    }
+    assert choice["Default"] == "CheckExecutionDidWork"
+    assert states["PartialScopeRun"]["Type"] == "Fail"
+    assert states["PartialScopeRun"]["Error"] == "PartialScopeRun"
+    assert "skipped_producers" in states["PartialScopeRun"]["CausePath"] or (
+        "execution_scope" in states["PartialScopeRun"]["CausePath"]
+    )
 
 
 # ---------------------------------------------------------------------------

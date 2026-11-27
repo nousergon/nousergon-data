@@ -34,6 +34,9 @@ verification (config#2277 deliverable 2).
 
 from __future__ import annotations
 
+# Existing modules predate the repository-wide ANN gate.
+# ruff: noqa: ANN001, ANN003, ANN201, ANN202, ANN204, ANN205
+
 import importlib.util
 import json
 import sys

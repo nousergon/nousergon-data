@@ -16,6 +16,9 @@ safe — that neither of the pipeline's two DESIGNED no-ops can reach it.
 """
 from __future__ import annotations
 
+# Existing modules predate the repository-wide ANN gate.
+# ruff: noqa: ANN001, ANN003, ANN201, ANN202, ANN204, ANN205
+
 import json
 import pathlib
 
@@ -63,7 +66,9 @@ def _reachable(states: dict, start: str) -> set[str]:
 
 
 def test_the_coverage_sweep_hands_off_to_the_did_work_choice(states):
-    assert states["WeeklyCoverageSweep"]["Next"] == "CheckExecutionDidWork"
+    assert states["WeeklyCoverageSweep"]["Next"] == "ClassifyExecutionScope"
+    assert states["ClassifyExecutionScope"]["Next"] == "CheckExecutionScope"
+    assert states["CheckExecutionScope"]["Default"] == "CheckExecutionDidWork"
 
 
 def test_the_choice_fires_only_on_an_explicit_boolean_false(states):

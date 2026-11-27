@@ -83,7 +83,10 @@ the rules below were established rather than assumed.
 """
 from __future__ import annotations
 
-from typing import Any, Iterable
+# Existing modules predate the repository-wide ANN gate.
+# ruff: noqa: ANN001, ANN003, ANN201, ANN202, ANN204, ANN205
+
+from typing import Any, Iterable, cast
 
 SCHEMA = "run_scope-1.0.0"
 SCHEMA_VERSION = 1
@@ -92,6 +95,11 @@ DISABLED = "DISABLED"
 ENABLED_COMPLETED = "ENABLED_COMPLETED"
 ENABLED_FAILED = "ENABLED_FAILED"
 NOT_REACHED = "NOT_REACHED"
+
+SCOPE_COMPLETE = "COMPLETE"
+SCOPE_PARTIAL = "PARTIAL"
+SCOPE_VACUOUS = "VACUOUS"
+SCOPE_UNAVAILABLE = "UNAVAILABLE"
 
 #: The closed vocabulary. A disposition outside it is a bug, not a new state.
 DISPOSITIONS = frozenset(
@@ -1338,6 +1346,61 @@ def _statement(
             f"recorded ({', '.join(sorted(after_scope))})"
         )
     return "; ".join(parts) + "."
+
+
+def classify_execution_scope(scope: dict[str, object]) -> dict[str, object]:
+    """Classify this execution without consulting the cycle-level merge.
+
+    The run-scope object in S3 accumulates stronger observations from several
+    executions.  It is therefore useful for grading a cycle, but is not valid
+    evidence that *this* execution ran every producer.  This verdict is made
+    from the rows derived from this execution's history before any merge.
+    """
+    if scope.get("degraded"):
+        return {
+            "verdict": SCOPE_UNAVAILABLE,
+            "skipped_producers": [],
+            "reason": scope.get("degraded_reason", "execution scope unavailable"),
+        }
+
+    raw_stages = scope.get("stages")
+    stages = cast(dict[str, object], raw_stages) if isinstance(raw_stages, dict) else {}
+    skipped = sorted(
+        name for name, row in stages.items()
+        if isinstance(row, dict)
+        and cast(dict[str, object], row).get("disposition") == DISABLED
+    )
+    not_completed = sorted(
+        name for name, row in stages.items()
+        if isinstance(row, dict)
+        and cast(dict[str, object], row).get("disposition")
+        in {ENABLED_FAILED, NOT_REACHED}
+    )
+    ran = sorted(
+        name for name, row in stages.items()
+        if isinstance(row, dict)
+        and cast(dict[str, object], row).get("disposition") in GRADED_DISPOSITIONS
+    )
+
+    if not ran and skipped:
+        verdict = SCOPE_VACUOUS
+    elif skipped:
+        verdict = SCOPE_PARTIAL
+    elif not_completed or not stages:
+        verdict = SCOPE_UNAVAILABLE
+    else:
+        verdict = SCOPE_COMPLETE
+    return {
+        "verdict": verdict,
+        "skipped_producers": skipped,
+        "not_completed_producers": not_completed,
+        "observed_producers": ran,
+        "reason": (
+            f"this execution skipped {', '.join(skipped)}"
+            if skipped else
+            "this execution did not skip a declared producer"
+        ),
+    }
 
 
 def graded_stage_names(block: Any) -> list[str]:
