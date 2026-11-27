@@ -818,6 +818,15 @@ PYTHON_BIN=python3.12
 export PYTHON_BIN
 ENV_EOF
 
+# Every generated SSM worker script includes ENV_SOURCE.  The rehearsal token
+# is authoritative over an inherited production trigger; other launches keep
+# an explicitly supplied trigger and otherwise retain their existing behavior.
+if [[ "${RUN_TOKEN:-}" == rehearsal-* ]]; then
+    ENV_SOURCE+=$'\nexport NE_DATA_TRIGGER=rehearsal'
+elif [ -n "${NE_DATA_TRIGGER:-}" ]; then
+    ENV_SOURCE+=$'\nexport NE_DATA_TRIGGER='"$(printf '%q' "$NE_DATA_TRIGGER")"
+fi
+
 # ── Bootstrap spot: watchdog + python + git + clone + config ────────────────
 # Rendered by krepis.spot_bootstrap (alpha-engine-config-I6922 / I7372), not
 # built as an inline heredoc. This file was the LAST shell copy of the fleet's

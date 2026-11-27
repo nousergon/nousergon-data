@@ -152,6 +152,12 @@ if [ -n "${RUN_TOKEN:-}" ]; then
 else
   _RUN_TOKEN_EXPORT="export RUN_TOKEN=spot-data-weekly-$(date -u +%Y%m%d)"$'\n'
 fi
+if [[ "${RUN_TOKEN:-}" == rehearsal-* ]]; then
+  # The rehearsal marker is authoritative over an inherited production value.
+  _RUN_TOKEN_EXPORT+="export NE_DATA_TRIGGER=rehearsal"$'\n'
+elif [ -n "${NE_DATA_TRIGGER:-}" ]; then
+  _RUN_TOKEN_EXPORT+="export NE_DATA_TRIGGER=$(printf '%q' "$NE_DATA_TRIGGER")"$'\n'
+fi
 
 # ── Spot launch (capacity-resilient) ─────────────────────────────────────────
 
