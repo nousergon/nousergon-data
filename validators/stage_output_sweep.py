@@ -72,6 +72,10 @@ always in the alarming direction. The verdict set keeps the two apart:
                   no stage is ever declared skipped, because "I don't know
                   which stages ran" must not become "the stage was allowed not
                   to run"
+  ``pending_downstream``
+                  the execution is still RUNNING and the declaring stage is
+                  reachable after the state running this sweep. It is not yet
+                  owed and is therefore neither a defect nor an alert
   ``dry``         (alpha-engine-config-I7392) the stage entered but this
                   execution ran under the dry-path contract (``shell_run``),
                   which forbids every routed producer from writing. A
@@ -189,7 +193,8 @@ import logging
 import re
 import sys
 from datetime import datetime, timezone
-from typing import Any, Callable, Iterable, Optional, Sequence
+from pathlib import Path
+from typing import Any, Callable, Iterable, Optional, Protocol, Sequence, cast
 
 logger = logging.getLogger(__name__)
 
@@ -254,6 +259,7 @@ MISSING = "missing"
 UNMEASURED = "unmeasured"
 UNRESOLVED = "unresolved"
 SKIPPED = "skipped"
+PENDING_DOWNSTREAM = "pending_downstream"
 DRY = "dry"
 GATED = "gated"
 
@@ -302,6 +308,14 @@ _ALERT_PREVIEW_LIMIT = 12
 _ENTERED_EVENT_SUFFIX = "StateEntered"
 
 
+class _ExecutionReader(Protocol):
+    def describe_execution(self, *, executionArn: str) -> object: ...  # noqa: N803
+
+    def describe_state_machine_for_execution(
+        self, *, executionArn: str  # noqa: N803
+    ) -> object: ...
+
+
 class ExecutionContext:
     """What the sweep could establish about the execution it is asserting over.
 
@@ -311,7 +325,10 @@ class ExecutionContext:
     be reported as a fact about the pipeline.
     """
 
-    __slots__ = ("start", "entered_stages", "notes", "run_mode")
+    __slots__ = (
+        "start", "entered_stages", "notes", "run_mode", "status",
+        "downstream_stages",
+    )
 
     def __init__(
         self,
@@ -319,11 +336,54 @@ class ExecutionContext:
         entered_stages: frozenset[str] | None = None,
         notes: list[str] | None = None,
         run_mode: str | None = None,
+        status: str | None = None,
+        downstream_stages: frozenset[str] | None = None,
     ) -> None:
         self.start = start
         self.entered_stages = entered_stages
         self.notes = notes or []
         self.run_mode = run_mode
+        self.status = status
+        self.downstream_stages = downstream_stages
+
+
+def _reachable_states(definition: object, start: str) -> frozenset[str] | None:
+    """Return states reachable after ``start`` in an ASL definition."""
+    try:
+        raw_machine: object = json.loads(definition) if isinstance(definition, str) else definition
+        if not isinstance(raw_machine, dict):
+            return None
+        machine = cast(dict[str, object], raw_machine)
+        raw_states = machine["States"]
+        if not isinstance(raw_states, dict):
+            return None
+        states = cast(dict[str, object], raw_states)
+        if start not in states:
+            return None
+        reachable: set[str] = set()
+        todo = [start]
+        while todo:
+            name = todo.pop()
+            raw_state = states.get(name)
+            if not isinstance(raw_state, dict):
+                continue
+            state = cast(dict[str, object], raw_state)
+            successors = [state.get("Next"), state.get("Default")]
+            for branch_key in ("Choices", "Catch"):
+                branches = state.get(branch_key)
+                if isinstance(branches, list):
+                    for raw_branch in cast(list[object], branches):
+                        if isinstance(raw_branch, dict):
+                            branch = cast(dict[str, object], raw_branch)
+                            successors.append(branch.get("Next"))
+            for successor in successors:
+                if isinstance(successor, str) and successor not in reachable:
+                    reachable.add(successor)
+                    todo.append(successor)
+        reachable.discard(start)
+        return frozenset(reachable)
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
 
 
 def _parse_run_mode(raw_input: Any, *, notes: list[str]) -> str | None:
@@ -417,14 +477,23 @@ def read_execution_context(
             context.notes.append(f"stepfunctions client unavailable: {exc}")
             return context
 
+    execution_reader = cast(_ExecutionReader, sfn_client)
     try:
-        described = sfn_client.describe_execution(executionArn=execution_arn)
+        described = cast(
+            dict[str, object],
+            execution_reader.describe_execution(executionArn=execution_arn),
+        )
         start = described.get("startDate")
         if isinstance(start, datetime):
             context.start = _utc(start)
         else:
             context.notes.append("describe_execution returned no usable startDate")
         context.run_mode = _parse_run_mode(described.get("input"), notes=context.notes)
+        status = described.get("status")
+        if isinstance(status, str):
+            context.status = status
+        else:
+            context.notes.append("describe_execution returned no usable status")
     except Exception as exc:  # noqa: BLE001
         context.notes.append(
             f"describe_execution failed ({type(exc).__name__}: {exc}) — staleness "
@@ -434,6 +503,7 @@ def read_execution_context(
 
     try:
         entered: set[str] = set()
+        last_entered: str | None = None
         token = None
         while True:
             kwargs = {"executionArn": execution_arn, "maxResults": 1000}
@@ -446,12 +516,50 @@ def read_execution_context(
                     continue
                 details = event.get("stateEnteredEventDetails") or {}
                 name = details.get("name")
-                if name:
+                if isinstance(name, str) and name:
                     entered.add(name)
+                    last_entered = name
             token = page.get("nextToken")
             if not token:
                 break
         context.entered_stages = frozenset(entered)
+        if context.status == "RUNNING" and last_entered is not None:
+            try:
+                described_machine = cast(
+                    dict[str, object],
+                    execution_reader.describe_state_machine_for_execution(
+                        executionArn=execution_arn
+                    ),
+                )
+                context.downstream_stages = _reachable_states(
+                    described_machine.get("definition"), last_entered
+                )
+                if context.downstream_stages is None:
+                    context.notes.append(
+                        "state-machine definition did not establish downstream ordering"
+                    )
+            except Exception as exc:  # noqa: BLE001
+                # The dashboard role historically has only DescribeExecution
+                # and GetExecutionHistory. Prefer the immutable execution
+                # definition when allowed, but retain the checked-in weekly
+                # definition as the same offline source used for deployments.
+                definition_path = (
+                    Path(__file__).resolve().parents[1]
+                    / "infrastructure"
+                    / "step_function.json"
+                )
+                try:
+                    context.downstream_stages = _reachable_states(
+                        json.loads(definition_path.read_text()), last_entered
+                    )
+                except (OSError, json.JSONDecodeError):
+                    context.downstream_stages = None
+                if context.downstream_stages is None:
+                    context.notes.append(
+                        "describe_state_machine_for_execution failed "
+                        f"({type(exc).__name__}: {exc}) and the checked-in definition "
+                        "did not establish downstream ordering"
+                    )
     except Exception as exc:  # noqa: BLE001
         context.notes.append(
             f"get_execution_history failed ({type(exc).__name__}: {exc}) — the "
@@ -866,6 +974,8 @@ def evaluate(
     head: Callable[[str, str], tuple[str, Any]],
     find: Callable[[str, str], tuple[str, Any, str]] | None = None,
     entered_stages: frozenset[str] | None = None,
+    pending_stages: frozenset[str] | None = None,
+    execution_classification_known: bool = True,
     cycle_date: str | None = None,
     run_mode: str | None = None,
     pipeline: str | None = None,
@@ -945,8 +1055,20 @@ def evaluate(
             continue
 
         if entered_stages is not None and stage not in entered_stages:
-            finding["verdict"] = SKIPPED
-            finding["detail"] = "stage did not enter this execution"
+            if not execution_classification_known:
+                finding["verdict"] = UNMEASURED
+                finding["detail"] = (
+                    "execution status, history, or downstream ordering could not "
+                    "be established; stage non-entry cannot be classified"
+                )
+            elif pending_stages is not None and stage in pending_stages:
+                finding["verdict"] = PENDING_DOWNSTREAM
+                finding["detail"] = (
+                    "execution is still running and stage is downstream of the sweep"
+                )
+            else:
+                finding["verdict"] = SKIPPED
+                finding["detail"] = "stage did not enter this execution"
             findings.append(finding)
             continue
 
@@ -1136,17 +1258,38 @@ def sweep(
     if cycle_date is None:
         cycle_date = resolve_cycle_date(run_date)
     context_notes: list[str] = []
+    pending_stages: frozenset[str] | None = None
+    execution_classification_known = True
+    entered_stages_known = entered_stages is not None
+    execution_status: str | None = None
     if execution_arn:
         context = read_execution_context(execution_arn, sfn_client=sfn_client)
         context_notes = context.notes
+        execution_status = context.status
         # An explicitly-passed value wins over the API read: the caller may be
         # replaying a historical run whose ARN no longer resolves.
         if execution_start is None:
             execution_start = context.start
         if entered_stages is None:
             entered_stages = context.entered_stages
+        entered_stages_known = entered_stages is not None
         if run_mode is None:
             run_mode = context.run_mode
+        if context.status == "RUNNING":
+            pending_stages = context.downstream_stages
+            execution_classification_known = (
+                entered_stages is not None
+                and context.downstream_stages is not None
+            )
+        elif context.status in {"SUCCEEDED", "FAILED", "TIMED_OUT", "ABORTED"}:
+            execution_classification_known = entered_stages is not None
+        else:
+            execution_classification_known = False
+        if not execution_classification_known and entered_stages is None:
+            # Preserve the distinction between "known empty" and "unknown":
+            # evaluate every declaration as unmeasured rather than turning a
+            # context failure into evidence of missing output.
+            entered_stages = frozenset()
         for note in context_notes:
             logger.warning("Execution context degraded: %s", note)
 
@@ -1185,6 +1328,8 @@ def sweep(
         head=lambda b, k: _head(s3_client, b, k),
         find=lambda b, k: _newest_match(s3_client, b, k),
         entered_stages=entered_stages,
+        pending_stages=pending_stages,
+        execution_classification_known=execution_classification_known,
         cycle_date=cycle_date,
         run_mode=run_mode,
         pipeline=pipeline,
@@ -1203,8 +1348,9 @@ def sweep(
         "execution_start": (
             execution_start.isoformat() if execution_start else None
         ),
-        "entered_stages_known": entered_stages is not None,
+        "entered_stages_known": entered_stages_known,
         "entered_stage_count": len(entered_stages) if entered_stages is not None else None,
+        "execution_status": execution_status,
         "execution_arn": execution_arn,
         "context_notes": context_notes,
         "declared_stages": sorted(
