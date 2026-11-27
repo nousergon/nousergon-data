@@ -28,6 +28,6 @@ requests>=2.34.2
 feedparser>=6.0.14
 anyio>=4.16.0
 tenacity>=9.2.1
-pyyaml>=6.0.3
+pyyaml>=6.0.4
 voyageai>=0.6.0
 nousergon-lib[rag,flow-doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.124.189
