@@ -1,3 +1,5 @@
+# Existing contract fixtures intentionally use pytest's dynamic module objects.
+# ruff: noqa: ANN001, ANN002, ANN003, ANN201, ANN202, ANN204
 """Contract tests for the standalone data-collection stack (alpha-engine-config-I10739).
 
 Nous Ergon's data collection is its own component with its own schedule and
@@ -598,6 +600,76 @@ def test_the_definition_fails_loud_rather_than_skipping(stack):
     ]
     # A paging outage must never convert a finding into a green run.
     assert asl["States"]["NotifyCompletionFindings"]["Catch"][0]["Next"] == "CompletionFailureMode"
+
+
+def test_one_data_revision_is_propagated_to_every_attempt(stack):
+    """A branch move between attempts cannot change the code being retried."""
+    asl = json.loads(stack.DEFINITION.read_text(encoding="utf-8"))
+    resolve = asl["States"]["ResolveDataRevision"]
+    assert asl["States"]["Init"]["Next"] == "ResolveDataRevision"
+    assert resolve["Parameters"]["Payload"] == {"action": "resolve-data-revision"}
+    assert resolve["ResultSelector"] == {"sha.$": "$.Payload.data_revision.sha"}
+    assert resolve["Catch"][0]["Next"] == "NotifyFailure"
+
+    run = asl["States"]["RunWorkloads"]
+    assert run["ItemSelector"]["data_revision.$"] == "$.data_revision.sha"
+    inner = run["ItemProcessor"]["States"]
+    assert inner["LaunchWorkload"]["Parameters"]["Payload"]["data_revision.$"] == "$.data_revision"
+    assert inner["RetryOnDemand"]["Parameters"]["data_revision.$"] == "$.data_revision"
+    assert inner["RetryOnDemand"]["Next"] == "LaunchWorkload"
+
+
+def test_pinned_revision_checkout_is_fail_closed_before_dependencies():
+    """The shallow branch clone is corrected to the execution's exact SHA."""
+    import importlib.util
+
+    path = REPO / "infrastructure" / "lambdas" / "data-spot-dispatcher" / "index.py"
+    spec = importlib.util.spec_from_file_location("_pinned_data_dispatcher", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    old_sha = "a" * 40
+    script = module._bootstrap_command(
+        "weekly-phase-one", "true", "token", data_revision=old_sha
+    )
+    assert f"fetch --depth 1 origin {old_sha}" in script
+    assert f"checkout --detach {old_sha}" in script
+    assert "data revision checkout failed" in script
+    assert script.index(f"checkout --detach {old_sha}") < script.index("pip install")
+    with pytest.raises(ValueError, match="full commit SHA"):
+        module._bootstrap_command("weekly-phase-one", "true", "token", data_revision="main")
+
+
+def test_revision_resolution_returns_only_a_full_sha_and_propagates_failure(monkeypatch):
+    import importlib.util
+    import io
+    import urllib.error
+
+    path = REPO / "infrastructure" / "lambdas" / "data-spot-dispatcher" / "index.py"
+    spec = importlib.util.spec_from_file_location("_revision_data_dispatcher", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    class _Response(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.close()
+
+    resolved = "b" * 40
+    monkeypatch.setattr(
+        module.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: _Response(json.dumps({"sha": resolved}).encode()),
+    )
+    assert module._resolve_data_revision() == {"data_revision": {"sha": resolved}}
+
+    def _fail(*_args, **_kwargs):
+        raise urllib.error.URLError("branch unavailable")
+
+    monkeypatch.setattr(module.urllib.request, "urlopen", _fail)
+    with pytest.raises(urllib.error.URLError, match="branch unavailable"):
+        module._resolve_data_revision()
 
 
 def test_the_four_failure_modes_the_asl_switches_on_are_the_lambdas_own(stack):

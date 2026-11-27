@@ -13,6 +13,17 @@
         "verify_units.$": "$.verify_units",
         "started_at.$": "$$.Execution.StartTime"
       },
+      "Next": "ResolveDataRevision"
+    },
+    "ResolveDataRevision": {
+      "Type": "Task",
+      "Comment": "Resolve the data repository branch once per execution. Every workload and its on-demand retry receives this immutable commit; resolution failure fails loud through NotifyFailure.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {"FunctionName": "${DispatcherFunctionArn}", "Payload": {"action": "resolve-data-revision"}},
+      "ResultSelector": {"sha.$": "$.Payload.data_revision.sha"},
+      "ResultPath": "$.data_revision",
+      "Retry": [{"ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"], "IntervalSeconds": 5, "MaxAttempts": 3, "BackoffRate": 2}],
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure"}],
       "Next": "CheckRequireTradingDay"
     },
     "CheckRequireTradingDay": {
@@ -87,6 +98,7 @@
         "workload.$": "$$.Map.Item.Value",
         "execution_id.$": "$$.Execution.Id",
         "pipeline_role.$": "$.collection",
+        "data_revision.$": "$.data_revision.sha",
         "force_on_demand": false,
         "attempts": 0
       },
@@ -105,6 +117,7 @@
                 "workload.$": "$.workload",
                 "execution_id.$": "$.execution_id",
                 "pipeline_role.$": "$.pipeline_role",
+                "data_revision.$": "$.data_revision",
                 "force_on_demand.$": "$.force_on_demand"
               }
             },
@@ -230,6 +243,7 @@
               "workload.$": "$.workload",
               "execution_id.$": "$.execution_id",
               "pipeline_role.$": "$.pipeline_role",
+              "data_revision.$": "$.data_revision",
               "force_on_demand": true,
               "attempts.$": "States.MathAdd($.attempts, 1)"
             },
