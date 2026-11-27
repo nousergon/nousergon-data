@@ -7523,7 +7523,87 @@
           "Next": "NotifyShellRunComplete"
         }
       ],
-      "Default": "CheckGateDegradedNotify"
+      "Default": "CheckExecutionScope"
+    },
+    "CheckExecutionScope": {
+      "Type": "Choice",
+      "Comment": "alpha-engine-config-I13864 - THIS EXECUTION'S OWN PRODUCER SCOPE, decided BEFORE the completion notifier and the completion marker, so a partial or unreadable scope degrades the run the way every other degraded family does (marker status DEGRADED, run-slot release, DegradedRun terminal that pages) instead of ending SUCCEEDED. WHY HERE AND NOT AT THE OBSERVE-ONLY TAIL: the tail after WeeklyCoverageSweep sits downstream of the success terminal and tests/sf_degraded_summary_helpers.py::assert_observe_only_tail forbids any Fail reachable from it other than VacuousRun; the first two attempts at this issue put the new Fail terminals there and broke 150 contract tests. Here the same verdict rides the existing degraded chokepoint instead, which already owns the marker write, the cleanup and the terminal. | THE VERDICT IS $.run_scope_result.Payload.execution_scope.verdict, which weekly-run-scope computes from the rows derived from THIS execution's history BEFORE it merges them into the cycle-level run_scope artifact, so an earlier execution that completed a stage this one skipped cannot conceal the skip. PARTIAL: a declared producer was skipped (a skip the cadence trigger declares for itself - skip_parity, skip_data_phase2 and skip_rag_ingestion today, pinned in run_scope.CADENCE_DECLARED_SKIP_FLAGS - is outside the declared set and does not count). UNAVAILABLE: the scope could not be derived, RunScope was bypassed or failed, or the verdict is absent or unrecognised - an unknown is never rendered green. COMPLETE: eligible for SUCCEEDED. VACUOUS: left to CheckExecutionDidWork and VacuousRun (alpha-engine-config-I9693), which already own that outcome and are preserved unchanged. | NOT REACHABLE FROM THE FRIDAY-PM SHELL RUN, which leaves at CheckShellRunNotify to NotifyShellRunComplete, nor from the Thu/Fri gate-out, which terminates upstream of every stage. | No state here dereferences vacuous_rerun_accepted_reason or skipped_producer_reasons: an operator acknowledgment is a record, and cannot change the verdict.",
+      "Choices": [
+        {
+          "Variable": "$.run_scope_result.Payload.execution_scope.verdict",
+          "IsPresent": false,
+          "Next": "MarkExecutionScopeUnavailable"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.run_scope_result.Payload.execution_scope.verdict",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.run_scope_result.Payload.execution_scope.verdict",
+              "StringEquals": "PARTIAL"
+            }
+          ],
+          "Next": "MarkExecutionScopeIncomplete"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.run_scope_result.Payload.execution_scope.verdict",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.run_scope_result.Payload.execution_scope.verdict",
+              "StringEquals": "COMPLETE"
+            }
+          ],
+          "Next": "CheckGateDegradedNotify"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.run_scope_result.Payload.execution_scope.verdict",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.run_scope_result.Payload.execution_scope.verdict",
+              "StringEquals": "VACUOUS"
+            }
+          ],
+          "Next": "CheckGateDegradedNotify"
+        }
+      ],
+      "Default": "MarkExecutionScopeUnavailable"
+    },
+    "MarkExecutionScopeIncomplete": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I13864: this execution skipped at least one declared producer, so it must not end SUCCEEDED. Writes the $.degraded_summary that CheckDegradedOutcome and the DegradedRun terminal read, with the scope verdict and the skipped producers under degraded_summary.execution_scope so the completion marker, the page and the terminal all name them. Folds into the same accumulating reasons map as every other degraded setter. Pages immediately: Next is the generic multi-family completion notifier (through its context normalizer), which then continues to CheckDegradedOutcome and the DEGRADED marker. PARTITION FAMILY = trading_day (run_date is the cycle's trading day from NormalizeRunDates; it names the cycle in the summary).",
+      "Parameters": {
+        "degraded": true,
+        "reason": "execution_scope_partial",
+        "run_date.$": "$.run_date",
+        "reasons.$": "States.JsonMerge($.degraded_summary.reasons, States.StringToJson('{\"execution_scope\":\"execution_scope_partial\"}'), false)",
+        "execution_scope.$": "$.run_scope_result.Payload.execution_scope"
+      },
+      "ResultPath": "$.degraded_summary",
+      "Next": "NormalizeMultipleDegradedContext"
+    },
+    "MarkExecutionScopeUnavailable": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I13864: this execution's producer scope is unknown (RunScope was bypassed or failed, or its verdict is absent or unrecognised), so it must not end SUCCEEDED: an unmeasured run is not a complete one. Same shape and routing as MarkExecutionScopeIncomplete, but dereferences nothing under $.run_scope_result, which may be absent on exactly this path. PARTITION FAMILY = trading_day (run_date is the cycle's trading day from NormalizeRunDates; it names the cycle in the summary).",
+      "Parameters": {
+        "degraded": true,
+        "reason": "execution_scope_unavailable",
+        "run_date.$": "$.run_date",
+        "reasons.$": "States.JsonMerge($.degraded_summary.reasons, States.StringToJson('{\"execution_scope\":\"execution_scope_unavailable\"}'), false)",
+        "execution_scope": {
+          "verdict": "UNAVAILABLE",
+          "skipped_producers": []
+        }
+      },
+      "ResultPath": "$.degraded_summary",
+      "Next": "NormalizeMultipleDegradedContext"
     },
     "CheckGateDegradedNotify": {
       "Type": "Choice",
@@ -7860,7 +7940,7 @@
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
         "Subject": "Alpha Engine Saturday Pipeline \u2014 DEGRADED: multiple (run terminates FAILED)",
-        "Message": "Every WORK stage completed, and the run still terminates FAILED (config-I6891, sf-pipeline-policy.md \u00a72.3 Option A) because one or more of the following degraded on this run: the pre-spend gates (LibPinDriftCheck/PipelineContractCheck/AcquireMutex), the tail health checks (SaturdayHealthCheck/WeeklySubstrateHealthCheck), the report card advisory grading (ReportCard Lambda), the Parity verdict (pit_parity/replay \u2014 absence of a verdict must NOT be read as a clean pass), and/or an internal ResearchPredictorParallel fail-open (Scanner/RegimeSubstrate/ChallengerShadow/ThinkTank/the eval-judge chain/the model-zoo rotation), and/or the top-level cost aggregation (AggregateCosts, moved out of that Parallel by alpha-engine-config-I7194). Exact combination is on the execution record: $.gate_degraded / $.health_check_degraded / $.report_card_degraded / $.parity_degraded / $.research_predictor_degraded / $.aggregate_costs_degraded, with detail at $.report_card_error and (if set) $.health_check_error / $.substrate_check_error / $.parity_error / $.branch_outcomes. View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
+        "Message": "Every WORK stage completed, and the run still terminates FAILED (config-I6891, sf-pipeline-policy.md \u00a72.3 Option A) because one or more of the following degraded on this run: the pre-spend gates (LibPinDriftCheck/PipelineContractCheck/AcquireMutex), the tail health checks (SaturdayHealthCheck/WeeklySubstrateHealthCheck), the report card advisory grading (ReportCard Lambda), the Parity verdict (pit_parity/replay \u2014 absence of a verdict must NOT be read as a clean pass), and/or an internal ResearchPredictorParallel fail-open (Scanner/RegimeSubstrate/ChallengerShadow/ThinkTank/the eval-judge chain/the model-zoo rotation), and/or the top-level cost aggregation (AggregateCosts, moved out of that Parallel by alpha-engine-config-I7194). and/or this execution's own producer scope was incomplete (alpha-engine-config-I13864): a declared producer was skipped, or the scope could not be measured - read $.degraded_summary.execution_scope for the verdict and the skipped producers. Exact combination is on the execution record: $.gate_degraded / $.health_check_degraded / $.report_card_degraded / $.parity_degraded / $.research_predictor_degraded / $.aggregate_costs_degraded, with detail at $.report_card_error and (if set) $.health_check_error / $.substrate_check_error / $.parity_error / $.branch_outcomes. View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
       },
       "ResultPath": "$.notify_result",
       "Catch": [
