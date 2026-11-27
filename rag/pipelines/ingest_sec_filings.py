@@ -24,6 +24,7 @@ import os
 import re
 import time
 from datetime import date, timedelta
+from typing import Any
 
 import requests
 
@@ -552,7 +553,8 @@ def ingest_ticker(
             stats.fail("no_sections")
             continue
 
-        all_chunks = []
+        # content / section_label strings, then an embedding vector per chunk.
+        all_chunks: list[dict[str, Any]] = []  # pyright: ignore[reportExplicitAny] -- mixed str and vector values
         for section_label, section_text in sections.items():
             for chunk_text in _chunk_text(section_text):
                 all_chunks.append({

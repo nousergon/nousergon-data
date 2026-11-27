@@ -867,7 +867,7 @@ def manual_run(
     bucket: str = MANIFEST_BUCKET,
     trigger: str = "manual",
     trading_day: str | None = None,
-) -> run_manifest.UnitRunResult:
+) -> run_manifest.UnitRunResult[Any]:  # pyright: ignore[reportExplicitAny] -- `value` is whatever the heterogeneous callback returned
     """Run a manual/on-demand tool under the same wrapper a scheduled unit uses.
 
     `data_collection_plan_260914.md` §4.4: "Manual and GHA units call the same

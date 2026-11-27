@@ -43,14 +43,27 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-from datetime import datetime, timezone
-from typing import Any
+from datetime import date, datetime, timezone
+from typing import TYPE_CHECKING, Any, cast
 
 from nousergon_lib.rag.db import execute_query
 
 from rag.pipelines._run_date import resolve_run_date
 
+if TYPE_CHECKING:
+    from _typeshed import ConvertibleToInt
+
 logger = logging.getLogger(__name__)
+
+
+def _int(value: object) -> int:
+    """``int(value)`` for a column of a ``RealDictCursor`` row.
+
+    ``execute_query`` types each row as ``dict[str, object]``; the columns read
+    here are SQL counts and percentiles, so this narrows for the type checker
+    and converts exactly as ``int()`` always did.
+    """
+    return int(cast("ConvertibleToInt", value))
 
 # Hardcoded; ``rag.embeddings.embed_*`` defaults to voyage-3-lite (512d,
 # matches the ``embedding vector(512)`` column in ``rag/schema.sql``).
@@ -75,10 +88,10 @@ def _by_source() -> dict[str, dict[str, int]]:
         """
     )
     return {
-        r["doc_type"]: {
-            "documents": int(r["documents"]),
-            "tickers": int(r["tickers"]),
-            "chunks": int(r["chunks"]),
+        cast(str, r["doc_type"]): {
+            "documents": _int(r["documents"]),
+            "tickers": _int(r["tickers"]),
+            "chunks": _int(r["chunks"]),
         }
         for r in rows
     }
@@ -110,10 +123,10 @@ def _by_ticker_coverage() -> dict[str, Any]:
         }
     r = rows[0]
     return {
-        "tickers_with_any_doc": int(r["tickers_with_any_doc"] or 0),
-        "p25_docs_per_ticker": int(r["p25_docs"] or 0),
-        "p50_docs_per_ticker": int(r["p50_docs"] or 0),
-        "p75_docs_per_ticker": int(r["p75_docs"] or 0),
+        "tickers_with_any_doc": _int(r["tickers_with_any_doc"] or 0),
+        "p25_docs_per_ticker": _int(r["p25_docs"] or 0),
+        "p50_docs_per_ticker": _int(r["p50_docs"] or 0),
+        "p75_docs_per_ticker": _int(r["p75_docs"] or 0),
     }
 
 
@@ -128,9 +141,9 @@ def _totals() -> dict[str, int]:
     )
     r = rows[0] if rows else {"documents": 0, "chunks": 0, "tickers": 0}
     return {
-        "documents": int(r["documents"] or 0),
-        "chunks": int(r["chunks"] or 0),
-        "tickers": int(r["tickers"] or 0),
+        "documents": _int(r["documents"] or 0),
+        "chunks": _int(r["chunks"] or 0),
+        "tickers": _int(r["tickers"] or 0),
     }
 
 
@@ -159,10 +172,10 @@ def _by_date_source() -> list[dict[str, Any]]:
     for r in rows:
         d = r["ingestion_date"]
         out.append({
-            "date": d.isoformat() if hasattr(d, "isoformat") else str(d),
+            "date": cast("date", d).isoformat() if hasattr(d, "isoformat") else str(d),
             "doc_type": r["doc_type"],
-            "documents": int(r["documents"] or 0),
-            "chunks": int(r["chunks"] or 0),
+            "documents": _int(r["documents"] or 0),
+            "chunks": _int(r["chunks"] or 0),
         })
     return out
 
@@ -176,7 +189,9 @@ def _ingestion() -> dict[str, Any]:
         ORDER BY doc_type
         """
     )
-    by_source_last_ts = {r["doc_type"]: r["last_ts"].isoformat() for r in rows if r["last_ts"]}
+    by_source_last_ts = {
+        cast(str, r["doc_type"]): cast("datetime", r["last_ts"]).isoformat() for r in rows if r["last_ts"]
+    }
     overall = max(by_source_last_ts.values(), default=None)
     return {
         "last_run_ts": overall,
@@ -201,7 +216,7 @@ def build_manifest() -> dict[str, Any]:
     }
 
 
-def main():
+def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     parser = argparse.ArgumentParser(description="Emit RAG corpus manifest")

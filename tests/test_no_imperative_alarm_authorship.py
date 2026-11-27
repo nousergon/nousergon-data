@@ -20,6 +20,22 @@ alarm-only setup scripts are reduced to pointer stubs (one,
 topic/subscription provisioning — that is not alarm authorship and is not
 migrating), and the four Lambda deploy.sh files' `put-metric-alarm` calls are
 removed or turned into no-op branches.
+
+Detection is the shared ``nousergon_lib.alarm_authorship`` detector
+(alpha-engine-config-I14032), which tokenises Python, shell and the
+executable fields of YAML, so it finds a continued or option-prefixed
+``aws cloudwatch put-metric-alarm`` and an f-string subprocess command, and
+ignores comments, docstrings and here-document bodies. The file walk, the
+``tests`` exclusion and GRANDFATHERED stay here.
+
+The detector only proves the forms it can resolve statically. This repo's
+commonest AWS call shape is ``run aws ...`` through a local dry-run wrapper
+(``run()`` in several infrastructure scripts), which the detector does not
+see through, and neither does it follow ``timeout``, ``bash -c``, a
+``$AWS`` command variable or a bound ``cw.put_metric_alarm`` reference. So
+the guard's previous mention check is kept as a fail-closed backstop: a line
+naming the call that the detector did not report as a call is still a
+finding. Replacing it outright would have let those forms through.
 """
 
 from __future__ import annotations
@@ -30,6 +46,7 @@ import tokenize
 from pathlib import Path
 
 import pytest
+from nousergon_lib.alarm_authorship import SourceLanguage, find_imperative_alarm_calls
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -42,7 +59,16 @@ GRANDFATHERED: frozenset[str] = frozenset()
 
 SHELL_CREATE = re.compile(r"\bput-metric-alarm\b")
 
-SCANNED_SUFFIXES = {".sh", ".py", ".yml", ".yaml", ".bash"}
+#: Suffix -> the language the shared detector parses the file as.
+LANGUAGE_BY_SUFFIX: dict[str, SourceLanguage] = {
+    ".sh": "shell",
+    ".bash": "shell",
+    ".py": "python",
+    ".yml": "yaml",
+    ".yaml": "yaml",
+}
+
+SCANNED_SUFFIXES = set(LANGUAGE_BY_SUFFIX)
 
 #: Same reasoning as nous-ergon-ops's guard: `tests` is skipped because this
 #: file and its siblings talk ABOUT put-metric-alarm in prose/fixtures, never
@@ -51,7 +77,7 @@ SKIP_DIRS = {".git", "__pycache__", ".pytest_cache", "node_modules", "tests"}
 
 
 def _python_hits(text: str, verb: str, method: str) -> list[tuple[int, str]]:
-    """Alarm calls in Python source, distinguished from Python PROSE.
+    """Backstop: Python lines naming the call outside docstrings and comments.
 
     Tokenized rather than regex'd over raw text — a regex over raw text
     reports docstrings and assertion messages as findings, which is how the
@@ -82,11 +108,30 @@ def _shell_hits(text: str) -> list[tuple[int, str]]:
     ]
 
 
-def _hits(path: Path) -> list[tuple[int, str]]:
-    text = path.read_text(encoding="utf-8")
+def _mentions(path: Path, text: str) -> list[tuple[int, str]]:
+    """The fail-closed backstop: every non-prose line naming the call."""
     if path.suffix == ".py":
         return _python_hits(text, "put-metric-alarm", "put_metric_alarm")
     return _shell_hits(text)
+
+
+def _hits(path: Path) -> list[tuple[int, str]]:
+    """Calls the shared detector proves, then mentions it could not classify.
+
+    A mention on a line the detector reported is the same finding and is not
+    repeated; one it did not report stays a finding, so this guard reports at
+    least every line its pre-I14032 detector did.
+    """
+    text = path.read_text(encoding="utf-8")
+    calls = find_imperative_alarm_calls(text, LANGUAGE_BY_SUFFIX[path.suffix])
+    hits = [(call.line, f"col {call.column}: {call.text}") for call in calls]
+    reported = {call.line for call in calls}
+    hits += [
+        (n, f"unclassified mention (fail-closed): {line}")
+        for n, line in _mentions(path, text)
+        if n not in reported
+    ]
+    return sorted(hits)
 
 
 def _scanned_files() -> list[Path]:
@@ -179,3 +224,50 @@ class TestTheGuardCanActuallyFail:
             encoding="utf-8",
         )
         assert _hits(fixture) == []
+
+    def test_the_shared_detector_classifies_a_boto3_call(self, tmp_path):
+        fixture = tmp_path / "offender.py"
+        fixture.write_text(
+            'import boto3\n'
+            'boto3.client("cloudwatch").put_metric_alarm(AlarmName="x")\n',
+            encoding="utf-8",
+        )
+        assert _hits(fixture) == [
+            (2, 'col 1: boto3.client("cloudwatch").put_metric_alarm(AlarmName="x")')
+        ]
+
+    def test_an_fstring_subprocess_command_is_found(self, tmp_path):
+        """Python 3.12 tokenises an f-string into FSTRING_* tokens, which the
+        backstop's STRING check never saw; the shared detector does."""
+        fixture = tmp_path / "offender.py"
+        fixture.write_text(
+            "import subprocess\n"
+            'subprocess.run(f"aws cloudwatch put-metric-alarm --alarm-name {name}", shell=True)\n',
+            encoding="utf-8",
+        )
+        assert [n for n, _ in _hits(fixture)] == [2]
+
+    def test_a_call_through_this_repos_run_wrapper_is_found(self, tmp_path):
+        """`run aws ...` is how this repo's scripts call AWS; the shared
+        detector does not see through the wrapper, the backstop does."""
+        fixture = tmp_path / "offender.sh"
+        fixture.write_text(
+            "#!/usr/bin/env bash\n"
+            'run() { if $DRY_RUN; then echo "DRY: $*"; else "$@"; fi; }\n'
+            'run aws cloudwatch put-metric-alarm --alarm-name "x"\n',
+            encoding="utf-8",
+        )
+        assert [n for n, _ in _hits(fixture)] == [3]
+
+    def test_a_yaml_run_step_is_found_and_its_comment_is_not(self, tmp_path):
+        fixture = tmp_path / "workflow.yml"
+        fixture.write_text(
+            "jobs:\n"
+            "  x:\n"
+            "    steps:\n"
+            "      - run: |\n"
+            "          # aws cloudwatch put-metric-alarm  <- a comment\n"
+            "          aws cloudwatch put-metric-alarm --alarm-name x\n",
+            encoding="utf-8",
+        )
+        assert [n for n, _ in _hits(fixture)] == [6]

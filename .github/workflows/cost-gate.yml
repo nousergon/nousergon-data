@@ -3,7 +3,7 @@ name: cost-gate
 # alpha-engine-config-I11228 deliverable 2 — pre-merge cost gate. BLOCKING.
 #
 # Runs `nousergon-cost-gate` (nousergon_lib.cost_gate, nousergon-lib
-# v0.124.174) over the PR's diff: a change that adds a billable capability,
+# v0.124.226) over the PR's diff: a change that adds a billable capability,
 # an always-on resource of an unmapped type, or a schedule with no bounded
 # retry policy fails here rather than after it has spent. Exit 1 = findings,
 # exit 2 = could not grade; both fail the job, because "the gate could not
@@ -30,14 +30,20 @@ name: cost-gate
 # nousergon-data PR2161 declares. Re-measured at v0.124.174: 0 findings on
 # each of the last 40 first-parent commits on main.
 #
+# Bumped to v0.124.226 on 2026-11-22 (alpha-engine-config-I14032): the
+# requirements.txt pin moved to v0.124.226 for nousergon_lib.alarm_authorship,
+# which put v0.124.174 52 patch releases behind root, past the lag bound below.
+# Re-measured at v0.124.226: 0 findings on each of the last 40 first-parent
+# commits on main (b6526347 back to a0f3dbfa).
+#
 # `--repo-visibility public`: this repo's scheduled workflows run on free,
 # unlimited GitHub-hosted Actions minutes (scm-platform-policy rule 2) and
 # must not be graded as spend, or the gate is pure noise on every PR that
 # touches a cron.
 #
 # The gate is installed from nousergon-lib in ITS OWN step, pinned to the
-# v0.124.174 tag with --no-deps, deliberately isolated from this repo's
-# requirements.txt pin (v0.124.175, held in cross-repo lockstep by
+# v0.124.226 tag with --no-deps, deliberately isolated from this repo's
+# requirements.txt pin (equal to it as of 2026-11-22, held in cross-repo lockstep by
 # tests/test_lib_pin_lockstep.py and per-Lambda CI guards) — bumping that
 # pin is a separate, guarded change and not part of this PR.
 # The isolation is not unbounded: test_lib_pin_lockstep.py holds this pin to a
@@ -113,10 +119,10 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install cost gate (nousergon-lib v0.124.174, isolated from repo requirements.txt pin)
+      - name: Install cost gate (nousergon-lib v0.124.226, isolated from repo requirements.txt pin)
         run: |
           set -euo pipefail
-          pip install --quiet --no-deps "git+https://github.com/nousergon/nousergon-lib@v0.124.174"
+          pip install --quiet --no-deps "git+https://github.com/nousergon/nousergon-lib@v0.124.226"
           pip install --quiet pyyaml
 
       - name: Run cost gate
