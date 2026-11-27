@@ -774,7 +774,7 @@ def collect(
     _max_workers = int(os.environ.get("ALT_DATA_MAX_WORKERS", "20"))
     _agg_lock = threading.Lock()
 
-    with ThreadPoolExecutor(max_workers=_max_workers) as executor:
+    with quiet_yfinance(), ThreadPoolExecutor(max_workers=_max_workers) as executor:
         futures = {
             executor.submit(
                 _process_one_ticker,

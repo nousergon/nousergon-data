@@ -10256,14 +10256,6 @@
             {
                 "code": "reportUnknownMemberType",
                 "range": {
-                    "startColumn": 10,
-                    "endColumn": 21,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportUnknownMemberType",
-                "range": {
                     "startColumn": 21,
                     "endColumn": 49,
                     "lineCount": 1
