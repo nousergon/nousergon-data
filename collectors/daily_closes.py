@@ -207,6 +207,18 @@ def _fred_get_with_retry(params: dict) -> requests.Response:
 # every existing caller of ``_FRED_INDEX_MAP`` in this module is unaffected.
 from collectors.fred_history import FRED_HISTORY_MAP as _FRED_INDEX_MAP
 
+# Only the caret-prefixed indices belong to daily_closes. The remaining map
+# entries are FRED-only macro series appended through their separate path.
+_DAILY_FRED_INDEX_MAP = {
+    ticker: _FRED_INDEX_MAP[ticker]
+    for ticker in ("VIX", "VIX3M", "TNX", "IRX")
+}
+
+
+def _is_daily_fred_ticker(ticker: str) -> bool:
+    """Whether a universe ticker is one of daily_closes' FRED indices."""
+    return ticker.lstrip("^") in _DAILY_FRED_INDEX_MAP
+
 
 def _coalesce_by_source_priority(
     new_records: list[dict],
@@ -493,7 +505,7 @@ def _polygon_date_fully_canonical(
     """
     if "source" not in existing_df.columns:
         return False
-    stock_tickers = [t for t in tickers if t.lstrip("^") not in _FRED_INDEX_MAP]
+    stock_tickers = [t for t in tickers if not _is_daily_fred_ticker(t)]
     if not stock_tickers:
         return True
     index = set(str(t) for t in existing_df.index)
@@ -1304,7 +1316,7 @@ def collect(
     captured_tickers = {r["ticker"] for r in records}
     fred_missing = [
         t for t in tickers
-        if t.lstrip("^") not in captured_tickers and t.lstrip("^") in _FRED_INDEX_MAP
+        if t.lstrip("^") not in captured_tickers and _is_daily_fred_ticker(t)
     ]
     fred_count = 0
     if fred_missing:
@@ -1348,7 +1360,7 @@ def collect(
         if source == "polygon_only":
             # Equity universe stays refused; macro FRED-index tickers get the
             # loud yfinance backstop.
-            macro_missing = [t for t in missing if t.lstrip("^") in _FRED_INDEX_MAP]
+            macro_missing = [t for t in missing if _is_daily_fred_ticker(t)]
             if macro_missing:
                 logger.warning(
                     "polygon_only: FRED did not supply macro ticker(s) %s for %s — "
@@ -1414,9 +1426,9 @@ def collect(
         )
 
     # ── Coverage gates — per-mode hard-fails ─────────────────────────────────
-    n_stock_tickers = sum(1 for t in tickers if t.lstrip("^") not in _FRED_INDEX_MAP)
+    n_stock_tickers = sum(1 for t in tickers if not _is_daily_fred_ticker(t))
     n_stock_records = sum(
-        1 for r in records if r["ticker"] not in _FRED_INDEX_MAP
+        1 for r in records if r["ticker"] not in _DAILY_FRED_INDEX_MAP
     )
     stock_coverage = (n_stock_records / n_stock_tickers) if n_stock_tickers else 1.0
 
@@ -1804,7 +1816,7 @@ def _collect_window(
     # resolves) and hand the cache to every per-date call. Only prefetch when
     # the universe actually contains FRED-index tickers — keeps non-macro
     # window callers (and tests) on a zero-FRED-I/O path.
-    fred_tickers = [t for t in tickers if t.lstrip("^") in _FRED_INDEX_MAP]
+    fred_tickers = [t for t in tickers if _is_daily_fred_ticker(t)]
     fred_window_cache: dict[str, list[tuple[str, float]]] | None = None
     if fred_tickers:
         _oldest = window_dates[-1]  # _previous_business_days returns newest-first
@@ -2140,7 +2152,7 @@ def _fetch_polygon_closes(
     captured = {r["ticker"] for r in records}
     missing_stocks = [
         t for t in tickers
-        if t.lstrip("^") not in captured and t.lstrip("^") not in _FRED_INDEX_MAP
+        if t.lstrip("^") not in captured and not _is_daily_fred_ticker(t)
     ]
     if missing_stocks:
         recovered = _fetch_polygon_closes_per_ticker(missing_stocks, run_date, records)
@@ -2465,7 +2477,7 @@ def _log_close_discrepancies(
         if prior is None or pd.isna(new_close) or prior == 0:
             continue
         n_compared += 1
-        is_fred_index = str(ticker).lstrip("^") in _FRED_INDEX_MAP
+        is_fred_index = str(ticker).lstrip("^") in _DAILY_FRED_INDEX_MAP
         pct_diff = abs(float(new_close) - prior) / prior
         # (action, evidence verdict) for a >5% equity jump the registry can
         # attribute to a registered split; (None, None) otherwise.
@@ -2689,7 +2701,7 @@ def _fetch_fred_window(
     cache: dict[str, list[tuple[str, float]]] = {}
     for ticker in tickers:
         store_ticker = ticker.lstrip("^")
-        series_id = _FRED_INDEX_MAP.get(store_ticker)
+        series_id = _DAILY_FRED_INDEX_MAP.get(store_ticker)
         if not series_id:
             continue
         try:
@@ -2731,7 +2743,7 @@ def _fetch_fred_closes(
     """Fetch FRED close on-or-before ``date_str`` for index tickers.
 
     Serves the index/macro symbols not on polygon free tier
-    (VIX, VIX3M, TNX, IRX, TWO, HYOAS, BAA10Y).
+    (VIX, VIX3M, TNX, IRX).
 
     The query is bounded by ``observation_end=date_str`` so per-date calls
     from the windowed-reconciliation loop return that date's actual FRED
@@ -2787,7 +2799,7 @@ def _fetch_fred_closes(
     count = 0
     for ticker in tickers:
         store_ticker = ticker.lstrip("^")
-        series_id = _FRED_INDEX_MAP.get(store_ticker)
+        series_id = _DAILY_FRED_INDEX_MAP.get(store_ticker)
         if not series_id:
             continue
         try:
