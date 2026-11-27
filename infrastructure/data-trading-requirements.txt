@@ -56,4 +56,4 @@ jsonschema>=4.26.0
 # migration framework key on (three tests red on every head). A major
 # version of the feature store is adopted on purpose, measured, not by drift.
 arcticdb>=6.28.3,<7
-nousergon-lib[arcticdb,flow-doctor,rag,contracts,github-app,gates] @ git+https://github.com/nousergon/nousergon-lib@v0.124.189
+nousergon-lib[arcticdb,flow-doctor,rag,contracts,github-app,gates] @ git+https://github.com/nousergon/nousergon-lib@v0.124.229

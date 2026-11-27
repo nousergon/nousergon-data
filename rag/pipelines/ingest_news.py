@@ -204,9 +204,9 @@ def ingest_articles(
         from nousergon_lib.rag import document_exists
         document_exists_fn = document_exists
     if ingest_document_fn is None:
-        # Upstream annotates chunks with a bare dict.
-        from nousergon_lib.rag import ingest_document  # pyright: ignore[reportUnknownVariableType]
-        # The library's public annotation uses an unparameterized dict for chunks.
+        from nousergon_lib.rag import ingest_document
+        # The library is typed now (chunks: Sequence[Mapping[str, object]]); the
+        # cast narrows it to this module's keyword-only protocol.
         ingest_document_fn = cast(_IngestDocumentFn, ingest_document)
     ticker_to_sector = ticker_to_sector or {}
 
