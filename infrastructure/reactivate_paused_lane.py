@@ -68,12 +68,13 @@ import argparse
 import json
 import logging
 import sys
-from typing import Any
+from typing import Protocol, TypedDict, cast
 
-import boto3
-from botocore.exceptions import ClientError
+import boto3  # pyright: ignore[reportMissingTypeStubs] -- boto3 does not ship type information.
+from botocore.exceptions import ClientError  # pyright: ignore[reportMissingTypeStubs] -- botocore does not ship type information.
 
-from dlq_redrive import DlqRedriveError, redrive
+import dlq_redrive
+from dlq_redrive import DlqRedriveError
 
 logger = logging.getLogger("reactivate_paused_lane")
 
@@ -87,13 +88,47 @@ DEFAULT_DLQ_NAME = "nousergon-overseer-intake-dlq"
 DEFAULT_DEST_NAME = "nousergon-overseer-intake"
 
 
+class _SchedulerClient(Protocol):
+    def get_schedule(self, *, Name: str) -> dict[str, object]: ...  # noqa: N803
+
+    def update_schedule(self, **kwargs: object) -> object: ...
+
+
+class _EventsClient(Protocol):
+    def enable_rule(self, *, Name: str) -> object: ...  # noqa: N803
+
+
+class _Arguments(Protocol):
+    schedules: list[str]
+    events_rules: list[str]
+    dlq_name: str
+    dest_name: str
+    region: str
+
+
+class ReactivationResult(TypedDict):
+    redrive: dict[str, object]
+    enabled: list[str]
+
+
+class _Redrive(Protocol):
+    def __call__(
+        self, sqs: object, *, dlq_name: str, dest_name: str
+    ) -> dict[str, object]: ...
+
+
+redrive = cast("_Redrive", getattr(dlq_redrive, "redrive"))
+
+
 class ReactivationError(RuntimeError):
     """Raised when the DLQ redrive or a trigger re-enable fails
     unexpectedly. Fail-loud by default — a swallowed error here means a
     lane looks reactivated when it is not."""
 
 
-def _enable_scheduler_schedule(scheduler_client, name: str, region: str) -> None:
+def _enable_scheduler_schedule(
+    scheduler_client: _SchedulerClient, name: str, region: str
+) -> None:
     """Round-trips the schedule: GetSchedule -> flip State=ENABLED ->
     UpdateSchedule with every other field carried forward. Mirrors
     automation_pause.py::_disable's documented reasoning: Scheduler has no
@@ -113,7 +148,7 @@ def _enable_scheduler_schedule(scheduler_client, name: str, region: str) -> None
         raise ReactivationError(f"scheduler update_schedule({name}) failed: {exc}") from exc
 
 
-def _enable_events_rule(events_client, name: str) -> None:
+def _enable_events_rule(events_client: _EventsClient, name: str) -> None:
     try:
         events_client.enable_rule(Name=name)
     except ClientError as exc:
@@ -121,16 +156,16 @@ def _enable_events_rule(events_client, name: str) -> None:
 
 
 def reactivate(
-    sqs_client,
-    scheduler_client,
-    events_client,
+    sqs_client: object,
+    scheduler_client: _SchedulerClient,
+    events_client: _EventsClient,
     *,
     schedules: tuple[str, ...] = (),
     events_rules: tuple[str, ...] = (),
     dlq_name: str = DEFAULT_DLQ_NAME,
     dest_name: str = DEFAULT_DEST_NAME,
     region: str = "us-east-1",
-) -> dict[str, Any]:
+) -> ReactivationResult:
     """Redrive first, then re-enable every named trigger. Returns a summary
     dict. Raises ReactivationError only for the redrive step's own
     DlqRedriveError (re-wrapped) or if the caller passed no triggers at
@@ -185,10 +220,20 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    args = _build_parser().parse_args(argv)
-    sqs = boto3.client("sqs", region_name=args.region)
-    scheduler = boto3.client("scheduler", region_name=args.region)
-    events = boto3.client("events", region_name=args.region)
+    args = cast("_Arguments", _build_parser().parse_args(argv))
+    # boto3's dynamically generated clients have no library-provided types.
+    sqs = cast(
+        "object",
+        boto3.client("sqs", region_name=args.region),  # pyright: ignore[reportUnknownMemberType] -- dynamically generated client
+    )
+    scheduler = cast(
+        "_SchedulerClient",
+        boto3.client("scheduler", region_name=args.region),  # pyright: ignore[reportUnknownMemberType] -- dynamically generated client
+    )
+    events = cast(
+        "_EventsClient",
+        boto3.client("events", region_name=args.region),  # pyright: ignore[reportUnknownMemberType] -- dynamically generated client
+    )
     try:
         result = reactivate(
             sqs, scheduler, events,
