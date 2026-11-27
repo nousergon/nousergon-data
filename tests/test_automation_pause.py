@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: ANN001, ANN002, ANN003, ANN201, ANN202
 """The scheduled-automation pause must stay a record, not a comment.
 
 Brian ruling 2026-08-07: every scheduled AWS trigger disabled except the weekly
@@ -954,7 +955,8 @@ def classified_world(module, monkeypatch, request):
         # fix is to stub the enumeration rather than each view of it.
         monkeypatch.setattr(
             module, "_live_alarm_actions",
-            lambda: {n: {"enabled": e, "breaching": True} for n, e in live.items()})
+            lambda: {n: {"enabled": e, "breaching": True, "paging": False}
+                     for n, e in live.items()})
     return live
 
 
@@ -1167,8 +1169,34 @@ def test_describe_alarms_pagination_is_followed(module, monkeypatch):
         return 0, body, ""
 
     monkeypatch.setattr(module, "_aws", fake_aws)
-    assert module._live_breaching_alarms() == {"a1": True, "a2": False}
+    assert module._live_completeness_alarms() == {"a1": True, "a2": False}
     assert seen == [None, "tok"], "the second page was never requested"
+
+
+@pytest.mark.parametrize("action_field", ["aa", "oa"])
+@pytest.mark.real_alarm_scan
+def test_not_breaching_alarm_routed_to_backstop_is_in_completeness_population(
+        module, monkeypatch, action_field):
+    """AlarmActions and OKActions can each page, independently of missing data."""
+    row = {"n": "transition-pager", "e": True, "b": "notBreaching",
+           "aa": [], "oa": []}
+    row[action_field] = [
+        "arn:aws:sns:us-east-1:711398986525:alpha-engine-alarm-backstop"
+    ]
+    monkeypatch.setattr(
+        module, "_aws", lambda args: (0, json.dumps({"a": [row], "t": None}), ""))
+    assert module._live_completeness_alarms() == {"transition-pager": True}
+
+
+def test_undeclared_not_breaching_backstop_alarm_is_a_finding(module, monkeypatch):
+    world = {"transition-pager": {
+        "enabled": True, "breaching": False, "paging": True,
+    }}
+    monkeypatch.setattr(module, "_live_alarm_actions", lambda: world)
+    findings = module.alarm_coverage_findings()
+    assert ("transition-pager", "alarm-undeclared") in {
+        (finding["trigger"], finding["kind"]) for finding in findings
+    }
 
 
 def test_enforce_can_both_disable_and_enable_alarm_actions(module, monkeypatch):
