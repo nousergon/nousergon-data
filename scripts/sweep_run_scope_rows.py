@@ -63,7 +63,7 @@ import re
 import sys
 import types
 from datetime import datetime, timezone
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable, Protocol, cast
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 LAMBDA_DIR = _REPO_ROOT / "infrastructure" / "lambdas" / "weekly-run-scope"
@@ -71,6 +71,30 @@ LAMBDA_DIR = _REPO_ROOT / "infrastructure" / "lambdas" / "weekly-run-scope"
 # A raw JSON object: an S3 artifact body, a Step Functions history event or a
 # re-derived scope row. Its values are whatever JSON held.
 _Json = dict[str, Any]  # pyright: ignore[reportExplicitAny] — raw JSON object
+
+
+class _Paginator(Protocol):
+    def paginate(self, **kwargs: object) -> Iterable[_Json]: ...
+
+
+class _Client(Protocol):
+    def get_paginator(self, name: str) -> _Paginator: ...
+    def describe_execution(self, **kwargs: object) -> _Json: ...
+    def describe_state_machine_for_execution(self, **kwargs: object) -> _Json: ...
+    def get_object(self, **kwargs: object) -> _Json: ...
+
+
+def _json_object(value: object) -> _Json:
+    """Narrow a decoded or SDK-provided value to the JSON object we expect."""
+    return cast(_Json, value) if isinstance(value, dict) else {}
+
+
+def _json_objects(value: object) -> list[_Json]:
+    """Narrow a decoded or SDK-provided value to a list of JSON objects."""
+    if not isinstance(value, list):
+        return []
+    items = cast(list[object], value)
+    return [cast(_Json, item) for item in items if isinstance(item, dict)]
 
 
 def _load_run_scope() -> types.ModuleType:
@@ -85,6 +109,8 @@ def _load_run_scope() -> types.ModuleType:
     if name in sys.modules:
         return sys.modules[name]
     spec = importlib.util.spec_from_file_location(name, LAMBDA_DIR / "run_scope.py")
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {LAMBDA_DIR / 'run_scope.py'}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     spec.loader.exec_module(module)
@@ -143,20 +169,22 @@ def row_authors(stored: _Json) -> list[str]:
     fallback = stored.get("execution_arn") or ""
     authors: list[str] = []
 
-    def _add(arn: Any) -> None:
+    def _add(arn: object) -> None:
         if isinstance(arn, str) and arn and arn not in authors:
             authors.append(arn)
 
-    for _, row in sorted((stored.get("stages") or {}).items()):
-        _add((row.get("recorded_by_execution_arn") if isinstance(row, dict) else None) or fallback)
+    for row in _json_object(stored.get("stages")).values():
+        row_object = _json_object(row)
+        _add(row_object.get("recorded_by_execution_arn") or fallback)
     _add(fallback)
-    for arn in stored.get("contributing_executions") or []:
+    contributors = stored.get("contributing_executions")
+    for arn in cast(list[object], contributors) if isinstance(contributors, list) else []:
         _add(arn)
     return authors
 
 
 def _history(
-    states: Any,  # pyright: ignore[reportExplicitAny] — untyped boto3 client
+    states: _Client,
     execution_arn: str,
 ) -> list[_Json]:
     events: list[_Json] = []
@@ -164,12 +192,12 @@ def _history(
     for page in paginator.paginate(
         executionArn=execution_arn, includeExecutionData=False, reverseOrder=False,
     ):
-        events.extend(page.get("events", []))
+        events.extend(_json_objects(page.get("events")))
     return events
 
 
 def rederive(
-    states: Any,  # pyright: ignore[reportExplicitAny] — untyped boto3 client
+    states: _Client,
     execution_arn: str,
     run_date: str,
     recorded_at: str,
@@ -182,9 +210,10 @@ def rederive(
     """
     try:
         described = states.describe_execution(executionArn=execution_arn)
-        definition = json.loads(
-            states.describe_state_machine_for_execution(executionArn=execution_arn)["definition"]
-        )
+        definition_text = states.describe_state_machine_for_execution(
+            executionArn=execution_arn
+        )["definition"]
+        definition = _json_object(json.loads(definition_text)) if isinstance(definition_text, str) else {}
         history = _history(states, execution_arn)
     except Exception as exc:  # noqa: BLE001
         return None, f"could not read the execution: {type(exc).__name__}: {exc}"
@@ -192,12 +221,13 @@ def rederive(
     if cut is None:
         return None, f"never entered {rs.SCOPE_STATE}, so it never wrote a row"
     try:
-        execution_input = json.loads(described.get("input") or "{}")
+        raw_input = json.loads(described.get("input") or "{}")
+        execution_input = _json_object(raw_input)
     except ValueError:
         execution_input = {}
     flags = {
         key: value for key, value in (execution_input or {}).items()
-        if isinstance(key, str) and key.startswith("skip_")
+        if key.startswith("skip_")
     }
     scope = rs.build_run_scope(
         definition,
@@ -226,8 +256,8 @@ def cycle_target(scopes: Iterable[_Json]) -> _Json | None:
 # ---------------------------------------------------------------------------
 
 
-def _summary(row: Any) -> _Json:  # pyright: ignore[reportExplicitAny] — a stored row may be any JSON value
-    row = row if isinstance(row, dict) else {}
+def _summary(row: object) -> _Json:
+    row = _json_object(row)
     return {
         "disposition": row.get("disposition"),
         "entry_state": row.get("entry_state"),
@@ -240,21 +270,23 @@ def _summary(row: Any) -> _Json:  # pyright: ignore[reportExplicitAny] — a sto
 def classify(stored: _Json, target: _Json | None, stages: Iterable[str] | None = None) -> list[_Json]:
     """One finding per stored row (or per ``stages``), held vs corrected."""
     wanted = set(stages) if stages else None
-    target_rows: _Json = (target or {}).get("stages") or {}
-    after_scope: _Json = (target or {}).get("after_scope") or {}
+    target_rows = _json_object((target or {}).get("stages"))
+    after_scope = _json_object((target or {}).get("after_scope"))
     findings: list[_Json] = []
-    for name, held in sorted((stored.get("stages") or {}).items()):
+    for name, held_value in sorted(_json_object(stored.get("stages")).items()):
+        held = _json_object(held_value)
         if wanted is not None and name not in wanted:
             continue
         new = target_rows.get(name)
-        if not isinstance(new, dict):
+        new_row = cast(_Json, new) if isinstance(new, dict) else None
+        if new_row is None:
             kind = AFTER_SCOPE if name in after_scope else NOT_REDERIVABLE
-        elif rs.authority(new) > rs.authority(held):
+        elif rs.authority(new_row) > rs.authority(held):
             kind = UPGRADE
-        elif rs.authority(new) < rs.authority(held):
+        elif rs.authority(new_row) < rs.authority(held):
             kind = DOWNGRADE
-        elif (new.get("disposition"), new.get("entry_state")) != (
-            (held or {}).get("disposition"), (held or {}).get("entry_state")
+        elif (new_row.get("disposition"), new_row.get("entry_state")) != (
+            held.get("disposition"), held.get("entry_state")
         ):
             kind = RESTATED
         else:
@@ -263,7 +295,7 @@ def classify(stored: _Json, target: _Json | None, stages: Iterable[str] | None =
             "stage": name,
             "kind": kind,
             "stored": _summary(held),
-            "corrected": _summary(new) if isinstance(new, dict) else None,
+            "corrected": _summary(new_row) if new_row is not None else None,
         })
     return findings
 
@@ -277,20 +309,25 @@ def corrected_artifact(stored: _Json, target: _Json, findings: list[_Json], swep
     """
     incoming = copy.deepcopy(stored)
     incoming.pop("scope_merge", None)
-    incoming["stages"] = {}
+    incoming_stages: _Json = {}
+    incoming["stages"] = incoming_stages
     for finding in findings:
         if finding["kind"] != UPGRADE:
             continue
-        row: _Json = copy.deepcopy(target["stages"][finding["stage"]])
+        target_stages = _json_object(target["stages"])
+        stage = finding["stage"]
+        row = copy.deepcopy(_json_object(target_stages.get(stage)))
         row["corrected_by"] = {
             "sweep": SWEEP_ID,
             "swept_at": swept_at,
             "replaced": finding["stored"],
         }
-        incoming["stages"][finding["stage"]] = row
-    merged, ledger = rs.merge_run_scopes(copy.deepcopy(stored), incoming)
-    accepted = {entry["stage"] for entry in ledger["accepted"]}
-    missing = sorted(set(incoming["stages"]) - accepted)
+        incoming_stages[stage] = row
+    merged_value, ledger_value = rs.merge_run_scopes(copy.deepcopy(stored), incoming)
+    merged = _json_object(merged_value)
+    ledger = _json_object(ledger_value)
+    accepted = {entry["stage"] for entry in _json_objects(ledger["accepted"])}
+    missing = sorted(set(incoming_stages) - accepted)
     if missing or ledger["rejected"]:
         # Unreachable while UPGRADE means "strictly stronger"; checked anyway
         # so a change to the merge rule cannot turn this into a silent no-op.
@@ -300,7 +337,7 @@ def corrected_artifact(stored: _Json, target: _Json, findings: list[_Json], swep
     ledger["sweep"] = {
         "id": SWEEP_ID,
         "swept_at": swept_at,
-        "corrected": sorted(incoming["stages"]),
+        "corrected": sorted(incoming_stages),
     }
     ledger["previous_scope_merge"] = stored.get("scope_merge")
     merged["scope_merge"] = ledger
@@ -313,7 +350,7 @@ def corrected_artifact(stored: _Json, target: _Json, findings: list[_Json], swep
 
 
 def stored_keys(
-    s3: Any,  # pyright: ignore[reportExplicitAny] — untyped boto3 client
+    s3: _Client,
     bucket: str,
     run_dates: list[str] | None,
 ) -> list[str]:
@@ -321,26 +358,29 @@ def stored_keys(
         return [KEY_TEMPLATE.format(run_date=d) for d in sorted(set(run_dates))]
     keys: list[str] = []
     for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=PREFIX):
-        for obj in page.get("Contents", []) or []:
-            if _KEY_RE.match(obj["Key"]):
-                keys.append(obj["Key"])
+        for obj in _json_objects(page.get("Contents")):
+            key = obj.get("Key")
+            if isinstance(key, str) and _KEY_RE.match(key):
+                keys.append(key)
     return sorted(keys)
 
 
 def read_artifact(
-    s3: Any,  # pyright: ignore[reportExplicitAny] — untyped boto3 client
+    s3: _Client,
     bucket: str,
     key: str,
 ) -> tuple[_Json, str]:
     response = s3.get_object(Bucket=bucket, Key=key)
-    body = json.loads(response["Body"].read())
+    response_body = response["Body"]
+    body = json.loads(response_body.read())
     if not isinstance(body, dict):
         raise ValueError(f"s3://{bucket}/{key} is not a JSON object")
-    return body, response.get("ETag", "")
+    etag = response.get("ETag", "")
+    return cast(_Json, body), etag if isinstance(etag, str) else ""
 
 
 def write_artifact(
-    s3: Any,  # pyright: ignore[reportExplicitAny] — untyped boto3 client
+    s3: _Client,
     bucket: str,
     key: str,
     body: _Json,
@@ -351,7 +391,8 @@ def write_artifact(
     if not etag:
         raise SweepWriteConflict(f"no ETag was read for s3://{bucket}/{key}; refusing to write")
     try:
-        s3.put_object(
+        put_object = cast(Callable[..., object], getattr(s3, "put_object"))
+        put_object(
             Bucket=bucket,
             Key=key,
             Body=json.dumps(body, indent=2, sort_keys=True).encode("utf-8"),
@@ -359,7 +400,8 @@ def write_artifact(
             IfMatch=etag,
         )
     except Exception as exc:  # noqa: BLE001
-        code = ((getattr(exc, "response", None) or {}).get("Error") or {}).get("Code")
+        response = _json_object(getattr(exc, "response", None))
+        code = _json_object(response.get("Error")).get("Code")
         if code in ("PreconditionFailed", "412", "ConditionalRequestConflict"):
             raise SweepWriteConflict(
                 f"s3://{bucket}/{key} changed after it was read ({code}); nothing "
@@ -374,8 +416,8 @@ def write_artifact(
 
 
 def sweep_one(
-    s3: Any,  # pyright: ignore[reportExplicitAny] — untyped boto3 client
-    states: Any,  # pyright: ignore[reportExplicitAny] — untyped boto3 client
+    s3: _Client,
+    states: _Client,
     bucket: str,
     key: str,
     *,
@@ -384,7 +426,10 @@ def sweep_one(
     now: datetime | None = None,
 ) -> _Json:
     swept_at = (now or datetime.now(timezone.utc)).isoformat(timespec="seconds")
-    run_date = _KEY_RE.match(key).group(1)
+    match = _KEY_RE.match(key)
+    if match is None:
+        raise ValueError(f"not a run-scope artifact key: {key}")
+    run_date = match.group(1)
     stored, etag = read_artifact(s3, bucket, key)
     notes: dict[str, str] = {}
     scopes: list[_Json] = []
@@ -408,7 +453,7 @@ def sweep_one(
 def _render(result: _Json, verbose: bool) -> list[str]:
     lines = [f"== s3://{BUCKET}/{result['key']}"]
     for arn, note in result["authors"].items():
-        lines.append(f"   author {arn.rsplit(':', 1)[-1]}: {note}")
+        lines.append(f"   author {str(arn).rsplit(':', 1)[-1]}: {note}")
     for finding in result["findings"]:
         if finding["kind"] in (UNCHANGED, AFTER_SCOPE) and not verbose:
             continue
@@ -438,10 +483,10 @@ def _run_date(value: str) -> str:
 def main(
     argv: list[str] | None = None,
     *,
-    s3: Any = None,  # pyright: ignore[reportExplicitAny] — untyped boto3 client
-    states: Any = None,  # pyright: ignore[reportExplicitAny] — untyped boto3 client
+    s3: _Client | None = None,
+    states: _Client | None = None,
 ) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0])
     parser.add_argument("--bucket", default=BUCKET)
     parser.add_argument("--region", default="us-east-1")
     parser.add_argument("--run-date", action="append", dest="run_dates", type=_run_date,
@@ -455,10 +500,11 @@ def main(
     args = parser.parse_args(argv)
 
     if s3 is None or states is None:
-        import boto3
+        import boto3  # pyright: ignore[reportMissingTypeStubs] -- boto3 has no bundled typing
 
-        s3 = s3 or boto3.client("s3", region_name=args.region)
-        states = states or boto3.client("stepfunctions", region_name=args.region)
+        boto3_client = cast(Callable[..., object], boto3.client)
+        s3 = s3 or cast(_Client, boto3_client("s3", region_name=args.region))
+        states = states or cast(_Client, boto3_client("stepfunctions", region_name=args.region))
 
     results: list[_Json] = []
     status = 0
