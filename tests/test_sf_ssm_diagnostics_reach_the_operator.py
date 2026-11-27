@@ -58,12 +58,7 @@ _DEFS = {
 # WaitForRefreshExecutorDeploy is the same state carried by BOTH machines (each
 # boots the box, so each refreshes the checkout) — the uncovered code is the
 # same three pollers, now counted per machine they live in.
-_UNCOVERED_POLLERS = {
-    ("eod", "WaitForCaptureSnapshot"),
-    ("eod", "WaitForRefreshExecutorDeploy"),
-    ("eod_reconcile", "WaitForEOD"),
-    ("eod_reconcile", "WaitForRefreshExecutorDeploy"),
-}
+_UNCOVERED_POLLERS: set[tuple[str, str]] = set()
 
 # A field whose value plausibly carries what the script printed.
 _DIAGNOSTIC_FIELDS = ("StandardErrorContent", "StandardOutputContent", "detail")
@@ -160,3 +155,63 @@ def test_output_tails_never_enter_sf_state_via_a_resultselector() -> None:
             assert "StandardOutputContent" not in selector, (
                 f"{which}:{name} maps StandardOutputContent — same class."
             )
+
+
+_AFFECTED_EOD_POLLERS = {
+    ("eod", "WaitForCaptureSnapshot", "SnapshotStatusError", "snapshot_poll"),
+    (
+        "eod",
+        "WaitForRefreshExecutorDeploy",
+        "RefreshExecutorDeployStatusError",
+        "refresh_executor_deploy_poll",
+    ),
+    ("eod_reconcile", "WaitForEOD", "EODStatusError", "eod_poll"),
+    (
+        "eod_reconcile",
+        "WaitForRefreshExecutorDeploy",
+        "RefreshExecutorDeployStatusError",
+        "refresh_executor_deploy_poll",
+    ),
+}
+
+
+def test_eod_pollers_use_normalized_bounded_diagnostics_in_observe_mode() -> None:
+    """I8703: share the proven poller contract without changing outcomes yet."""
+    for which, poll_name, error_name, result_name in _AFFECTED_EOD_POLLERS:
+        states = _load(which)["States"]
+        poll = states[poll_name]
+        assert poll["Resource"] == "arn:aws:states:::lambda:invoke"
+        assert poll["Parameters"]["FunctionName"].endswith(
+            ":function:alpha-engine-ssm-liveness-poller"
+        )
+        payload = poll["Parameters"]["Payload"]
+        assert payload["instance_id.$"] == "$.trading_instance_id[0]"
+        assert payload["command_id.$"].endswith(".Command.CommandId")
+
+        selector = poll["ResultSelector"]
+        assert selector["detail.$"] == "$.Payload.detail"
+        assert selector["StandardErrorContent.$"] == "$.Payload.stderr_tail"
+        assert "StandardOutputContent.$" not in selector
+        assert "stdout_tail.$" not in selector
+
+        # The old Status-based Choice remains the decision-maker. The new
+        # verdict is visible but deliberately cannot alter an outcome until
+        # the declared five-cycle observation completes.
+        choice = states[poll["Next"]]
+        assert "verdict" not in json.dumps(choice)
+        error = states[error_name]["Parameters"]
+        assert error["detail.$"] == f"$.{result_name}.detail"
+
+
+def test_shared_poller_normalizes_absent_ssm_output_fields() -> None:
+    """The mapped tails and detail are unconditional even when SSM omits output."""
+    source = (
+        _REPO_ROOT
+        / "infrastructure"
+        / "lambdas"
+        / "ssm-liveness-poller"
+        / "index.py"
+    ).read_text()
+    assert 'inv.get("StandardErrorContent") or ""' in source
+    assert 'inv.get("StandardOutputContent") or ""' in source
+    assert '"detail": ""' in source

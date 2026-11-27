@@ -534,30 +534,31 @@
     },
     "WaitForCaptureSnapshot": {
       "Type": "Task",
-      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Comment": "alpha-engine-config-I8703: route this poll through the shared liveness poller so absent SSM output fields are normalised and bounded stderr/stdout tails reach failure notifications in detail. Liveness verdict is observe-only: the existing Status choices retain every terminal outcome. Review verdict and ping_status for 5 scheduled EOD cycles before a separate promotion change may branch on liveness.",
+      "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
-        "CommandId.$": "$.snapshot_result.Command.CommandId",
-        "InstanceId.$": "$.trading_instance_id[0]"
+        "FunctionName": "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-ssm-liveness-poller",
+        "Payload": {
+          "instance_id.$": "$.trading_instance_id[0]",
+          "command_id.$": "$.snapshot_result.Command.CommandId",
+          "max_attempts": 2,
+          "max_ping_misses": 2,
+          "step": "snapshot"
+        }
       },
-      "TimeoutSeconds": 60,
+      "TimeoutSeconds": 20,
       "Retry": [
         {
           "ErrorEquals": [
-            "Ssm.InvocationDoesNotExistException",
-            "Ssm.InvocationDoesNotExist"
-          ],
-          "MaxAttempts": 10,
-          "IntervalSeconds": 10,
-          "BackoffRate": 1.5
-        },
-        {
-          "ErrorEquals": [
-            "Ssm.SdkClientException",
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException",
             "States.Timeout"
           ],
-          "MaxAttempts": 2,
+          "MaxAttempts": 3,
           "IntervalSeconds": 5,
-          "BackoffRate": 1.5
+          "BackoffRate": 2.0
         }
       ],
       "Catch": [
@@ -571,11 +572,15 @@
         }
       ],
       "ResultSelector": {
-        "Status.$": "$.Status",
-        "ResponseCode.$": "$.ResponseCode",
-        "StatusDetails.$": "$.StatusDetails",
-        "CommandId.$": "$.CommandId",
-        "InstanceId.$": "$.InstanceId"
+        "verdict.$": "$.Payload.verdict",
+        "attempts.$": "$.Payload.attempts",
+        "ping_misses.$": "$.Payload.ping_misses",
+        "Status.$": "$.Payload.status",
+        "ResponseCode.$": "$.Payload.response_code",
+        "StatusDetails.$": "$.Payload.status_details",
+        "StandardErrorContent.$": "$.Payload.stderr_tail",
+        "ping_status.$": "$.Payload.ping_status",
+        "detail.$": "$.Payload.detail"
       },
       "ResultPath": "$.snapshot_poll",
       "Next": "CheckSnapshotStatus"
@@ -615,8 +620,9 @@
         "status.$": "$.snapshot_poll.Status",
         "status_details.$": "$.snapshot_poll.StatusDetails",
         "response_code.$": "$.snapshot_poll.ResponseCode",
-        "command_id.$": "$.snapshot_poll.CommandId",
-        "instance_id.$": "$.snapshot_poll.InstanceId"
+        "command_id.$": "$.snapshot_result.Command.CommandId",
+        "instance_id.$": "$.trading_instance_id[0]",
+        "detail.$": "$.snapshot_poll.detail"
       },
       "ResultPath": "$.error",
       "Next": "CheckCaptureSnapshotRetryBudget"
@@ -786,30 +792,31 @@
     },
     "WaitForRefreshExecutorDeploy": {
       "Type": "Task",
-      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Comment": "alpha-engine-config-I8703: route this poll through the shared liveness poller so absent SSM output fields are normalised and bounded stderr/stdout tails reach failure notifications in detail. Liveness verdict is observe-only: the existing Status choices retain every terminal outcome. Review verdict and ping_status for 5 scheduled EOD cycles before a separate promotion change may branch on liveness.",
+      "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
-        "CommandId.$": "$.refresh_executor_deploy_result.Command.CommandId",
-        "InstanceId.$": "$.trading_instance_id[0]"
+        "FunctionName": "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-ssm-liveness-poller",
+        "Payload": {
+          "instance_id.$": "$.trading_instance_id[0]",
+          "command_id.$": "$.refresh_executor_deploy_result.Command.CommandId",
+          "max_attempts": 2,
+          "max_ping_misses": 2,
+          "step": "refresh-executor-deploy"
+        }
       },
-      "TimeoutSeconds": 60,
+      "TimeoutSeconds": 20,
       "Retry": [
         {
           "ErrorEquals": [
-            "Ssm.InvocationDoesNotExistException",
-            "Ssm.InvocationDoesNotExist"
-          ],
-          "MaxAttempts": 10,
-          "IntervalSeconds": 10,
-          "BackoffRate": 1.5
-        },
-        {
-          "ErrorEquals": [
-            "Ssm.SdkClientException",
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException",
             "States.Timeout"
           ],
-          "MaxAttempts": 2,
+          "MaxAttempts": 3,
           "IntervalSeconds": 5,
-          "BackoffRate": 1.5
+          "BackoffRate": 2.0
         }
       ],
       "Catch": [
@@ -822,11 +829,15 @@
         }
       ],
       "ResultSelector": {
-        "Status.$": "$.Status",
-        "ResponseCode.$": "$.ResponseCode",
-        "StatusDetails.$": "$.StatusDetails",
-        "CommandId.$": "$.CommandId",
-        "InstanceId.$": "$.InstanceId"
+        "verdict.$": "$.Payload.verdict",
+        "attempts.$": "$.Payload.attempts",
+        "ping_misses.$": "$.Payload.ping_misses",
+        "Status.$": "$.Payload.status",
+        "ResponseCode.$": "$.Payload.response_code",
+        "StatusDetails.$": "$.Payload.status_details",
+        "StandardErrorContent.$": "$.Payload.stderr_tail",
+        "ping_status.$": "$.Payload.ping_status",
+        "detail.$": "$.Payload.detail"
       },
       "ResultPath": "$.refresh_executor_deploy_poll",
       "Next": "CheckRefreshExecutorDeployStatus"
@@ -871,8 +882,9 @@
         "status.$": "$.refresh_executor_deploy_poll.Status",
         "status_details.$": "$.refresh_executor_deploy_poll.StatusDetails",
         "response_code.$": "$.refresh_executor_deploy_poll.ResponseCode",
-        "command_id.$": "$.refresh_executor_deploy_poll.CommandId",
-        "instance_id.$": "$.refresh_executor_deploy_poll.InstanceId"
+        "command_id.$": "$.refresh_executor_deploy_result.Command.CommandId",
+        "instance_id.$": "$.trading_instance_id[0]",
+        "detail.$": "$.refresh_executor_deploy_poll.detail"
       },
       "ResultPath": "$.error",
       "Next": "HandleFailure"
