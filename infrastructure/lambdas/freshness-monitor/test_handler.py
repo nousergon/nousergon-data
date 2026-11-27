@@ -2071,6 +2071,98 @@ def test_dynamic_severity_no_listed_rows_skips_pointer_read(fake_s3):
     assert calls == []
 
 
+def test_champion_floor_ids_include_matching_already_critical_row(
+    fake_s3: object,
+) -> None:
+    """Floor policy depends on the declaration, not a severity transition."""
+    import index
+    _keyed_get_object(fake_s3, {
+        index.CHAMPION_POINTER_KEY:
+            b'{"schema_version": 1, "champion": "scanner_predictor_direct"}',
+    })
+    arms = {
+        "already_critical": ["scanner_predictor_direct"],
+        "other_arm": ["think_tank"],
+    }
+    assert index._champion_freshness_floor_ids(fake_s3, arms) == {
+        "already_critical"
+    }
+
+
+def test_champion_floor_ids_fail_loud_for_unreadable_pointer(
+    fake_s3: object,
+) -> None:
+    import index
+    _keyed_get_object(fake_s3, {index.CHAMPION_POINTER_KEY: None})
+    arms = {
+        "champion_feed": ["scanner_predictor_direct"],
+        "other_arm": ["think_tank"],
+    }
+    assert index._champion_freshness_floor_ids(fake_s3, arms) == set(arms)
+
+
+@pytest.mark.parametrize(
+    ("now", "last_modified", "expected_state"),
+    [
+        # A Friday or Saturday write remains valid through Monday's pre-open
+        # check, then fails Wednesday once Tuesday is the last closed session.
+        ("2026-08-17T12:00:00+00:00", "2026-08-14T11:31:00+00:00", "fresh"),
+        ("2026-08-19T12:00:00+00:00", "2026-08-14T11:31:00+00:00", "stale"),
+        ("2026-08-19T12:00:00+00:00", "2026-08-15T11:31:00+00:00", "stale"),
+        # Labor Day is not treated as a closed session; the first post-holiday
+        # close advances the floor on Wednesday's pre-open check.
+        ("2026-09-08T12:00:00+00:00", "2026-09-05T11:31:00+00:00", "fresh"),
+        ("2026-09-09T12:00:00+00:00", "2026-09-05T11:31:00+00:00", "stale"),
+    ],
+)
+def test_champion_floor_is_one_closed_trading_day(
+    now: str, last_modified: str, expected_state: str
+) -> None:
+    import index
+    from nousergon_lib.artifact_freshness import CheckResult
+    result = CheckResult(
+        state="fresh",
+        last_modified=datetime.fromisoformat(last_modified),
+        reason="shared cadence floor says fresh",
+    )
+    graded = index._apply_champion_freshness_floor(
+        result, datetime.fromisoformat(now)
+    )
+    assert graded.state == expected_state
+    if expected_state == "stale":
+        assert graded.sla_violated_by_minutes > 0
+        assert "monitor-side one-trading-day freshness floor" in graded.reason
+
+
+def test_champion_floor_stale_result_enters_critical_page_path(monkeypatch) -> None:
+    import index
+    from nousergon_lib.artifact_freshness import ArtifactSpec, CheckResult
+    monkeypatch.setattr(index, "ALERTS_ENABLED", True)
+    spec = ArtifactSpec(
+        artifact_id="research_free_backfill",
+        s3_bucket="alpha-engine-research",
+        s3_key_template="predictor/research_free_backfill/feed.parquet",
+        cadence="eod_sf",
+        sla_minutes_after_cron=360,
+        severity="critical",
+        owner_repo="nousergon-data",
+        created_at="2026-01-01",
+    )
+    result = index._apply_champion_freshness_floor(
+        CheckResult(
+            state="fresh",
+            last_modified=datetime.fromisoformat("2026-08-15T11:31:00+00:00"),
+            reason="shared cadence floor says fresh",
+        ),
+        datetime.fromisoformat("2026-08-19T12:00:00+00:00"),
+    )
+    decision = index._alert_decision(spec, result, datetime.fromisoformat(
+        "2026-08-19T12:00:00+00:00"
+    ))
+    assert decision is not None
+    assert decision["severity"] == "critical"
+
+
 def _warning_spec_and_missing_result(index):
     from nousergon_lib.artifact_freshness import CheckResult
     spec = index.ArtifactSpec(
