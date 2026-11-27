@@ -41,6 +41,7 @@ from datetime import datetime, timezone
 from collections.abc import Callable
 from typing import Any
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 import pandas as pd
@@ -1480,6 +1481,8 @@ class AlternativeLoad(dict):
     """
 
     short: bool = False
+    #: Recorded weekly partition run date, for aging daily earnings counts.
+    partition_date: str | None = None
     #: Features in :data:`UNPUBLISHED_FIELD_GRACE` whose producer field NO
     #: loaded payload carries (alpha-engine-config-I13143): the partition
     #: predates the producer, so the column cannot vary yet.
@@ -1621,6 +1624,7 @@ def _load_cached_alternative(
                 keys.append(key)
 
         alt_data = AlternativeLoad()
+        alt_data.partition_date = latest_date
         unreadable: list[str] = []
         payloads: list[dict] = []
         for key in keys:
@@ -1809,6 +1813,17 @@ def build_feature_frame(
     sub_sector_map = _load_sub_sector_etf_map(s3, bucket)
     fundamentals = _load_cached_fundamentals(s3, bucket, date_str)
     alt_data = _load_cached_alternative(s3, bucket)
+    partition_date = getattr(alt_data, "partition_date", None)
+    if partition_date:
+        elapsed = max(0, (datetime.fromisoformat(date_str).date()
+                          - datetime.fromisoformat(partition_date).date()).days)
+        for entry in cast("dict[str, dict[str, dict[str, int | None]]]", alt_data).values():
+            earnings: dict[str, int | None] = entry["earnings"]
+            days: int | None = earnings.get("days_since_earnings")
+            if days is not None:
+                # Calendar aging only: reports inside this gap are unknown to
+                # the weekly payload and cannot reset the count until refresh.
+                earnings["days_since_earnings"] = min(days + elapsed, 90)
 
     t_load = time.time() - t0
     log.info(

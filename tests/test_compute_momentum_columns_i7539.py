@@ -157,3 +157,49 @@ def test_an_uncomputed_factor_momentum_stays_nan_never_a_fabricated_zero(monkeyp
         "an uncomputed factor_momentum_ratio must be absent, not 0.0 — a "
         f"fabricated zero is unfalsifiable downstream. Got: {col.dropna().unique()[:5]}"
     )
+
+
+def test_daily_earnings_count_ages_from_recorded_weekly_partition(monkeypatch):
+    """I13262: Friday and Monday snapshots age Saturday's count in calendar days."""
+    import io
+    import json
+    from unittest.mock import MagicMock
+
+    import pytest
+
+    price_data, macro = _synthetic_universe(n_tickers=4)
+    # Exercise the real alternative loader as well as the real feature engineer.
+    loader = compute._load_cached_alternative
+    _patch_loaders(monkeypatch, price_data, macro)
+    monkeypatch.setattr(compute, "_load_cached_alternative", loader)
+    prefix = "market_data/weekly/2026-11-07/alternative/"
+    counts = {"T00": 12, "T01": 87, "T02": None, "T03": 0}
+    objects = {
+        "market_data/latest_weekly.json": {"date": "2026-11-07"},
+        prefix + "manifest.json": {"tickers_succeeded": 4},
+        **{prefix + t + ".json": {"eps_revision": {"days_since_earnings": v}}
+           for t, v in counts.items()},
+    }
+    s3 = MagicMock()
+    s3.get_object.side_effect = lambda Bucket, Key: {
+        "Body": io.BytesIO(json.dumps(objects[Key]).encode())
+    }
+    s3.get_paginator.return_value.paginate.return_value = [
+        {"Contents": [{"Key": key} for key in objects if key.startswith(prefix)]}
+    ]
+
+    def frame(day):
+        build = compute.build_feature_frame(day, "test-bucket", s3=s3, registry_client=None)
+        return build.features_df.set_index("ticker")["days_since_earnings"]
+
+    saturday = frame("2026-11-07")
+    friday = frame("2026-11-13")
+    monday = frame("2026-11-16")
+    assert saturday["T00"] == pytest.approx(12 / 90)
+    assert friday["T00"] == pytest.approx(18 / 90)
+    assert monday["T00"] == pytest.approx(21 / 90)
+    assert friday["T01"] == monday["T01"] == 1.0  # capped at 90
+    assert friday["T02"] == monday["T02"] == 1.0  # unknown stays unknown/default
+    assert friday["T03"] == pytest.approx(6 / 90)  # zero is a real report
+    assert frame("2026-11-13")["T00"] == friday["T00"]  # replay is stable
+    assert objects[prefix + "T00.json"]["eps_revision"]["days_since_earnings"] == 12
