@@ -60,7 +60,7 @@ import datetime as dt
 import json
 import os
 from pathlib import Path
-from typing import Any, cast
+from typing import SupportsInt, cast
 
 # The fleet check-result envelope's own status vocabulary, read by the
 # console's checks-envelope adapter. Anything outside it renders UNREPORTED —
@@ -134,7 +134,25 @@ _UNSWEEPABLE_KIND_TO_STATUS = {
 }
 
 
-def is_blocking_finding(finding: Any) -> bool:
+JsonObject = dict[str, object]
+
+
+def _object_dict(value: object) -> JsonObject:
+    """Narrow a JSON object after its container shape has been checked."""
+    return cast("JsonObject", value)
+
+
+def _object_list(value: object) -> list[object]:
+    """Return a JSON array, preserving the old empty-array fallback."""
+    return cast("list[object]", value) if isinstance(value, list) else []
+
+
+def _int_value(value: object) -> int:
+    """Apply ``int`` to a value supplied by the JSON report."""
+    return int(cast("str | bytes | bytearray | SupportsInt", value))
+
+
+def is_blocking_finding(finding: object) -> bool:
     """Does this coverage finding mean the sweep's own denominator is WRONG?
 
     Findings carry their own severity because two different things live in the
@@ -149,14 +167,18 @@ def is_blocking_finding(finding: Any) -> bool:
     keeps the fail-loud direction.
     """
     if isinstance(finding, dict):
-        return bool(finding.get("blocking", True))
+        return bool(_object_dict(cast("object", finding)).get("blocking", True))
     return True
 
 
-def finding_text(finding: Any) -> str:
+def finding_text(finding: object) -> str:
     """The human-readable body of a coverage finding, either shape."""
     if isinstance(finding, dict):
-        return str(finding.get("finding", finding))
+        return str(
+            _object_dict(cast("object", finding)).get(
+                "finding", cast("object", finding)
+            )
+        )
     return str(finding)
 
 
@@ -164,7 +186,7 @@ class CadenceError(RuntimeError):
     """The declared cadence could not be read. Raised, never defaulted."""
 
 
-def load_cadence(path: Path = CADENCE_PATH) -> dict[str, Any]:
+def load_cadence(path: Path = CADENCE_PATH) -> JsonObject:
     """The single declared cadence parameter.
 
     Never defaults. A component that guesses its own cadence produces a
@@ -172,13 +194,17 @@ def load_cadence(path: Path = CADENCE_PATH) -> dict[str, Any]:
     runtime is indistinguishable on the surface from one that was ruled.
     """
     try:
-        manifest = json.loads(Path(path).read_text())
+        parsed: object = json.loads(Path(path).read_text())
     except (OSError, json.JSONDecodeError) as exc:
         raise CadenceError(f"could not read the cadence declaration at {path}: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise CadenceError(f"{path} must contain a JSON object")
+    manifest = _object_dict(cast("object", parsed))
     for field in ("sweep_cadence", "cadence_minutes", "staleness_factor"):
         if field not in manifest:
             raise CadenceError(f"{path} is missing the required field {field!r}")
-    if manifest["sweep_cadence"] not in manifest.get("allowed_values", []):
+    allowed_values = _object_list(manifest.get("allowed_values", []))
+    if manifest["sweep_cadence"] not in allowed_values:
         raise CadenceError(
             f"{path} declares sweep_cadence={manifest['sweep_cadence']!r}, which is "
             f"not in allowed_values {manifest.get('allowed_values')}"
@@ -198,14 +224,14 @@ def stage_check_id(stage_name: str) -> str:
 
 
 def stage_envelope(
-    result: dict[str, Any],
+    result: JsonObject,
     run_id: str,
     ran_at: str,
-    cadence: dict[str, Any],
-) -> dict[str, Any]:
+    cadence: JsonObject,
+) -> JsonObject:
     """One stage's check-result envelope."""
     verdict = result.get("verdict", "")
-    status = _VERDICT_TO_STATUS.get(verdict)
+    status = _VERDICT_TO_STATUS.get(cast("str", verdict))
     if status is None:
         # An internal verdict with no declared envelope mapping. Rendering it
         # as "ok" would be the worst available default, and dropping the row
@@ -219,14 +245,14 @@ def stage_envelope(
     if verdict == "unsweepable" and kind is not None:
         # An unrecognised kind keeps the ERROR default: a new kind must be
         # added by PR here, not absorbed into the quieter status.
-        status = _UNSWEEPABLE_KIND_TO_STATUS.get(kind, ENVELOPE_ERROR)
+        status = _UNSWEEPABLE_KIND_TO_STATUS.get(cast("str", kind), ENVELOPE_ERROR)
 
     return {
-        "check_id": stage_check_id(result["stage"]),
+        "check_id": stage_check_id(cast("str", result["stage"])),
         "status": status,
         "ran_at": ran_at,
         "cadence_minutes": cadence["cadence_minutes"],
-        "component_id": stage_check_id(result["stage"]),
+        "component_id": stage_check_id(cast("str", result["stage"])),
         "stage": result["stage"],
         "verdict": verdict,
         "unsweepable_kind": kind,
@@ -249,8 +275,8 @@ def stage_envelope(
 
 
 def rollup_envelope(
-    report: dict[str, Any], cadence: dict[str, Any], ran_at: str
-) -> dict[str, Any]:
+    report: JsonObject, cadence: JsonObject, ran_at: str
+) -> JsonObject:
     """The sweep's own row: coverage, not any one stage's verdict.
 
     This is where ``stages_unobserved`` lives — stages the definition declares
@@ -258,9 +284,9 @@ def rollup_envelope(
     zero, because a coverage number that only appears when it is non-zero is a
     number nobody can tell the absence of from the presence of health.
     """
-    declared = int(report.get("stages_declared", 0))
-    no_dry_path = int(report.get("stages_no_dry_path", 0))
-    retired = int(report.get("stages_retired", 0) or 0)
+    declared = _int_value(report.get("stages_declared", 0))
+    no_dry_path = _int_value(report.get("stages_no_dry_path", 0))
+    retired = _int_value(report.get("stages_retired", 0) or 0)
     # The denominator the sweep is accountable for: every stage the definition
     # declares, MINUS the ones acknowledged in preflight_sweep_manifest.json as
     # having no dry path at all. That subtraction is the only one permitted,
@@ -268,19 +294,23 @@ def rollup_envelope(
     # acknowledged set and the definition disagree in either direction — so it
     # cannot be used to quietly shrink what is being counted.
     expected = max(declared - no_dry_path, 0)
-    results = report.get("results", []) or []
+    results = [
+        _object_dict(cast("object", result))
+        for result in _object_list(report.get("results", []) or [])
+        if isinstance(result, dict)
+    ]
     # Stages the sweep is accountable for AND produced a verdict for. A
     # `no_dry_path` row is a verdict, but it is not coverage — counting it here
     # would let the acknowledged gaps cancel out the stages they represent and
     # drive `stages_unobserved` to zero while nothing was exercised.
     reported = len([r for r in results if r.get("verdict") != "no_dry_path"])
     unobserved = max(expected - reported, 0)
-    findings = report.get("coverage_findings", []) or []
+    findings = _object_list(report.get("coverage_findings", []) or [])
     blocking = [f for f in findings if is_blocking_finding(f)]
-    persistent = report.get("persistent_unsweepable_findings", []) or []
-    coverage_defects = int(report.get("stages_unsweepable_coverage_defect", 0) or 0)
-    upstream_pending = int(report.get("stages_unsweepable_upstream_pending", 0) or 0)
-    dedicated_box = int(report.get("stages_unsweepable_dedicated_box", 0) or 0)
+    persistent = _object_list(report.get("persistent_unsweepable_findings", []) or [])
+    coverage_defects = _int_value(report.get("stages_unsweepable_coverage_defect", 0) or 0)
+    upstream_pending = _int_value(report.get("stages_unsweepable_upstream_pending", 0) or 0)
+    dedicated_box = _int_value(report.get("stages_unsweepable_dedicated_box", 0) or 0)
     if (
         not report.get("stages_unsweepable_coverage_defect")
         and not upstream_pending
@@ -289,7 +319,7 @@ def rollup_envelope(
         # A report predating the kind split (or the shell's could-not-measure
         # payload) carries only the total. Attribute it to the loud kind rather
         # than assume the quiet one.
-        coverage_defects = int(report.get("stages_unsweepable", 0) or 0)
+        coverage_defects = _int_value(report.get("stages_unsweepable", 0) or 0)
 
     if not report.get("measured", False):
         status = ENVELOPE_ERROR
@@ -335,7 +365,7 @@ def rollup_envelope(
         "stages_retired": retired,
         "retired_stages": [
             r.get("stage")
-            for r in cast("list[dict[str, object]]", results)
+            for r in results
             if r.get("verdict") == "retired"
         ],
         "stages_not_attempted": report.get("stages_not_attempted", 0),
@@ -381,8 +411,8 @@ def rollup_envelope(
 
 
 def envelopes(
-    report: dict[str, Any], cadence: dict[str, Any], now: dt.datetime | None = None
-) -> list[tuple[str, dict[str, Any]]]:
+    report: JsonObject, cadence: JsonObject, now: dt.datetime | None = None
+) -> list[tuple[str, JsonObject]]:
     """Every console object this run publishes, as ``(s3_key, body)`` pairs.
 
     One row per stage plus the roll-up. Written on EVERY run, including a run
@@ -392,8 +422,11 @@ def envelopes(
     """
     ran_at = (now or dt.datetime.now(dt.timezone.utc)).isoformat()
     run_id = str(report.get("run_id", "unknown"))
-    out: list[tuple[str, dict[str, Any]]] = []
-    for result in report.get("results", []):
+    out: list[tuple[str, JsonObject]] = []
+    for item in _object_list(report.get("results", [])):
+        if not isinstance(item, dict):
+            continue
+        result = _object_dict(cast("object", item))
         body = stage_envelope(result, run_id, ran_at, cadence)
         out.append((f"{CHECKS_PREFIX}/{body['check_id']}/latest.json", body))
     rollup = rollup_envelope(report, cadence, ran_at)
