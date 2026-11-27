@@ -424,8 +424,6 @@ pip install --upgrade pip -q || fail "pip upgrade failed"
 if [ -f requirements.txt ]; then
   pip install -q -r requirements.txt || fail "dashboard requirements install failed"
 fi
-# numpy<2 pin to match every other spot workload (pyarrow compiled against 1.x).
-pip install -q 'numpy<2' || fail "numpy pin failed"
 # Runtime backstop for ssm_log_capture --correlation-id. Keep this floor in
 # one place: requirements.txt remains the authoritative exact version to
 # install, while this assertion diagnoses a stale or otherwise malformed venv.
@@ -475,12 +473,10 @@ deactivate
 #
 # (measured 2026-08-15, execution watch-rerun-2026-08-15-2).
 #
-# The two dependency sets CANNOT be merged into one venv: the dashboard venv
-# is pinned `numpy<2` on the line above because every spot workload's pyarrow
-# is compiled against 1.x, and alpha-engine-data declares `numpy>=2.4.6`.
-# Installing data's requirements into the dashboard venv would silently break
-# the pin that fourteen other stages depend on. Two venvs is the only shape
-# that is correct for both.
+# The two dependency sets stay in separate venvs: the dashboard venv serves
+# the launcher commands, while alpha-engine-data declares the complete closure
+# needed by its own health checks. Installing data's requirements into the
+# dashboard venv would make those independently owned closures drift together.
 echo "[weekly-freshness-spot-bootstrap] building alpha-engine-data venv..."
 cd /home/ec2-user/alpha-engine-data
 # python3.12 literally, for the same reason as the dashboard venv above: an
