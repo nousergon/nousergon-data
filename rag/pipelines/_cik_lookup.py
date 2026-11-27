@@ -35,6 +35,10 @@ from typing import Protocol, cast
 
 logger = logging.getLogger(__name__)
 
+# SEC's published fair-access ceiling.  Filing pipelines use the same value
+# both for pacing and for their pre-request wall-clock budget projection.
+EDGAR_REQUESTS_PER_SECOND = 10
+
 
 class _Response(Protocol):
     """The slice of ``requests.Response`` this module reads."""

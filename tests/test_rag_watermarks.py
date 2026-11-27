@@ -17,6 +17,10 @@ from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from unittest.mock import MagicMock
 
+import pytest
+
+from rag.pipelines import ingest_8k_filings, ingest_sec_filings
+
 from rag.pipelines._watermarks import (
     WatermarkStore,
     resolve_outstanding,
@@ -25,7 +29,7 @@ from rag.pipelines._watermarks import (
 NOW = datetime(2026, 7, 30, 12, 0, tzinfo=timezone.utc)
 
 
-def _s3(marks: dict | None = None, *, readable: bool = True):
+def _s3(marks: dict[str, str] | None = None, *, readable: bool = True) -> MagicMock:
     s3 = MagicMock()
     if not readable:
         s3.get_object.side_effect = RuntimeError("AccessDenied")
@@ -39,14 +43,16 @@ def _s3(marks: dict | None = None, *, readable: bool = True):
     return s3
 
 
-def _store(marks=None, *, readable=True):
+def _store(
+    marks: dict[str, str] | None = None, *, readable: bool = True,
+) -> WatermarkStore:
     return WatermarkStore("news", s3_client=_s3(marks, readable=readable))
 
 
 # ── the health check §4 calls honest ─────────────────────────────────────
 
 
-def test_second_run_with_nothing_new_issues_zero_vendor_requests():
+def test_second_run_with_nothing_new_issues_zero_vendor_requests() -> None:
     fresh = (NOW - timedelta(minutes=30)).isoformat().replace("+00:00", "Z")
     store = _store({f"{t}|news_article": fresh for t in ("AAPL", "MSFT")})
 
@@ -58,7 +64,7 @@ def test_second_run_with_nothing_new_issues_zero_vendor_requests():
     assert hours == 0
 
 
-def test_a_ticker_at_watermark_contributes_nothing_while_a_stale_one_does():
+def test_a_ticker_at_watermark_contributes_nothing_while_a_stale_one_does() -> None:
     marks = {
         "AAPL|news_article": (NOW - timedelta(minutes=10)).isoformat().replace("+00:00", "Z"),
         "MSFT|news_article": (NOW - timedelta(hours=30)).isoformat().replace("+00:00", "Z"),
@@ -76,7 +82,7 @@ def test_a_ticker_at_watermark_contributes_nothing_while_a_stale_one_does():
 # ── first fill and the §6 carve-out ──────────────────────────────────────
 
 
-def test_never_ingested_ticker_gets_the_full_first_fill_window():
+def test_never_ingested_ticker_gets_the_full_first_fill_window() -> None:
     # A newly in-scope ticker legitimately fetches its whole lookback — a
     # gap-fill, not a re-fetch (§6). It has no history to bound the window.
     outstanding, hours = resolve_outstanding(
@@ -86,7 +92,7 @@ def test_never_ingested_ticker_gets_the_full_first_fill_window():
     assert hours == 168
 
 
-def test_one_never_ingested_ticker_widens_the_shared_window():
+def test_one_never_ingested_ticker_widens_the_shared_window() -> None:
     # The batch takes ONE window, so a single first-fill ticker forces the full
     # lookback for the batch. Stated as a test so the tradeoff is deliberate
     # rather than discovered.
@@ -99,7 +105,7 @@ def test_one_never_ingested_ticker_widens_the_shared_window():
     assert hours == 168
 
 
-def test_absent_store_is_first_fill_not_a_degradation():
+def test_absent_store_is_first_fill_not_a_degradation() -> None:
     store = _store(None)  # NoSuchKey
     outstanding, hours = resolve_outstanding(
         ["AAPL"], store, doc_type="news_article", max_hours=168, now=NOW,
@@ -111,7 +117,7 @@ def test_absent_store_is_first_fill_not_a_degradation():
 # ── failure directions ───────────────────────────────────────────────────
 
 
-def test_unreadable_store_treats_everything_as_outstanding():
+def test_unreadable_store_treats_everything_as_outstanding() -> None:
     # Over-fetching once is the safe direction. Skipping a fetch on the
     # strength of state we could not read is not.
     store = _store(None, readable=False)
@@ -124,7 +130,7 @@ def test_unreadable_store_treats_everything_as_outstanding():
     assert hours == 168
 
 
-def test_unparseable_store_does_not_silently_read_as_empty_marks():
+def test_unparseable_store_does_not_silently_read_as_empty_marks() -> None:
     s3 = MagicMock()
     s3.get_object.return_value = {"Body": BytesIO(b"{not json")}
     store = WatermarkStore("news", s3_client=s3)
@@ -132,7 +138,7 @@ def test_unparseable_store_does_not_silently_read_as_empty_marks():
     assert store.unreadable is True
 
 
-def test_flush_failure_does_not_raise_over_stored_documents():
+def test_flush_failure_does_not_raise_over_stored_documents() -> None:
     # Losing the marks costs one redundant fetch next run; raising here would
     # discard documents that are already in the corpus.
     s3 = _s3({})
@@ -145,7 +151,7 @@ def test_flush_failure_does_not_raise_over_stored_documents():
 # ── the advance contract ─────────────────────────────────────────────────
 
 
-def test_advance_then_flush_round_trips_through_the_stored_payload():
+def test_advance_then_flush_round_trips_through_the_stored_payload() -> None:
     s3 = _s3({})
     store = WatermarkStore("news", s3_client=s3)
     store.advance("aapl", "news_article", NOW)
@@ -158,7 +164,7 @@ def test_advance_then_flush_round_trips_through_the_stored_payload():
     assert "AAPL|news_article" in body["marks"]
 
 
-def test_watermarks_are_keyed_per_doc_type():
+def test_watermarks_are_keyed_per_doc_type() -> None:
     marks = {"AAPL|news_article": NOW.isoformat().replace("+00:00", "Z")}
     store = _store(marks)
     assert store.get("AAPL", "news_article") is not None
@@ -167,6 +173,38 @@ def test_watermarks_are_keyed_per_doc_type():
     assert store.get("AAPL", "8-K") is None
 
 
-def test_store_key_is_per_source_so_pipelines_cannot_contend():
+def test_store_key_is_per_source_so_pipelines_cannot_contend() -> None:
     assert WatermarkStore("news", s3_client=MagicMock()).key != \
         WatermarkStore("sec_edgar", s3_client=MagicMock()).key
+
+
+def test_current_sec_filing_keys_make_no_vendor_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MagicMock()
+    store.get.return_value = datetime.now(timezone.utc)
+    monkeypatch.setattr(ingest_sec_filings, "WatermarkStore", lambda _source: store)
+    vendor = MagicMock(side_effect=AssertionError("vendor request"))
+    monkeypatch.setattr(ingest_sec_filings.requests, "get", vendor)
+    monkeypatch.setattr(ingest_sec_filings, "write_yield", MagicMock())
+    monkeypatch.setattr("sys.argv", ["ingest_sec_filings", "--tickers", "AAPL"])
+
+    ingest_sec_filings.main()
+
+    vendor.assert_not_called()
+
+
+def test_current_8k_key_makes_no_vendor_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MagicMock()
+    store.get.return_value = datetime.now(timezone.utc)
+    monkeypatch.setattr(ingest_8k_filings, "WatermarkStore", lambda _source: store)
+    vendor = MagicMock(side_effect=AssertionError("vendor request"))
+    monkeypatch.setattr(ingest_8k_filings.requests, "get", vendor)
+    monkeypatch.setattr(ingest_8k_filings, "write_yield", MagicMock())
+    monkeypatch.setattr("sys.argv", ["ingest_8k_filings", "--tickers", "AAPL"])
+
+    ingest_8k_filings.main()
+
+    vendor.assert_not_called()
