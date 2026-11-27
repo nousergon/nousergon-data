@@ -20,6 +20,8 @@ against manifest publication lag, not a budget covering the collection's run —
 the event already waited for that. The derivations below pin both halves.
 """
 
+# ruff: noqa: ANN001, ANN002, ANN003, ANN101, ANN102, ANN201, ANN202, ANN204, ANN205, ANN206
+
 from __future__ import annotations
 
 import copy
@@ -482,9 +484,9 @@ def test_the_heal_starts_the_standalone_eod_machine_with_its_own_units(schedules
 
 def test_the_heal_loop_keeps_detect_act_verify_and_its_bound():
     states = _definition(EOD_RECONCILE)["States"]
-    assert states["HealLoopGate"]["Default"] == "HealStartCollection"
-    assert states["HealStartCollection"]["Next"] == "HealReProbe"
-    assert states["HealStartCollection"]["Catch"][0]["Next"] == "HealReProbe"
+    assert states["HealLoopGate"]["Default"] == "HealMarkAttemptStarted"
+    assert states["HealStartCollection"]["Next"] == "HealReadFailureSignature"
+    assert states["HealStartCollection"]["Catch"][0]["Next"] == "HealReadFailureSignature"
     for name in ("HealReProbe", "HealCheckConverged", "HealDispatchReplay", "HealNonConvergent"):
         assert name in states, name
     removed = {

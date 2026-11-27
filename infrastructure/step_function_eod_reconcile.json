@@ -1264,7 +1264,7 @@
         "attempts": 0
       },
       "ResultPath": "$.heal_loop",
-      "Next": "HealLoopGate"
+      "Next": "HealInitialSignatureAvailable"
     },
     "HealLoopGate": {
       "Type": "Choice",
@@ -1293,7 +1293,7 @@
           "Next": "HealNonConvergent"
         }
       ],
-      "Default": "HealStartCollection"
+      "Default": "HealMarkAttemptStarted"
     },
     "HealReProbe": {
       "Type": "Task",
@@ -1349,7 +1349,7 @@
           "Next": "HealDispatchReplay"
         }
       ],
-      "Default": "HealLoopIncrement"
+      "Default": "HealCheckRepeatedFailure"
     },
     "HealLoopIncrement": {
       "Type": "Pass",
@@ -1960,7 +1960,8 @@
         "failed.$": "$.Payload.readiness.failed",
         "failure_mode.$": "$.Payload.readiness.failure_mode",
         "baseline.$": "$.Payload.readiness.baseline",
-        "summary.$": "$.Payload.readiness.summary"
+        "summary.$": "$.Payload.readiness.summary",
+        "failure_signature.$": "$.Payload.readiness.failure_signature"
       },
       "ResultPath": "$.collection_readiness",
       "Next": "CheckCollectionReadiness"
@@ -2084,10 +2085,10 @@
           ],
           "Comment": "A FAILED/TIMED_OUT collection is not a convergence verdict \u2014 the collection fails loud on ANY unit, while the precondition is the SPY close + macro sentinel. HealReProbe decides, exactly as it did after a failed spot.",
           "ResultPath": "$.heal_error",
-          "Next": "HealReProbe"
+          "Next": "HealReadFailureSignature"
         }
       ],
-      "Next": "HealReProbe"
+      "Next": "HealReadFailureSignature"
     },
     "DrainTraderReconcile": {
       "Type": "Task",
@@ -2306,6 +2307,149 @@
       },
       "ResultPath": "$.degraded_summary",
       "Next": "PublishTraderReconcileDrainUnsettled"
+    },
+    "HealInitialSignatureAvailable": {
+      "Type": "Choice",
+      "Comment": "aec#7764: only a measured, nonempty workload failure signature can participate in deterministic-failure comparison.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.collection_readiness.failure_signature",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.collection_readiness.failure_signature",
+              "StringGreaterThan": ""
+            }
+          ],
+          "Next": "HealCaptureInitialFailureSignature"
+        }
+      ],
+      "Default": "HealClearInitialFailureSignature"
+    },
+    "HealCaptureInitialFailureSignature": {
+      "Type": "Pass",
+      "Parameters": {
+        "value.$": "$.collection_readiness.failure_signature"
+      },
+      "ResultPath": "$.heal_initial_signature",
+      "Next": "HealLoopGate"
+    },
+    "HealClearInitialFailureSignature": {
+      "Type": "Pass",
+      "Result": {
+        "value": ""
+      },
+      "ResultPath": "$.heal_initial_signature",
+      "Next": "HealLoopGate"
+    },
+    "HealMarkAttemptStarted": {
+      "Type": "Pass",
+      "Parameters": {
+        "not_before.$": "$$.State.EnteredTime"
+      },
+      "ResultPath": "$.heal_attempt",
+      "Next": "HealStartCollection"
+    },
+    "HealReadFailureSignature": {
+      "Type": "Task",
+      "Comment": "aec#7764: grade only manifests finished after this heal attempt began, so an old failure cannot short-circuit a retry.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-collection-readiness-probe",
+        "Payload": {
+          "collection": "eod",
+          "units": [
+            "D03",
+            "D19",
+            "D20",
+            "D21",
+            "D22",
+            "D23",
+            "D24",
+            "D25",
+            "D26",
+            "D27",
+            "D28",
+            "D29",
+            "D30",
+            "D31",
+            "D32"
+          ],
+          "not_before.$": "$.heal_attempt.not_before",
+          "lookback_seconds": 0
+        }
+      },
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "ResultSelector": {
+        "value.$": "$.Payload.readiness.failure_signature"
+      },
+      "ResultPath": "$.heal_failure_signature",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.heal_signature_error",
+          "Next": "HealClearFreshFailureSignature"
+        }
+      ],
+      "Next": "HealReProbe"
+    },
+    "HealClearFreshFailureSignature": {
+      "Type": "Pass",
+      "Comment": "An unreadable probe is not evidence that failures match. Clear it so no stale value can compare equal.",
+      "Result": {
+        "value": ""
+      },
+      "ResultPath": "$.heal_failure_signature",
+      "Next": "HealReProbe"
+    },
+    "HealCheckRepeatedFailure": {
+      "Type": "Choice",
+      "Comment": "aec#7764: after one wasted relaunch, identical nonempty workload failures are non-convergent and use the existing loud page/cleanup route.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.heal_initial_signature.value",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.heal_initial_signature.value",
+              "StringGreaterThan": ""
+            },
+            {
+              "Variable": "$.heal_failure_signature.value",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.heal_failure_signature.value",
+              "StringGreaterThan": ""
+            },
+            {
+              "Variable": "$.heal_failure_signature.value",
+              "StringEqualsPath": "$.heal_initial_signature.value"
+            }
+          ],
+          "Next": "HealNonConvergent"
+        }
+      ],
+      "Default": "HealLoopIncrement"
     }
   }
 }
