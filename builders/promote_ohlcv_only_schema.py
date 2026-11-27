@@ -38,6 +38,10 @@ Usage:
     python -m builders.promote_ohlcv_only_schema --ticker SNDK     # single symbol
 """
 
+# Legacy ArcticDB/SDK seams in this module are dynamically typed.
+# ruff: noqa: ANN001, ANN201, ANN202, ANN204
+
+
 from __future__ import annotations
 
 import argparse
@@ -56,6 +60,7 @@ from features.compute import (
     _load_sector_map,
     _load_cached_fundamentals,
     _load_cached_alternative,
+    assert_alternative_arctic_coverage,
 )
 from store.arctic_store import get_universe_lib, get_macro_lib
 
@@ -246,6 +251,7 @@ def promote_schemas(
         datetime.now(timezone.utc).strftime("%Y-%m-%d"),
     )
     alt_data = _load_cached_alternative(s3, bucket)
+    assert_alternative_arctic_coverage(alt_data)
     macro = _load_macro_series(macro_lib, bucket)
 
     results: list[dict] = []

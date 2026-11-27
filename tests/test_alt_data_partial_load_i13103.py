@@ -13,9 +13,14 @@ A ticker the producer never covers (``XLRE``, measured 2026-10-30) is NaN-marked
 but does not degrade a full load.
 """
 
+# Legacy fixtures in this focused regression module are dynamically typed.
+# ruff: noqa: ANN001, ANN201, ANN202
+
+
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -71,6 +76,12 @@ def _patch(monkeypatch, tickers: list[str], alt):
 def _alt_load(tickers: list[str], *, short: bool) -> compute.AlternativeLoad:
     alt = compute.AlternativeLoad({t: _entry(i) for i, t in enumerate(tickers)})
     alt.short = short
+    return alt
+
+
+def _manifest_load(*, loaded: int, expected: int) -> compute.AlternativeLoad:
+    alt = _alt_load([f"T{i:03d}" for i in range(loaded)], short=True)
+    alt.manifest_count = expected
     return alt
 
 
@@ -162,3 +173,41 @@ def test_the_loader_reports_a_short_load(unreadable, manifest_short, short):
     alt = compute._load_cached_alternative(s3, "alpha-engine-research")
     assert isinstance(alt, compute.AlternativeLoad)
     assert alt.short is short
+    assert alt.manifest_count == len(tickers) + (3 if manifest_short else 0)
+
+
+def test_arctic_coverage_guard_raises_above_two_percent() -> None:
+    with pytest.raises(compute.AlternativeCoverageError, match="3 missing"):
+        compute.assert_alternative_arctic_coverage(
+            _manifest_load(loaded=97, expected=100),
+        )
+
+
+def test_arctic_coverage_guard_logs_at_two_percent_and_preserves_data(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    alt = _manifest_load(loaded=98, expected=100)
+
+    compute.assert_alternative_arctic_coverage(alt)
+
+    assert len(alt) == 98
+    assert "2 missing (2.0%)" in caplog.text
+    assert "defaults will be preserved" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "writer",
+    [
+        "builders/daily_append.py",
+        "builders/backfill.py",
+        "builders/promote_ohlcv_only_schema.py",
+        "builders/migrate_universe_crsp_basis.py",
+    ],
+)
+def test_every_arctic_writer_applies_the_coverage_guard(writer: str) -> None:
+    """Pin the fail-loud call at all four independently maintained writers."""
+    source = Path(writer).read_text()
+    load_at = source.index("_load_cached_alternative(s3, bucket)")
+    guard_at = source.index("assert_alternative_arctic_coverage(alt_data)", load_at)
+
+    assert guard_at > load_at
