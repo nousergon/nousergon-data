@@ -128,17 +128,21 @@ print("same" if json.dumps(live, sort_keys=True) == json.dumps(disk, sort_keys=T
 ' "${live_doc}" "${policy_file}" 2>/dev/null || echo unknown
 }
 
-# Usage: apply_iam_policy <role_name> <policy_name> <policy_file> <trust_policy_json> [may_create_role]
+# Usage: apply_iam_policy <role_name> <policy_name> <policy_file>
+#                         <trust_policy_json> [managed_policy_arn] [may_create_role]
 #
-# `may_create_role` (default "true") governs the ROLE-CREATION half only. The
-# policy apply below runs either way. This is the OPERATOR path (--bootstrap /
-# --apply-iam); the code-only deploy path uses check_iam_policy_on_deploy and
+# `managed_policy_arn`, when supplied, is attached after a missing role is
+# created. `may_create_role` (default "true") governs the ROLE-CREATION half
+# only. The policy apply below runs either way. This is the OPERATOR path
+# (--bootstrap / --apply-iam); the code-only deploy path uses
+# check_iam_policy_on_deploy and
 # never reaches this function. See probe_role_presence and
 # the may_create_role rail, which the 45 scripts queued onto this helper by
 # alpha-engine-config-I9207 will need as they migrate.
 apply_iam_policy() {
   local role_name="$1" policy_name="$2" policy_file="$3" trust_policy="$4"
-  local may_create_role="${5:-true}"
+  local managed_policy_arn="${5:-}"
+  local may_create_role="${6:-true}"
 
   local presence
   presence="$(probe_role_presence "${role_name}")"
@@ -167,6 +171,11 @@ apply_iam_policy() {
         --role-name "${role_name}" \
         --assume-role-policy-document "${trust_policy}" \
         --query 'Role.RoleName' --output text
+      if [ -n "${managed_policy_arn}" ]; then
+        run aws iam attach-role-policy \
+          --role-name "${role_name}" \
+          --policy-arn "${managed_policy_arn}"
+      fi
       if ! $DRY_RUN; then
         echo "  Waiting 10s for IAM role propagation..."
         sleep 10
