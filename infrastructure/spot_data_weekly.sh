@@ -802,6 +802,8 @@ export HOME=/home/ec2-user
 export XDG_CACHE_HOME=/tmp
 export AWS_REGION=us-east-1
 export AWS_DEFAULT_REGION=us-east-1
+export FLOW_DOCTOR_ENABLED=1
+export ALPHA_ENGINE_DEPLOYED=1
 # Router addressing (alpha-engine-config-I7409) - undeclared before this, krepis defaulted to
 # exec_context=laptop and RouterUnresolvable'd every flow-doctor diagnosis call on this box.
 export KREPIS_EXEC_CONTEXT=ec2
