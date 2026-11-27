@@ -9,11 +9,24 @@ the dry-run no-write path, and the fail-soft empty-universe skip.
 from __future__ import annotations
 
 import json
+import logging
 from datetime import date, datetime, timedelta, timezone
 from unittest import mock
 from unittest.mock import MagicMock
 
 from collectors import metron_market_data as mmd
+
+
+def test_read_json_denied_logs_s3_key(caplog) -> None:
+    s3 = MagicMock()
+    s3.get_object.side_effect = PermissionError("AccessDenied")
+    key = f"{mmd.CLOSE_HISTORY_PREFIX}DENIED.json"
+
+    with caplog.at_level(logging.WARNING):
+        assert mmd._read_json(s3, "market-bucket", key) is None
+
+    assert f"s3://market-bucket/{key}" in caplog.text
+    assert "AccessDenied" in caplog.text
 
 
 def _universe_s3(
