@@ -245,7 +245,16 @@ def _load_stance_lookup_for_date(s3: Any, bucket: str, sig_date: str) -> dict[st
     try:
         obj = s3.get_object(Bucket=bucket, Key=key)
         payload = json.loads(obj["Body"].read())
-    except (ClientError, json.JSONDecodeError):
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") in {  # pyright: ignore[reportUnknownMemberType]
+            "404", "NoSuchKey", "NotFound",
+        }:
+            return {}
+        raise RuntimeError(f"Failed to load stance lookup s3://{bucket}/{key}: {exc}") from exc
+    except json.JSONDecodeError as exc:  # malformed legacy context is non-primary
+        # Swallows malformed optional stance context; score rows still publish, while this
+        # WARNING and their NULL stance values are the concrete recording surfaces.
+        logger.warning("Stance lookup malformed at s3://%s/%s: %s", bucket, key, exc)
         return {}
     out: dict[str, str] = {}
     for pred in payload.get("predictions") or []:

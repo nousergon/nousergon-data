@@ -42,6 +42,7 @@ from collections.abc import Callable
 from typing import Any
 from pathlib import Path
 
+from botocore.exceptions import ClientError  # pyright: ignore[reportMissingTypeStubs]  # botocore ships no stubs; matches universe_returns.py
 import numpy as np
 import pandas as pd
 
@@ -1697,7 +1698,7 @@ def _load_cached_alternative(
 def _expected_alternative_count(
     s3: Any, bucket: str, prefix: str,  # pyright: ignore[reportExplicitAny] - untyped S3 SDK / recording client
 ) -> int | None:
-    """``tickers_succeeded`` from DataPhase2's manifest, or None if unreadable.
+    """``tickers_succeeded`` from DataPhase2's manifest, or None if it is absent.
 
     The producer writes the manifest BEFORE its own quality gate can raise, so
     it is present even on a degraded Phase 2 — which is exactly the run where a
@@ -1706,9 +1707,18 @@ def _expected_alternative_count(
     try:
         obj = s3.get_object(Bucket=bucket, Key=f"{prefix}manifest.json")
         manifest = json.loads(obj["Body"].read())
-    except Exception as exc:  # noqa: BLE001 — absence is reported by the caller
-        log.debug("Alternative manifest unreadable at %smanifest.json: %s", prefix, exc)
-        return None
+    except ClientError as exc:
+        # A genuinely absent manifest stays None: the caller WARNs that an
+        # under-read cannot be detected this run. Any other failure raises.
+        if exc.response.get("Error", {}).get("Code") in {"404", "NoSuchKey", "NotFound"}:  # pyright: ignore[reportUnknownMemberType]
+            return None
+        raise AlternativeCoverageError(
+            f"Alternative manifest unreadable at {prefix}manifest.json: {exc}"
+        ) from exc
+    except Exception as exc:
+        raise AlternativeCoverageError(
+            f"Alternative manifest unreadable at {prefix}manifest.json: {exc}"
+        ) from exc
     value = manifest.get("tickers_succeeded")
     return int(value) if isinstance(value, (int, float)) else None
 

@@ -40,24 +40,18 @@ _NOT_FOUND_TYPES = ("NoSuchKey", "NotFound", "FileNotFoundError", "KeyError")
 # The first eleven return None.
 GRANDFATHERED: frozenset[tuple[str, str]] = frozenset(
     {
-        ("features/compute.py", "_expected_alternative_count"),
-        ("features/reader.py", "read_feature_snapshot"),
-        ("features/reader.py", "read_registry"),
-        ("collectors/alternative.py", "load_from_s3"),
-        ("collectors/alternative.py", "_get_latest_date"),
         ("collectors/crypto_balances.py", "_read_json"),
         ("collectors/daily_closes.py", "_read_earlier_root_file"),
         ("collectors/historical_constituents.py", "closes"),
+        ("collectors/metron_market_data.py", "_read_metron_universe_holdings"),
         ("collectors/metron_market_data.py", "_read_json"),
+        ("collectors/signal_returns.py", "_load_stance_lookup_for_date"),
         ("collectors/price_cache_holes.py", "_read_daily_closes"),
         ("collectors/price_cache_holes.py", "_read_cached"),
         # The four below return an EMPTY CONTAINER, the severe I10923 shape.
         # features/compute.py::_load_cached_alternative left in
         # alpha-engine-config-I12879: it now raises AlternativeCoverageError.
-        ("collectors/alternative.py", "_load_promoted_tickers"),
         ("collectors/daily_news.py", "_load_holdings_universe"),
-        ("collectors/metron_market_data.py", "_read_metron_universe_holdings"),
-        ("collectors/signal_returns.py", "_load_stance_lookup_for_date"),
     }
 )
 
@@ -140,7 +134,7 @@ def _repo_sites() -> set[tuple[str, str]]:
     return sites
 
 
-def test_no_new_get_object_load_swallow():
+def test_no_new_get_object_load_swallow() -> None:
     new = sorted(_repo_sites() - GRANDFATHERED)
     assert not new, (
         "s3.get_object load failure swallowed into None or an empty container "
@@ -150,12 +144,12 @@ def test_no_new_get_object_load_swallow():
     )
 
 
-def test_grandfathered_entries_are_still_needed():
+def test_grandfathered_entries_are_still_needed() -> None:
     stale = sorted(GRANDFATHERED - _repo_sites())
     assert not stale, f"fixed or moved; remove from GRANDFATHERED: {stale}"
 
 
-def test_detector_flags_the_swallow_and_spares_the_compliant_shapes():
+def test_detector_flags_the_swallow_and_spares_the_compliant_shapes() -> None:
     """The detector is not vacuous: one fixture per branch."""
     src = """
 def swallow(s3):

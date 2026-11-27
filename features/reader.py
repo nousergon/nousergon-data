@@ -9,10 +9,12 @@ Self-contained copy from alpha-engine-predictor/feature_store/reader.py.
 
 from __future__ import annotations
 
+# pyright: reportExplicitAny=false
+
 import io
 import logging
 from datetime import date, timedelta
-from typing import Optional
+from typing import Any, Optional
 
 import pandas as pd
 
@@ -26,7 +28,7 @@ def read_feature_snapshot(
     group: str,
     bucket: str,
     prefix: str = DEFAULT_PREFIX,
-    s3_client=None,
+    s3_client: Any = None,
 ) -> Optional[pd.DataFrame]:
     """
     Read a single group's Parquet file for a given date.
@@ -48,8 +50,7 @@ def read_feature_snapshot(
         logger.debug("Feature snapshot not found: s3://%s/%s", bucket, key)
         return None
     except Exception as exc:
-        logger.warning("Failed to read feature snapshot %s: %s", key, exc)
-        return None
+        raise RuntimeError(f"Failed to read feature snapshot {key}: {exc}") from exc
 
 
 def read_feature_range(
@@ -58,7 +59,7 @@ def read_feature_range(
     group: str,
     bucket: str,
     prefix: str = DEFAULT_PREFIX,
-    s3_client=None,
+    s3_client: Any = None,
 ) -> pd.DataFrame:
     """
     Read and concatenate feature snapshots for a date range (inclusive).
@@ -97,7 +98,7 @@ def read_feature_range(
 def latest_available_date(
     bucket: str,
     prefix: str = DEFAULT_PREFIX,
-    s3_client=None,
+    s3_client: Any = None,
 ) -> Optional[str]:
     """
     Find the most recent date that has feature snapshots in S3.
@@ -131,7 +132,7 @@ def latest_available_date(
 def read_registry(
     bucket: str,
     prefix: str = DEFAULT_PREFIX,
-    s3_client=None,
+    s3_client: Any = None,
 ) -> Optional[dict]:
     """Read registry.json from S3."""
     import json
@@ -145,5 +146,4 @@ def read_registry(
         obj = s3_client.get_object(Bucket=bucket, Key=key)
         return json.loads(obj["Body"].read())
     except Exception as exc:
-        logger.warning("Failed to read feature registry: %s", exc)
-        return None
+        raise RuntimeError(f"Failed to read feature registry {key}: {exc}") from exc
