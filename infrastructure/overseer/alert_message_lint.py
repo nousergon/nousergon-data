@@ -130,6 +130,7 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TextIO
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import alert_class_pr_guard as guard  # noqa: E402
@@ -707,22 +708,6 @@ _UI_PATH_SEGMENTS: frozenset[str] = frozenset(
 )
 
 
-#: Publish shapes this lint recognises IN ADDITION to the ones the class
-#: scanner matches. `notify_via_flow_doctor` reaches an operator exactly as
-#: `publish_ops_alert` does, but the class scanner does not match it, so
-#: `saturday-sf-watch-dispatcher/index.py` — a live emitter with two dedup keys
-#: — was out of scope entirely until this was added.
-#:
-#: WHY THIS IS NOT ADDED TO THE SHARED SCANNER INSTEAD. Widening
-#: `alert_class_registry_drift._PUBLISH_CALL_PATTERN` would make the CLASS
-#: guard — enforcing, in seven repos, today — start demanding `alert_classes`
-#: rows for every flow-doctor source in the fleet, on the next PR each of those
-#: repos opens. That is a live-guard behaviour change and it belongs in its own
-#: PR with its own row inventory (alpha-engine-config-I9490), not smuggled in
-#: under a warn-only lint.
-_EXTRA_PUBLISH_SHAPES = re.compile(r"notify_via_flow_doctor\s*\(|notify_via_\w+\s*\(")
-
-
 def _in_scope(relpath: str, text: str) -> bool:
     """A file is graded when it publishes an alert, or is named like an emitter.
 
@@ -737,10 +722,11 @@ def _in_scope(relpath: str, text: str) -> bool:
     parts = Path(relpath).parts[:-1]
     if any(seg in _UI_PATH_SEGMENTS for seg in parts):
         return False
+    # The shared scanner includes operator-reaching ``notify_via_*`` wrappers;
+    # keep this scope check on that single publish-shape definition.
     publishes = bool(
         scan._PUBLISH_CALL_PATTERN.search(text)
         or scan._CLI_CALL_PATTERN.search(text)
-        or _EXTRA_PUBLISH_SHAPES.search(text)
     )
     if publishes:
         return True
@@ -800,7 +786,7 @@ def _gha_annotation(finding: Finding, *, warn_only: bool) -> str:
     return f"::{level} file={finding.relpath},line={finding.line},title=alert-message-lint::{msg}"
 
 
-def report(findings: list[Finding], *, warn_only: bool, out) -> None:
+def report(findings: list[Finding], *, warn_only: bool, out: TextIO) -> None:
     by_rule: dict[str, list[Finding]] = {}
     for f in findings:
         by_rule.setdefault(f.rule, []).append(f)
