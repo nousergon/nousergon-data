@@ -68,6 +68,7 @@ import re
 import sys
 from collections.abc import Iterator
 from pathlib import Path
+from typing import TypeAlias, TypedDict, cast
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DECLARED_PATH = REPO_ROOT / "validators" / "sf_entrypoints.json"
@@ -116,6 +117,36 @@ SHELL_LOGIC = re.compile(
 )
 
 Counts = dict[str, dict[str, int]]
+JSONValue: TypeAlias = None | bool | int | float | str | list["JSONValue"] | dict[str, "JSONValue"]
+JSONObject: TypeAlias = dict[str, JSONValue]
+
+
+class Finding(TypedDict):
+    path: str
+    state: str
+    rule: str
+    detail: str
+
+
+class Comparison(TypedDict):
+    path: str
+    rule: str
+    baseline: int
+    current: int
+
+
+def _object(value: JSONValue) -> JSONObject:
+    """Return a JSON object, or an empty object for another JSON value."""
+    return value if isinstance(value, dict) else {}
+
+
+def _array(value: JSONValue) -> list[JSONValue]:
+    """Return a JSON array, or an empty array for another JSON value."""
+    return value if isinstance(value, list) else []
+
+
+def _read_json(path: Path) -> JSONValue:
+    return cast(JSONValue, json.loads(path.read_text(encoding="utf-8")))
 
 
 # --------------------------------------------------------------------------
@@ -130,17 +161,19 @@ def definition_files(repo: Path) -> list[Path]:
     return sorted(out)
 
 
-def walk_states(states: dict, prefix: str = "") -> Iterator[tuple[str, dict]]:
+def walk_states(states: JSONObject, prefix: str = "") -> Iterator[tuple[str, JSONObject]]:
     """Every state, depth first, named by its path through Parallel/Map."""
-    for name, state in states.items():
+    for name, state_value in states.items():
+        state = _object(state_value)
         path = f"{prefix}{name}"
         yield path, state
         if state.get("Type") == "Parallel":
-            for i, branch in enumerate(state.get("Branches") or []):
-                yield from walk_states(branch.get("States") or {}, f"{path}[{i}]/")
+            for i, branch_value in enumerate(_array(state.get("Branches"))):
+                branch = _object(branch_value)
+                yield from walk_states(_object(branch.get("States")), f"{path}[{i}]/")
         elif state.get("Type") == "Map":
-            inner = state.get("ItemProcessor") or state.get("Iterator") or {}
-            yield from walk_states(inner.get("States") or {}, f"{path}/")
+            inner = _object(state.get("ItemProcessor") or state.get("Iterator"))
+            yield from walk_states(_object(inner.get("States")), f"{path}/")
 
 
 def lambda_name(value: str) -> str:
@@ -154,21 +187,23 @@ def state_machine_name(value: str) -> str:
     return value.rsplit(":stateMachine:", 1)[-1] if ":stateMachine:" in value else value
 
 
-def _rule_leaves(rule: dict) -> Iterator[tuple[str | None, list[str]]]:
+def _rule_leaves(rule: JSONObject) -> Iterator[tuple[str | None, list[str]]]:
     for key in ("And", "Or"):
         if key in rule:
-            for sub in rule[key]:
-                yield from _rule_leaves(sub)
+            for sub in _array(rule[key]):
+                yield from _rule_leaves(_object(sub))
             return
     if "Not" in rule:
-        yield from _rule_leaves(rule["Not"])
+        yield from _rule_leaves(_object(rule["Not"]))
         return
     ops = [k for k in rule if k not in ("Variable", "Next", "Comment", "Assign", "Output")]
-    yield rule.get("Variable"), ops
+    variable = rule.get("Variable")
+    yield variable if isinstance(variable, str) else None, ops
 
 
-def choice_is_outcome_only(state: dict) -> bool:
-    for rule in state.get("Choices") or []:
+def choice_is_outcome_only(state: JSONObject) -> bool:
+    for rule_value in _array(state.get("Choices")):
+        rule = _object(rule_value)
         if "Condition" in rule:
             return False
         for variable, ops in _rule_leaves(rule):
@@ -178,10 +213,10 @@ def choice_is_outcome_only(state: dict) -> bool:
     return True
 
 
-def classify_task(state: dict, declared: dict[str, set[str]]) -> tuple[str, str] | None:
+def classify_task(state: JSONObject, declared: dict[str, set[str]]) -> tuple[str, str] | None:
     """``(rule, detail)`` for a Task that breaks a rule, else ``None``."""
     resource = str(state.get("Resource") or "")
-    params = state.get("Parameters") or state.get("Arguments") or {}
+    params = _object(state.get("Parameters") or state.get("Arguments"))
     if resource.startswith(LAMBDA_PREFIX):
         if "FunctionName" not in params:
             return "task-undeclared-entrypoint", "lambda <dynamic FunctionName>"
@@ -206,12 +241,12 @@ def classify_task(state: dict, declared: dict[str, set[str]]) -> tuple[str, str]
     return "task-not-an-entrypoint", resource.removeprefix("arn:aws:states:::")
 
 
-def findings(repo: Path, declared: dict[str, set[str]]) -> list[dict]:
-    out: list[dict] = []
+def findings(repo: Path, declared: dict[str, set[str]]) -> list[Finding]:
+    out: list[Finding] = []
     for path in definition_files(repo):
         rel = path.relative_to(repo).as_posix()
-        doc = json.loads(path.read_text(encoding="utf-8"))
-        for state_path, state in walk_states(doc.get("States") or {}):
+        doc = _object(_read_json(path))
+        for state_path, state in walk_states(_object(doc.get("States"))):
             kind = state.get("Type")
             hit: tuple[str, str] | None = None
             if kind == "Task":
@@ -223,7 +258,7 @@ def findings(repo: Path, declared: dict[str, set[str]]) -> list[dict]:
     return out
 
 
-def counts_of(rows: list[dict]) -> Counts:
+def counts_of(rows: list[Finding]) -> Counts:
     out: Counts = {}
     for row in rows:
         per = out.setdefault(row["path"], {})
@@ -232,7 +267,7 @@ def counts_of(rows: list[dict]) -> Counts:
 
 
 def load_declared(path: Path) -> dict[str, set[str]]:
-    doc = json.loads(path.read_text(encoding="utf-8"))
+    doc = _object(_read_json(path))
     out: dict[str, set[str]] = {}
     for key in ("lambda_functions", "state_machines"):
         entries = doc.get(key)
@@ -248,7 +283,7 @@ def load_declared(path: Path) -> dict[str, set[str]]:
 
 
 def totals(counts: Counts) -> dict[str, int]:
-    out = dict.fromkeys(RULES, 0)
+    out: dict[str, int] = dict.fromkeys(RULES, 0)
     for per in counts.values():
         for rule, n in per.items():
             out[rule] += n
@@ -259,19 +294,22 @@ def totals(counts: Counts) -> dict[str, int]:
 def load_baseline(path: Path) -> Counts:
     if not path.exists():
         return {}
-    doc = json.loads(path.read_text(encoding="utf-8"))
+    doc = _object(_read_json(path))
     if doc.get("schema_version") != SCHEMA_VERSION or doc.get("guard") != GUARD:
         raise SystemExit(f"{path}: not a {GUARD} baseline (schema_version {SCHEMA_VERSION})")
     files = doc.get("files")
     if not isinstance(files, dict):
         raise SystemExit(f"{path}: 'files' must be an object")
     out: Counts = {}
-    for rel, per in files.items():
-        if not isinstance(per, dict) or any(
+    for rel, per_value in files.items():
+        if not isinstance(per_value, dict):
+            raise SystemExit(f"{path}: bad entry for {rel!r}: {per_value!r}")
+        per = per_value
+        if any(
             r not in RULES or not isinstance(n, int) or n < 1 for r, n in per.items()
         ):
             raise SystemExit(f"{path}: bad entry for {rel!r}: {per!r}")
-        out[rel] = dict(per)
+        out[rel] = {rule: n for rule, n in per.items() if isinstance(n, int)}
     return out
 
 
@@ -293,14 +331,15 @@ def render_baseline(counts: Counts) -> str:
     return json.dumps(doc, indent=2) + "\n"
 
 
-def compare(current: Counts, baseline: Counts) -> tuple[list[dict], list[dict]]:
+def compare(current: Counts, baseline: Counts) -> tuple[list[Comparison], list[Comparison]]:
     """``(new, stale)`` rows, each ``{path, rule, baseline, current}``."""
-    new, stale = [], []
+    new: list[Comparison] = []
+    stale: list[Comparison] = []
     for rel in sorted(set(current) | set(baseline)):
         cur, base = current.get(rel, {}), baseline.get(rel, {})
         for rule in RULES:
             c, b = cur.get(rule, 0), base.get(rule, 0)
-            row = {"path": rel, "rule": rule, "baseline": b, "current": c}
+            row: Comparison = {"path": rel, "rule": rule, "baseline": b, "current": c}
             if c > b:
                 new.append(row)
             elif c < b:
@@ -334,7 +373,9 @@ def is_enforced(path: str, mode: str) -> bool:
     return mode == "enforce" or path in ENFORCED_DEFINITIONS
 
 
-def report(rows: list[dict], new: list[dict], stale: list[dict], mode: str) -> list[str]:
+def report(
+    rows: list[Finding], new: list[Comparison], stale: list[Comparison], mode: str
+) -> list[str]:
     t = totals(counts_of(rows))
     lines = [
         f"{GUARD} ({mode}): {len(rows)} finding(s) in {t['files']} definition(s) "
@@ -393,7 +434,8 @@ def write_summary(lines: list[str]) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    description = (__doc__ or "").split("\n\n")[0]
+    ap = argparse.ArgumentParser(description=description)
     ap.add_argument("--repo", default=str(REPO_ROOT), help="repo root")
     ap.add_argument("--declared", help="declared entrypoints JSON")
     ap.add_argument("--baseline", help="baseline JSON")
