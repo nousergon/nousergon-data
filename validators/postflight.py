@@ -36,12 +36,47 @@ import json
 import logging
 import os
 import random
-from datetime import datetime, timezone
-from typing import Any
+from datetime import date, datetime, timezone
+from typing import Protocol, TypeAlias, cast
 
-import pandas as pd
+import pandas as pd  # pyright: ignore[reportMissingTypeStubs]  # pandas does not ship type information
 
 log = logging.getLogger(__name__)
+
+JsonValue: TypeAlias = None | bool | int | float | str | list[object] | dict[str, object]
+JsonObject: TypeAlias = dict[str, JsonValue]
+
+
+class _StreamingBody(Protocol):
+    def read(self) -> bytes: ...
+
+
+class _S3Client(Protocol):
+    def get_object(self, *, Bucket: str, Key: str) -> dict[str, _StreamingBody]: ...
+
+    def head_object(self, *, Bucket: str, Key: str) -> object: ...
+
+
+class _ArcticReadResult(Protocol):
+    data: pd.DataFrame | None
+
+
+class _ArcticLibrary(Protocol):
+    def read(self, symbol: str, *, columns: list[str]) -> _ArcticReadResult: ...
+
+    def list_symbols(self) -> list[str]: ...
+
+
+class _FreshnessCheck(Protocol):
+    def __call__(self, value: date, run_date: str, *, max_stale: int) -> bool: ...
+
+
+class _TradingDaysStale(Protocol):
+    def __call__(self, value: date, reference: str | date) -> int: ...
+
+
+class _ExpectedLastClose(Protocol):
+    def __call__(self, run_date: str) -> date: ...
 
 
 class PostflightError(RuntimeError):
@@ -105,24 +140,36 @@ class DataPostflight:
         self.phase = phase
         self.region = os.environ.get("AWS_REGION", "us-east-1")
         # Lazy-initialized handles (set on first use to keep __init__ cheap).
-        self._s3 = None
-        self._universe_lib = None
-        self._macro_lib = None
+        self._s3: _S3Client | None = None
+        self._universe_lib: _ArcticLibrary | None = None
+        self._macro_lib: _ArcticLibrary | None = None
 
     # ── Lazy handles ─────────────────────────────────────────────────────────
 
-    def _s3_client(self):
+    def _s3_client(self) -> _S3Client:
         if self._s3 is None:
-            import boto3
-            self._s3 = boto3.client("s3", region_name=self.region)
+            import boto3  # pyright: ignore[reportMissingTypeStubs]  # boto3 has no bundled stubs
+            self._s3 = cast(
+                _S3Client,
+                boto3.client("s3", region_name=self.region),  # pyright: ignore[reportUnknownMemberType]  # boto3 is untyped
+            )
         return self._s3
 
-    def _open_arctic_libs(self) -> "tuple[Any, Any]":
+    def _open_arctic_libs(self) -> tuple[_ArcticLibrary, _ArcticLibrary]:
         if self._universe_lib is None or self._macro_lib is None:
-            from nousergon_lib.arcticdb import open_universe_lib, open_macro_lib
+            from nousergon_lib.arcticdb import (
+                open_macro_lib,
+                open_universe_lib,
+            )
             try:
-                self._universe_lib = open_universe_lib(self.bucket, region=self.region)
-                self._macro_lib = open_macro_lib(self.bucket, region=self.region)
+                self._universe_lib = cast(
+                    _ArcticLibrary,
+                    open_universe_lib(self.bucket, region=self.region),
+                )
+                self._macro_lib = cast(
+                    _ArcticLibrary,
+                    open_macro_lib(self.bucket, region=self.region),
+                )
             except Exception as exc:
                 raise PostflightError(str(exc)) from exc
         return self._universe_lib, self._macro_lib
@@ -141,10 +188,13 @@ class DataPostflight:
         every post-Saturday redrive (2026-05-24 incident).
         """
         from nousergon_lib.dates import (
-            is_fresh_in_trading_days,
-            trading_days_stale,
-            expected_last_close,
+            is_fresh_in_trading_days,  # pyright: ignore[reportAttributeAccessIssue, reportUnknownVariableType]  # external package is untyped
+            trading_days_stale,  # pyright: ignore[reportAttributeAccessIssue, reportUnknownVariableType]  # external package is untyped
+            expected_last_close,  # pyright: ignore[reportAttributeAccessIssue, reportUnknownVariableType]  # external package is untyped
         )
+        is_fresh = cast(_FreshnessCheck, is_fresh_in_trading_days)
+        days_stale = cast(_TradingDaysStale, trading_days_stale)
+        last_close = cast(_ExpectedLastClose, expected_last_close)
 
         _, macro_lib = self._open_arctic_libs()
         try:
@@ -160,17 +210,20 @@ class DataPostflight:
                 "ArcticDB macro.SPY has zero rows — daily_append has never written."
             )
 
-        last_ts = pd.Timestamp(df.index[-1])
+        last_ts = cast(
+            datetime,
+            pd.Timestamp(cast(datetime | str, df.index[-1])).to_pydatetime(),
+        )
         if last_ts.tzinfo is not None:
-            last_ts = last_ts.tz_convert("UTC").tz_localize(None)
-        last_date = last_ts.normalize().date()
+            last_ts = last_ts.astimezone(timezone.utc).replace(tzinfo=None)
+        last_date = last_ts.date()
 
-        if not is_fresh_in_trading_days(
+        if not is_fresh(
             last_date, self.run_date,
             max_stale=_MACRO_SPY_MAX_STALE_TRADING_DAYS,
         ):
-            stale = trading_days_stale(last_date, self.run_date)
-            expected = expected_last_close(self.run_date)
+            stale = days_stale(last_date, self.run_date)
+            expected = last_close(self.run_date)
             raise PostflightError(
                 f"ArcticDB macro.SPY last_date={last_date} is {stale} "
                 f"trading-day(s) behind the expected last close {expected} "
@@ -194,15 +247,22 @@ class DataPostflight:
         per-ticker error rate in research's ``PriceFetchError`` check at
         Lambda runtime.
         """
-        from nousergon_lib.dates import trading_days_stale
+        from nousergon_lib.dates import trading_days_stale  # pyright: ignore[reportAttributeAccessIssue, reportUnknownVariableType]  # external package is untyped
+        days_stale = cast(_TradingDaysStale, trading_days_stale)
 
         universe_lib, macro_lib = self._open_arctic_libs()
 
         # SPY last date serves as the staleness reference (already validated above).
-        spy_last = pd.Timestamp(macro_lib.read("SPY", columns=["Close"]).data.index[-1])
+        spy_data = cast(
+            pd.DataFrame, macro_lib.read("SPY", columns=["Close"]).data
+        )
+        spy_last = cast(
+            datetime,
+            pd.Timestamp(cast(datetime | str, spy_data.index[-1])).to_pydatetime(),
+        )
         if spy_last.tzinfo is not None:
-            spy_last = spy_last.tz_convert("UTC").tz_localize(None)
-        spy_last_date = spy_last.normalize().date()
+            spy_last = spy_last.astimezone(timezone.utc).replace(tzinfo=None)
+        spy_last_date = spy_last.date()
 
         symbols = list(universe_lib.list_symbols())
         # Filter sector ETFs + macro symbols out of the stock sample.
@@ -235,15 +295,18 @@ class DataPostflight:
             if df is None or df.empty:
                 stale_tickers.append((sym, 9999))
                 continue
-            last_ts = pd.Timestamp(df.index[-1])
+            last_ts = cast(
+                datetime,
+                pd.Timestamp(cast(datetime | str, df.index[-1])).to_pydatetime(),
+            )
             if last_ts.tzinfo is not None:
-                last_ts = last_ts.tz_convert("UTC").tz_localize(None)
+                last_ts = last_ts.astimezone(timezone.utc).replace(tzinfo=None)
             # Trading-day staleness vs SPY's last_date — calendar arithmetic
             # would over-fail on partial writes that landed late in the
             # session window (e.g. Friday write where one ticker landed
             # Thursday — calendar 1d, trading 1d). Both fine here, but the
             # primitive aligns with the system-wide convention.
-            stale = trading_days_stale(last_ts.normalize().date(), spy_last_date)
+            stale = days_stale(last_ts.date(), spy_last_date)
             if stale > _UNIVERSE_MAX_STALE_VS_SPY_TRADING_DAYS:
                 stale_tickers.append((sym, stale))
 
@@ -310,8 +373,8 @@ class DataPostflight:
             raise PostflightError(
                 f"s3://{self.bucket}/{key} missing 'data' dict — schema violation."
             )
-        ticker_count = data.get("ticker_count", 0)
-        ok_count = data.get("ok_count", 0)
+        ticker_count = cast(int, data.get("ticker_count", 0))
+        ok_count = cast(int, data.get("ok_count", 0))
         if ticker_count == 0:
             raise PostflightError(
                 f"s3://{self.bucket}/{key} ticker_count=0 — collector wrote an empty payload."
@@ -336,7 +399,7 @@ class DataPostflight:
         """
         key = f"{self.market_prefix}weekly/{self.run_date}/constituents.json"
         data = self._fetch_json(key, name="constituents.json")
-        tickers = data.get("tickers", [])
+        tickers = cast(list[JsonValue], data.get("tickers", []))
         if not tickers or len(tickers) < _MIN_CONSTITUENTS:
             raise PostflightError(
                 f"s3://{self.bucket}/{key} has {len(tickers)} tickers "
@@ -350,7 +413,7 @@ class DataPostflight:
             )
         log.info(
             "postflight: constituents.json OK (%d tickers, %d sector_map entries)",
-            len(tickers), len(data["sector_map"]),
+            len(tickers), len(cast(JsonObject, data["sector_map"])),
         )
 
     def _check_latest_weekly_pointer(self) -> None:
@@ -394,7 +457,7 @@ class DataPostflight:
 
     # ── Helpers ──────────────────────────────────────────────────────────────
 
-    def _fetch_json(self, key: str, name: str) -> dict:
+    def _fetch_json(self, key: str, name: str) -> JsonObject:
         s3 = self._s3_client()
         try:
             obj = s3.get_object(Bucket=self.bucket, Key=key)
@@ -404,7 +467,7 @@ class DataPostflight:
                 f"{name} did not write or pointer is broken."
             ) from exc
         try:
-            return json.loads(obj["Body"].read())
+            return cast(JsonObject, json.loads(obj["Body"].read()))
         except Exception as exc:
             raise PostflightError(
                 f"s3://{self.bucket}/{key} is not valid JSON: {exc}"
@@ -441,15 +504,15 @@ class DataPostflight:
             return
 
         data = self._fetch_json(key, name="alternative/manifest.json")
-        n_tickers = data.get("tickers_requested", 0)
+        n_tickers = cast(int, data.get("tickers_requested", 0))
         if n_tickers == 0:
             raise PostflightError(
                 f"s3://{self.bucket}/{key} tickers_requested=0 — "
                 f"Phase 2 collector wrote an empty payload."
             )
 
-        floors = data.get("source_min_ok_ratios") or {}
-        observed = data.get("source_ok_ratios") or {}
+        floors = cast(dict[str, float], data.get("source_min_ok_ratios") or {})
+        observed = cast(dict[str, float], data.get("source_ok_ratios") or {})
         if not floors or not observed:
             raise PostflightError(
                 f"s3://{self.bucket}/{key} missing source_min_ok_ratios "
