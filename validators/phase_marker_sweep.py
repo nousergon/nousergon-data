@@ -55,9 +55,11 @@ import argparse
 import json
 import logging
 import sys
-from typing import Optional
+from collections.abc import Iterable, Mapping
+from typing import Literal, Protocol, TypedDict, cast
 
-import boto3
+# boto3 does not publish a py.typed marker for its generated clients.
+import boto3  # pyright: ignore[reportMissingTypeStubs]
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +70,75 @@ _PHASE_PREFIX_TEMPLATE = "backtest/{run_date}/.phases/"
 _ALERT_PREVIEW_LIMIT = 10
 
 
-def _list_phase_markers(bucket: str, run_date: str) -> tuple[list[dict], list[dict]]:
+class _StreamingBody(Protocol):
+    def read(self) -> bytes: ...
+
+
+class _Paginator(Protocol):
+    def paginate(self, **kwargs: object) -> Iterable[Mapping[str, object]]: ...
+
+
+class _S3Client(Protocol):
+    def get_paginator(self, operation_name: str) -> _Paginator: ...
+    def get_object(self, **kwargs: object) -> Mapping[str, object]: ...
+
+
+class _PhaseMarker(TypedDict, total=False):
+    phase: str
+    status: str
+    error: str | None
+    _s3_key: str
+
+
+class _MalformedMarker(TypedDict):
+    s3_key: str
+    reason: str
+
+
+class _ErrorPhase(TypedDict):
+    phase: str
+    error: str | None
+    s3_key: str
+
+
+class _SweepError(TypedDict):
+    status: Literal["error"]
+    error: str
+    stage: Literal["s3_list"]
+
+
+class _SweepFindings(TypedDict):
+    status: Literal["ok", "phase_errors_detected", "malformed_markers_detected"]
+    run_date: str
+    checked_count: int
+    error_phases: list[_ErrorPhase]
+    malformed_markers: list[_MalformedMarker]
+
+
+class _DeliveryStatus(Protocol):
+    ok: bool
+
+
+class _PublishResult(Protocol):
+    sns: _DeliveryStatus
+    telegram: _DeliveryStatus
+    any_ok: bool
+
+
+class _Alerts(Protocol):
+    def publish(self, message: str, **kwargs: object) -> _PublishResult: ...
+
+
+class _Args(argparse.Namespace):
+    run_date: str
+    bucket: str
+    no_alert: bool
+    alert_severity: str
+
+
+def _list_phase_markers(
+    bucket: str, run_date: str,
+) -> tuple[list[_PhaseMarker], list[_MalformedMarker]]:
     """Parse the phase markers directly under backtest/{run_date}/.phases/.
 
     Returns ``(markers, malformed)`` — the well-formed markers, and one
@@ -96,33 +166,45 @@ def _list_phase_markers(bucket: str, run_date: str) -> tuple[list[dict], list[di
     sweep cannot read is exactly the condition it exists to surface, and a
     skip would make it indistinguishable from a healthy phase.
     """
-    s3 = boto3.client("s3")
+    # boto3 generates service clients dynamically and does not expose their type here.
+    s3 = cast(_S3Client, boto3.client("s3"))  # pyright: ignore[reportUnknownMemberType]
     prefix = _PHASE_PREFIX_TEMPLATE.format(run_date=run_date)
-    markers: list[dict] = []
-    malformed: list[dict] = []
+    markers: list[_PhaseMarker] = []
+    malformed: list[_MalformedMarker] = []
     paginator = s3.get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix, Delimiter="/"):
-        for obj in page.get("Contents", []) or []:
-            key = obj["Key"]
+        raw_contents = page.get("Contents", [])
+        if not isinstance(raw_contents, list):
+            continue
+        contents = cast(list[object], raw_contents)
+        for raw_obj in contents:
+            if not isinstance(raw_obj, Mapping):
+                continue
+            obj = cast(Mapping[str, object], raw_obj)
+            key = obj.get("Key")
+            if not isinstance(key, str):
+                continue
             if not key.endswith(".json"):
                 continue
-            body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+            response = s3.get_object(Bucket=bucket, Key=key)
+            body = cast(_StreamingBody, response["Body"]).read()
             try:
-                marker = json.loads(body)
+                parsed: object = json.loads(body)
             except (json.JSONDecodeError, ValueError) as exc:
                 logger.error("Unparseable phase marker %s: %s", key, exc)
                 malformed.append({"s3_key": key, "reason": f"unparseable: {exc}"})
                 continue
-            if not isinstance(marker, dict):
+            if not isinstance(parsed, dict):
                 logger.error(
                     "Phase marker %s parsed to %s, not an object — cannot be "
-                    "read as a marker", key, type(marker).__name__,
+                    "read as a marker", key, type(parsed).__name__,
                 )
                 malformed.append({
                     "s3_key": key,
-                    "reason": f"parsed to {type(marker).__name__}, expected object",
+                    "reason": f"parsed to {type(parsed).__name__}, expected object",
                 })
                 continue
+            marker = cast(_PhaseMarker, parsed)
             marker["_s3_key"] = key
             markers.append(marker)
     return markers, malformed
@@ -134,7 +216,7 @@ def sweep(
     bucket: str = "alpha-engine-research",
     alert: bool = True,
     alert_severity: str = "error",
-) -> dict:
+) -> _SweepFindings | _SweepError:
     """Sweep backtest/{run_date}/.phases/*.json for status=error markers.
 
     Args:
@@ -159,11 +241,11 @@ def sweep(
         logger.exception("Phase marker list/read failed")
         return {"status": "error", "error": str(exc), "stage": "s3_list"}
 
-    error_phases = [
+    error_phases: list[_ErrorPhase] = [
         {
             "phase": m.get("phase", "?"),
             "error": m.get("error"),
-            "s3_key": m["_s3_key"],
+            "s3_key": m.get("_s3_key", "?"),
         }
         for m in markers
         if m.get("status") == "error"
@@ -175,7 +257,9 @@ def sweep(
     )
 
     if error_phases:
-        status = "phase_errors_detected"
+        status: Literal["ok", "phase_errors_detected", "malformed_markers_detected"] = (
+            "phase_errors_detected"
+        )
     elif malformed_markers:
         # A marker that cannot be read is a finding with a name, not a pass
         # and not a harness fault (alpha-engine-config-I9262).
@@ -183,7 +267,7 @@ def sweep(
     else:
         status = "ok"
 
-    result = {
+    result: _SweepFindings = {
         "status": status,
         "run_date": run_date,
         "checked_count": len(markers),
@@ -201,13 +285,14 @@ def sweep(
 
     if error_phases and alert:
         try:
-            from nousergon_lib import alerts  # noqa: PLC0415
+            from nousergon_lib import alerts as untyped_alerts  # noqa: PLC0415
         except ImportError as exc:
             logger.warning(
                 "alerts publish skipped — nousergon_lib.alerts unavailable: %s",
                 exc,
             )
             return result
+        alerts = cast(_Alerts, untyped_alerts)
         names = sorted(p["phase"] for p in error_phases)
         preview = "; ".join(
             f"{p['phase']} ({p['error']})" for p in error_phases[:_ALERT_PREVIEW_LIMIT]
@@ -244,7 +329,7 @@ def sweep(
     return result
 
 
-def main(argv: Optional[list[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     # allow_abbrev=False (config-I7415): argparse's default accepts any
     # unambiguous prefix of a long option. A caller passing `--alert` —
     # believing it was turning alerting ON, which is already the default —
@@ -267,7 +352,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--alert-severity", default="error",
         choices=["info", "warn", "warning", "error", "critical"],
     )
-    args = parser.parse_args(argv)
+    args = parser.parse_args(argv, namespace=_Args())
 
     logging.basicConfig(
         level=logging.INFO,
