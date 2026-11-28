@@ -90,7 +90,7 @@ import sys
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Protocol, TypedDict, cast
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MANIFEST_PATH = REPO_ROOT / "infrastructure" / "weekly_cadence.json"
@@ -104,7 +104,7 @@ ALLOWED_CADENCE = {"daily", "weekly-only", "off"}
 DEFAULT_WINDOW_DAYS = 5
 
 
-def _is_weekly_gate_out(output_json: dict) -> bool:
+def _is_weekly_gate_out(output_json: dict[str, object]) -> bool:
     """True iff a SUCCEEDED weekly-role execution's own OUTPUT proves it did
     no work (alpha-engine-config-I8057, mirrors
     ``gate_sf_run_sweep.py::_is_weekly_gate_out`` from
@@ -117,10 +117,10 @@ def _is_weekly_gate_out(output_json: dict) -> bool:
     gate = output_json.get("weekly_run_day_gate")
     if not isinstance(gate, dict):
         return False
-    inner = gate.get("Payload")
+    inner = _object_dict(cast(object, gate)).get("Payload")
     if not isinstance(inner, dict):
         return False
-    return inner.get("is_weekly_run_day") is False
+    return _object_dict(cast(object, inner)).get("is_weekly_run_day") is False
 
 
 # ---------------------------------------------------------------------------
@@ -128,9 +128,9 @@ def _is_weekly_gate_out(output_json: dict) -> bool:
 # ---------------------------------------------------------------------------
 
 def _validate_cadence(value: object, source: str) -> str:
-    if value not in ALLOWED_CADENCE:
+    if not isinstance(value, str) or value not in ALLOWED_CADENCE:
         raise ValueError(f"{source} declared exercise_cadence={value!r}, not one of {sorted(ALLOWED_CADENCE)}")
-    return value  # type: ignore[return-value]
+    return value
 
 
 @dataclass(frozen=True)
@@ -150,17 +150,26 @@ def _parse_cadence_history(raw: object, source: str) -> list[CadenceEntry]:
             f"{{value, effective_from}} entries, got {raw!r}"
         )
     entries: list[CadenceEntry] = []
-    for item in raw:
-        if not isinstance(item, dict) or "value" not in item or "effective_from" not in item:
+    for raw_item in cast(list[object], raw):
+        item = _object_dict(raw_item)
+        if "value" not in item or "effective_from" not in item:
             raise ValueError(f"{source} exercise_cadence entry malformed (needs value + effective_from): {item!r}")
         value = _validate_cadence(item["value"], source)
+        effective_from_raw = item["effective_from"]
+        if not isinstance(effective_from_raw, str):
+            raise ValueError(
+                f"{source} exercise_cadence entry has an invalid effective_from: {effective_from_raw!r}"
+            )
         try:
-            effective_from = date.fromisoformat(item["effective_from"])
+            effective_from = date.fromisoformat(effective_from_raw)
         except ValueError as exc:
             raise ValueError(
-                f"{source} exercise_cadence entry has an invalid effective_from: {item['effective_from']!r}"
+                f"{source} exercise_cadence entry has an invalid effective_from: {effective_from_raw!r}"
             ) from exc
-        entries.append(CadenceEntry(value=value, effective_from=effective_from, why=item.get("_why", "")))
+        why = item.get("_why", "")
+        if not isinstance(why, str):
+            raise ValueError(f"{source} exercise_cadence entry has an invalid _why: {why!r}")
+        entries.append(CadenceEntry(value=value, effective_from=effective_from, why=why))
     entries.sort(key=lambda e: e.effective_from)
     return entries
 
@@ -198,9 +207,16 @@ def load_cadence_from_manifest(path: Path = MANIFEST_PATH) -> str:
     return value
 
 
-def load_cadence_from_ssm(ssm_client) -> str:
+class SsmClient(Protocol):
+    def get_parameter(self, *, Name: str) -> dict[str, object]: ...
+
+
+def load_cadence_from_ssm(ssm_client: SsmClient) -> str:
     resp = ssm_client.get_parameter(Name=SSM_PARAM_NAME)
-    return _validate_cadence(resp["Parameter"]["Value"], SSM_PARAM_NAME)
+    parameter = resp.get("Parameter")
+    if not isinstance(parameter, dict):
+        raise ValueError(f"{SSM_PARAM_NAME}: response has no Parameter object")
+    return _validate_cadence(_object_dict(cast(object, parameter)).get("Value"), SSM_PARAM_NAME)
 
 
 # ---------------------------------------------------------------------------
@@ -292,7 +308,9 @@ def compute_expected_slots(
             else:
                 day_cadence = cadence
             if day_cadence is None:
-                first_entry = cadence_history[0]  # non-empty by _parse_cadence_history
+                if not cadence_history:
+                    raise ValueError("cadence_history must not be empty")
+                first_entry = cadence_history[0]
                 slots.append(ExpectedSlot(
                     day=d,
                     role="exercise",
@@ -474,23 +492,50 @@ def evaluate(slots: list[ExpectedSlot], executions: list[ExecutionRecord]) -> li
 # AWS plumbing (thin, injectable — mirrors weekly_sf_rerun.py's shape)
 # ---------------------------------------------------------------------------
 
-def _list_all_executions(sf_client, sm_arn: str, cap: int = 500) -> list[dict]:
-    out: list[dict] = []
-    token = None
+class ExecutionSummary(TypedDict):
+    executionArn: str
+    name: str
+    status: str
+    startDate: datetime
+    stopDate: datetime
+
+
+class SfClient(Protocol):
+    def list_executions(self, **kwargs: object) -> dict[str, object]: ...
+    def describe_execution(self, *, executionArn: str) -> dict[str, object]: ...
+
+
+class SnsClient(Protocol):
+    def publish(self, *, TopicArn: str, Subject: str, Message: str) -> object: ...
+
+
+def _object_dict(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        return {}
+    mapping = cast(dict[object, object], value)
+    return {key: item for key, item in mapping.items() if isinstance(key, str)}
+
+
+def _list_all_executions(sf_client: SfClient, sm_arn: str, cap: int = 500) -> list[ExecutionSummary]:
+    out: list[ExecutionSummary] = []
+    token: str | None = None
     while len(out) < cap:
         kwargs = {"stateMachineArn": sm_arn, "maxResults": 200}
         if token:
             kwargs["nextToken"] = token
         resp = sf_client.list_executions(**kwargs)
-        out.extend(resp["executions"])
-        token = resp.get("nextToken")
+        executions = resp.get("executions")
+        if isinstance(executions, list):
+            out.extend(cast(list[ExecutionSummary], executions))
+        next_token = resp.get("nextToken")
+        token = next_token if isinstance(next_token, str) else None
         if not token:
             break
     return out[:cap]
 
 
 def fetch_execution_records(
-    sf_client, window_days: int, today: date | None = None
+    sf_client: SfClient, window_days: int, today: date | None = None
 ) -> list[ExecutionRecord]:
     """Live AWS fetch: list recent executions, then describe each one for its
     pipeline_role (never present on the list-executions summary itself —
@@ -522,13 +567,17 @@ def fetch_execution_records(
         is_gate_out = False
         try:
             desc = sf_client.describe_execution(executionArn=ex["executionArn"])
-            inp = json.loads(desc.get("input") or "{}")
+            inp_raw = desc.get("input")
+            inp = _object_dict(cast(object, json.loads(inp_raw if isinstance(inp_raw, str) else "{}")))
             role = normalize_role(inp.get("pipeline_role"))
             run_date = _parse_run_date(inp.get("run_date"))
             if role == "weekly" and ex["status"] == "SUCCEEDED":
                 # Same describe_execution call already made above — no extra
                 # AWS call. Never duration-based (alpha-engine-config-I8057).
-                output_json = json.loads(desc.get("output") or "{}")
+                output_raw = desc.get("output")
+                output_json = _object_dict(
+                    cast(object, json.loads(output_raw if isinstance(output_raw, str) else "{}"))
+                )
                 is_gate_out = _is_weekly_gate_out(output_json)
         except Exception as exc:  # noqa: BLE001 — best-effort per-execution; unrecognized role is a safe fallback, not a hidden failure (surfaced below)
             print(f"WARN: could not read input of {ex['executionArn']}: {exc}", file=sys.stderr)
@@ -556,7 +605,7 @@ def _today() -> date:
 
 def format_report(results: list[SlotResult]) -> str:
     marks = {"OK": "✓", "GATED_OFF": "·", "CRITICAL": "✗"}
-    lines = []
+    lines: list[str] = []
     for r in sorted(results, key=lambda r: (r.slot.day, r.slot.role)):
         lines.append(
             f"  {marks[r.classification]} {r.slot.day.isoformat()} {r.slot.role:8s} "
@@ -585,13 +634,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = ap.parse_args(argv)
 
-    import boto3  # local import: keeps the pure functions above importable/testable with zero AWS deps
-    from nousergon_lib.trading_calendar import is_trading_day, next_trading_day
+    import boto3  # pyright: ignore[reportMissingTypeStubs]  # boto3 has no bundled typing; clients are narrowed to local protocols
+    from nousergon_lib import trading_calendar
 
-    sf = boto3.client("stepfunctions", region_name=REGION)
+    sf = cast(SfClient, boto3.client("stepfunctions", region_name=REGION))  # pyright: ignore[reportUnknownMemberType]  # untyped boto3 factory is narrowed to SfClient
 
     if args.live:
-        ssm = boto3.client("ssm", region_name=REGION)
+        ssm = cast(SsmClient, boto3.client("ssm", region_name=REGION))  # pyright: ignore[reportUnknownMemberType]  # untyped boto3 factory is narrowed to SsmClient
         cadence = load_cadence_from_ssm(ssm)
     else:
         cadence = load_cadence_from_manifest()
@@ -610,7 +659,11 @@ def main(argv: list[str] | None = None) -> int:
     through = today if args.through == "today" else last_due_day(today)
     executions = fetch_execution_records(sf, args.window_days, today=today)
     slots = compute_expected_slots(
-        through, cadence, args.window_days, is_trading_day, next_trading_day,
+        through,
+        cadence,
+        args.window_days,
+        cast(Callable[[date], bool], trading_calendar.is_trading_day),  # pyright: ignore[reportAttributeAccessIssue]  # runtime re-export is absent from the package stub
+        cast(Callable[[date], date], trading_calendar.next_trading_day),  # pyright: ignore[reportAttributeAccessIssue]  # runtime re-export is absent from the package stub
         cadence_history=cadence_history,
     )
     results = evaluate(slots, executions)
@@ -645,7 +698,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if critical and not args.no_notify:
         try:
-            sns = boto3.client("sns", region_name=REGION)
+            sns = cast(SnsClient, boto3.client("sns", region_name=REGION))  # pyright: ignore[reportUnknownMemberType]  # untyped boto3 factory is narrowed to SnsClient
             detail = "\n".join(f"- {r.slot.day.isoformat()} {r.slot.role}: {r.detail}" for r in critical)
             sns.publish(
                 TopicArn=SNS_TOPIC_ARN,
